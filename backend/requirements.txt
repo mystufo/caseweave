@@ -1,0 +1,45 @@
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+python-dotenv==1.0.1
+pydantic-settings==2.7.0
+pydantic==2.10.4
+
+# Database
+sqlalchemy[asyncio]==2.0.36
+asyncpg==0.30.0
+alembic==1.14.0
+psycopg2-binary==2.9.10
+pgvector==0.3.6
+
+# LLM
+anthropic==0.42.0
+langchain==0.3.13
+langchain-anthropic==0.3.3
+langchain-community==0.3.13
+langchain-openai==0.2.14
+
+# Document parsing
+python-docx==1.1.2
+pdfplumber==0.11.4
+PyMuPDF==1.25.1
+
+# Export
+openpyxl==3.1.5
+
+# Browser automation (Phase 5)
+playwright==1.49.0
+
+# Utilities
+python-multipart==0.0.20
+httpx==0.28.1
+aiofiles==24.1.0
+numpy==1.26.4
+
+# Auth
+passlib[bcrypt]==1.7.4
+bcrypt==4.2.1  # pin: passlib 1.7.4 不兼容 bcrypt 5.x
+pyjwt==2.10.1
+email-validator==2.2.0
+
+# Dev tools
+ruff==0.8.4

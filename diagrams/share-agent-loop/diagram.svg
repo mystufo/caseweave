@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="620" viewBox="0 0 900 620">
+  <rect x="0" y="0" width="900" height="620" fill="#F7F9FC"/>
+  <text x="40" y="56" font-family="Noto Sans SC" font-size="30" font-weight="700" fill="#1A2433">Agent 循环（ReAct）</text>
+  <text x="40" y="90" font-family="Noto Sans SC" font-size="18" fill="#6B7684">思考 → 行动 → 观察，循环直到满足停止条件</text>
+
+  <!-- center -->
+  <circle cx="450" cy="350" r="92" fill="#FFFFFF" stroke="#E6EAF0" stroke-width="2"/>
+  <text x="450" y="338" font-family="Noto Sans SC" font-size="20" font-weight="700" fill="#1A2433" text-anchor="middle">LLM</text>
+  <text x="450" y="368" font-family="Noto Sans SC" font-size="15" fill="#6B7684" text-anchor="middle">带累积上下文</text>
+
+  <!-- Think node (top) -->
+  <g>
+    <rect x="330" y="130" width="240" height="78" rx="14" fill="#E8F0FE" stroke="#3A6FF0" stroke-width="2"/>
+    <text x="450" y="166" font-family="Noto Sans SC" font-size="19" font-weight="700" fill="#1F4FB8" text-anchor="middle">① 思考 Reason</text>
+    <text x="450" y="192" font-family="Noto Sans SC" font-size="14" fill="#5670A0" text-anchor="middle">决定下一步做什么</text>
+  </g>
+
+  <!-- Act node (right) -->
+  <g>
+    <rect x="640" y="300" width="220" height="78" rx="14" fill="#E9F6EF" stroke="#2F8F66" stroke-width="2"/>
+    <text x="750" y="336" font-family="Noto Sans SC" font-size="19" font-weight="700" fill="#1F6B49" text-anchor="middle">② 行动 Act</text>
+    <text x="750" y="362" font-family="Noto Sans SC" font-size="14" fill="#3F8266" text-anchor="middle">调用工具 / 执行命令</text>
+  </g>
+
+  <!-- Observe node (bottom) -->
+  <g>
+    <rect x="330" y="492" width="240" height="78" rx="14" fill="#FFF6E5" stroke="#E0A02E" stroke-width="2"/>
+    <text x="450" y="528" font-family="Noto Sans SC" font-size="19" font-weight="700" fill="#A9760F" text-anchor="middle">③ 观察 Observe</text>
+    <text x="450" y="554" font-family="Noto Sans SC" font-size="14" fill="#9A7320" text-anchor="middle">读取结果，喂回上下文</text>
+  </g>
+
+  <!-- arrows along the cycle (clockwise) -->
+  <!-- think -> act -->
+  <path d="M 560 196 Q 690 230 740 296" fill="none" stroke="#9AA6B5" stroke-width="3"/>
+  <polygon points="740,296 728,286 744,283" fill="#9AA6B5"/>
+  <!-- act -> observe -->
+  <path d="M 740 382 Q 690 470 562 506" fill="none" stroke="#9AA6B5" stroke-width="3"/>
+  <polygon points="562,506 575,500 567,514" fill="#9AA6B5"/>
+  <!-- observe -> think (loop back up the left) -->
+  <path d="M 330 520 Q 150 430 160 350 Q 170 230 328 178" fill="none" stroke="#3A6FF0" stroke-width="3" stroke-dasharray="2 0"/>
+  <polygon points="328,178 312,180 322,192" fill="#3A6FF0"/>
+  <text x="120" y="350" font-family="Noto Sans SC" font-size="14" fill="#3A6FF0" text-anchor="middle">再思考</text>
+
+  <!-- stop branch -->
+  <g>
+    <rect x="612" y="486" width="248" height="92" rx="14" fill="#FDEDEF" stroke="#E15770" stroke-width="2"/>
+    <text x="736" y="520" font-family="Noto Sans SC" font-size="18" font-weight="700" fill="#B23A52" text-anchor="middle">满足条件 → 停止</text>
+    <text x="736" y="546" font-family="Noto Sans SC" font-size="13.5" fill="#8A5260" text-anchor="middle">完成判定 / 最大步数</text>
+    <text x="736" y="566" font-family="Noto Sans SC" font-size="13.5" fill="#8A5260" text-anchor="middle">避免死循环</text>
+  </g>
+  <path d="M 560 540 L 608 538" fill="none" stroke="#E15770" stroke-width="3" stroke-dasharray="7 5"/>
+  <polygon points="608,538 594,532 595,546" fill="#E15770"/>
+
+  <!-- side note -->
+  <rect x="40" y="470" width="220" height="110" rx="12" fill="#FFFFFF" stroke="#E6EAF0" stroke-width="2"/>
+  <text x="58" y="502" font-family="Noto Sans SC" font-size="15" font-weight="700" fill="#1A2433">两个工程关键点</text>
+  <text x="58" y="528" font-family="Noto Sans SC" font-size="13.5" fill="#6B7684">· 何时停止（防死循环）</text>
+  <text x="58" y="550" font-family="Noto Sans SC" font-size="13.5" fill="#6B7684">· 上下文累积（会撑爆</text>
+  <text x="58" y="570" font-family="Noto Sans SC" font-size="13.5" fill="#6B7684">　token → 跑久会忘事）</text>
+</svg>

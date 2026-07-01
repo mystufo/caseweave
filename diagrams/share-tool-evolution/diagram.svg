@@ -1,0 +1,72 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1040" height="560" viewBox="0 0 1040 560">
+  <rect x="0" y="0" width="1040" height="560" fill="#F7F9FC"/>
+  <text x="40" y="58" font-family="Noto Sans SC" font-size="30" font-weight="700" fill="#1A2433">工具接入方式的演化</text>
+  <text x="40" y="92" font-family="Noto Sans SC" font-size="18" fill="#6B7684">硬编码 → 标准化 → 通用化，能力上限一路打开</text>
+
+  <!-- baseline arrow -->
+  <polyline points="60,150 980,150" fill="none" stroke="#C7D0DC" stroke-width="3"/>
+  <polygon points="980,150 966,143 966,157" fill="#C7D0DC"/>
+  <text x="828" y="138" font-family="Noto Sans SC" font-size="14" fill="#9AA6B5">能力 / 灵活度</text>
+
+  <!-- Stage 1: Function Calling -->
+  <g>
+    <rect x="60" y="190" width="280" height="300" rx="16" fill="#FFFFFF" stroke="#E1577022" stroke-width="2"/>
+    <rect x="60" y="190" width="280" height="64" rx="16" fill="#FDEDEF"/>
+    <rect x="60" y="222" width="280" height="32" fill="#FDEDEF"/>
+    <circle cx="96" cy="222" r="16" fill="#E15770"/>
+    <text x="96" y="228" font-family="Noto Sans SC" font-size="18" font-weight="700" fill="#FFFFFF" text-anchor="middle">1</text>
+    <text x="124" y="228" font-family="Noto Sans SC" font-size="20" font-weight="700" fill="#1A2433">Function Calling</text>
+    <text x="84" y="296" font-family="Noto Sans SC" font-size="16" fill="#3D4757">模型只「说」要调哪个函数</text>
+    <text x="84" y="324" font-family="Noto Sans SC" font-size="16" fill="#3D4757">和参数，由代码去执行</text>
+    <rect x="84" y="350" width="232" height="1" fill="#EDEFF3"/>
+    <text x="84" y="386" font-family="Noto Sans SC" font-size="15" font-weight="700" fill="#E15770">痛点</text>
+    <text x="84" y="414" font-family="Noto Sans SC" font-size="15" fill="#6B7684">每个工具都要硬编码</text>
+    <text x="84" y="440" font-family="Noto Sans SC" font-size="15" fill="#6B7684">各家格式还不统一</text>
+    <text x="84" y="470" font-family="Noto Sans SC" font-size="14" fill="#AEB7C4">灵活度：低</text>
+  </g>
+
+  <!-- connector 1->2 -->
+  <polyline points="340,340 380,340" fill="none" stroke="#B9C3D0" stroke-width="3"/>
+  <polygon points="380,340 366,333 366,347" fill="#B9C3D0"/>
+
+  <!-- Stage 2: MCP -->
+  <g>
+    <rect x="380" y="160" width="280" height="330" rx="16" fill="#FFFFFF" stroke="#2F8F6622" stroke-width="2"/>
+    <rect x="380" y="160" width="280" height="64" rx="16" fill="#E9F6EF"/>
+    <rect x="380" y="192" width="280" height="32" fill="#E9F6EF"/>
+    <circle cx="416" cy="192" r="16" fill="#2F8F66"/>
+    <text x="416" y="198" font-family="Noto Sans SC" font-size="18" font-weight="700" fill="#FFFFFF" text-anchor="middle">2</text>
+    <text x="444" y="198" font-family="Noto Sans SC" font-size="20" font-weight="700" fill="#1A2433">MCP 协议</text>
+    <text x="404" y="266" font-family="Noto Sans SC" font-size="16" fill="#3D4757">把工具抽象成标准协议</text>
+    <text x="404" y="294" font-family="Noto Sans SC" font-size="16" fill="#3D4757">client / server 解耦可插拔</text>
+    <rect x="404" y="320" width="232" height="1" fill="#EDEFF3"/>
+    <text x="404" y="356" font-family="Noto Sans SC" font-size="15" font-weight="700" fill="#2F8F66">解决</text>
+    <text x="404" y="384" font-family="Noto Sans SC" font-size="15" fill="#6B7684">N×M 集成爆炸</text>
+    <text x="404" y="410" font-family="Noto Sans SC" font-size="15" fill="#6B7684">一次接入，到处复用</text>
+    <text x="404" y="440" font-family="Noto Sans SC" font-size="14" fill="#AEB7C4">灵活度：中</text>
+    <text x="404" y="470" font-family="Noto Sans SC" font-size="14" fill="#2F8F66">本项目 Phase 6 禅道 MCP</text>
+  </g>
+
+  <!-- connector 2->3 -->
+  <polyline points="660,310 700,310" fill="none" stroke="#B9C3D0" stroke-width="3"/>
+  <polygon points="700,310 686,303 686,317" fill="#B9C3D0"/>
+
+  <!-- Stage 3: CLI -->
+  <g>
+    <rect x="700" y="120" width="280" height="370" rx="16" fill="#FFFFFF" stroke="#3A6FF022" stroke-width="2"/>
+    <rect x="700" y="120" width="280" height="64" rx="16" fill="#E8F0FE"/>
+    <rect x="700" y="152" width="280" height="32" fill="#E8F0FE"/>
+    <circle cx="736" cy="152" r="16" fill="#3A6FF0"/>
+    <text x="736" y="158" font-family="Noto Sans SC" font-size="18" font-weight="700" fill="#FFFFFF" text-anchor="middle">3</text>
+    <text x="764" y="158" font-family="Noto Sans SC" font-size="20" font-weight="700" fill="#1A2433">CLI / Shell</text>
+    <text x="724" y="226" font-family="Noto Sans SC" font-size="16" fill="#3D4757">工具不再是几个函数，</text>
+    <text x="724" y="254" font-family="Noto Sans SC" font-size="16" fill="#3D4757">而是整个命令行 / 文件系统</text>
+    <rect x="724" y="280" width="232" height="1" fill="#EDEFF3"/>
+    <text x="724" y="316" font-family="Noto Sans SC" font-size="15" font-weight="700" fill="#3A6FF0">突破</text>
+    <text x="724" y="344" font-family="Noto Sans SC" font-size="15" fill="#6B7684">通用化，能力上限打开</text>
+    <text x="724" y="370" font-family="Noto Sans SC" font-size="15" fill="#6B7684">如 Claude Code 直接读写</text>
+    <text x="724" y="396" font-family="Noto Sans SC" font-size="15" fill="#6B7684">代码、跑命令</text>
+    <text x="724" y="440" font-family="Noto Sans SC" font-size="14" fill="#AEB7C4">灵活度：高</text>
+    <text x="724" y="470" font-family="Noto Sans SC" font-size="14" font-weight="700" fill="#3A6FF0">★ 能力上限被彻底打开</text>
+  </g>
+</svg>

@@ -1,0 +1,341 @@
+================================================================================
+TestCraft AI — 开发进度记录
+更新时间：2026-07-01
+================================================================================
+
+■ Phase 1 — 基础骨架                                              [✅ 已完成]
+  ├─ 项目目录结构初始化（backend / frontend / prompts / skills / docs）
+  ├─ docker-compose.yml（backend + frontend + PostgreSQL/pgvector）
+  ├─ Makefile（up / down / dev-backend / dev-frontend / install / lint）
+  ├─ .env.example（LLM / DB / LangSmith / Browser Agent / Zentao 配置项）
+  ├─ .gitignore
+  ├─ 数据库模型（SQLAlchemy async）
+  │   ├─ sessions / messages（对话会话与消息）
+  │   ├─ modules / module_relations（产品模块与关联关系）
+  │   ├─ knowledge_entries（知识条目，预留 embedding 字段）
+  │   ├─ documents（上传文档记录）
+  │   ├─ skills / prompt_versions（技能与 Prompt 版本）
+  │   └─ test_cases / feedbacks（测试用例与反馈）
+  ├─ FastAPI 主入口（app/main.py），startup 自动建表
+  ├─ 统一配置管理（app/config.py，pydantic-settings）
+  └─ React + TypeScript + Vite + Tailwind CSS v3 前端骨架
+
+■ Phase 2 — 核心功能流程                                          [✅ 已完成]
+  ├─ 文档解析模块（app/tools/doc_parser.py）
+  │   ├─ .docx 解析：python-docx，提取标题层级 / 正文 / 表格
+  │   └─ .pdf 解析：pdfplumber，按页提取文本
+  ├─ 对话与澄清模块
+  │   ├─ Clarifier Agent（app/agents/clarifier.py）
+  │   │   └─ 分析文档歧义，返回结构化澄清问题列表（JSON）
+  │   ├─ POST /api/upload：上传文档 → 解析 → 触发澄清 → 返回问题列表
+  │   └─ 前端 ClarificationPanel 组件：展示问题、收集用户回答
+  ├─ 测试用例生成模块
+  │   ├─ Generator Agent（app/agents/generator.py）
+  │   │   ├─ 基于文档 + 澄清结果生成结构化用例 JSON
+  │   │   └─ 支持流式（stream）和非流式两种模式
+  │   └─ POST /api/generate：调用 Agent → 持久化 TestCase → 返回用例列表
+  ├─ Excel 导出模块（app/tools/excel_export.py）
+  │   ├─ openpyxl 生成 .xlsx，按模块分 Sheet
+  │   ├─ 冻结首行、自动列宽、表头样式
+  │   └─ GET /api/export/{session_id}：下载当前会话全部用例
+  ├─ 反馈模块
+  │   ├─ POST /api/feedback：记录 like / dislike / edit
+  │   └─ edit 类型同步更新 TestCase 内容
+  ├─ 流式对话 API（POST /api/chat，SSE text/event-stream）
+  │   └─ 事件类型：session / text / done / error
+  ├─ 知识库基础 CRUD（GET/POST /api/modules，GET/PUT /api/knowledge）
+  └─ 前端核心组件
+      ├─ ChatPage.tsx（主页面：会话 + 对话 + 上传 + 用例表格）
+      ├─ ChatMessage.tsx（Markdown 渲染 + 流式光标）
+      ├─ MessageInput.tsx（自动扩展输入框 + 文件上传）
+      ├─ SessionList.tsx（左侧会话列表）
+      ├─ ClarificationPanel.tsx（澄清问题面板）
+      └─ TestCaseTable.tsx（可编辑用例表格 + 👍/👎/✏️ 反馈）
+
+────────────────────────────────────────────────────────────────────────────────
+
+■ 横切基础设施（跨阶段补充，代码已落地，原记录漏登）              [✅ 已完成]
+  ├─ 用户鉴权系统（app/auth.py + app/api/routes_auth.py）
+  │   ├─ User 模型（users 表）；passlib + bcrypt 密码哈希
+  │   ├─ JWT（PyJWT，HS256，默认 7 天过期；jwt_secret 配置项）
+  │   ├─ POST /api/auth/register（注册）
+  │   ├─ POST /api/auth/login（登录，返回 access_token）
+  │   ├─ GET  /api/auth/me（当前用户）
+  │   ├─ get_current_user 依赖 + admin 角色（admin_emails 白名单）
+  │   └─ require_admin / require_project 依赖（权限闸门）
+  ├─ 多项目 / 多租户（app/models/user.py:Project + routes_projects.py）
+  │   ├─ Project 模型（projects 表），数据按项目隔离
+  │   ├─ GET    /api/projects（列表）
+  │   ├─ POST   /api/projects（新建）
+  │   ├─ DELETE /api/projects/{project_id}（删除）
+  │   └─ 前端 LoginPage + ProjectPickerPage（登录 → 选项目 → 进工作台）
+  ├─ 飞书文档导入（app/tools/lark_fetcher.py）
+  │   ├─ 调用本机 lark-cli 拉取飞书文档（lark_cli_path / 超时可配）
+  │   ├─ POST /api/upload/lark/stream（SSE：拉取 → 解析 → 知识预览 → 自动分类）
+  │   └─ 前端 LarkUrlDialog（粘贴飞书 URL 导入）
+  └─ 前端体验增强组件
+      ├─ TabBar.tsx（对话 / 用例 / 知识库 多页签）
+      ├─ CasesPage.tsx（用例管理页：跨会话浏览 / 勾选导出 / 删除）
+      ├─ MindmapPasteDialog.tsx（脑图直接粘贴文本导入）
+      ├─ KnowledgePreviewPanel.tsx + KnowledgeDraftReviewPanel.tsx（知识预览 / 草稿审核）
+      └─ StopConfirmDialog.tsx（流式生成中断二次确认）
+
+────────────────────────────────────────────────────────────────────────────────
+
+■ Phase 3 — 知识系统                                              [✅ 已完成]
+  ├─ [✅] pgvector 扩展启用（init_db 自动 CREATE EXTENSION + embedding 列改 vector(N)）
+  │      └─ 维度变化时自动 DROP 重建（settings.embedding_dim 与现有列对比）
+  ├─ [✅] 知识条目向量化写入
+  │      ├─ Embedding API 调用（app/tools/embedding.py）
+  │      └─ 异步抽取 → pending_knowledge 草稿 → 用户审核入库
+  ├─ [✅] 语义检索接口（pgvector ivfflat cosine 索引 + lists=50）
+  │      └─ 注入 Clarifier / Generator 提示词
+  ├─ [✅] 模块关联关系管理（CRUD /api/module_relations）             [Task #84]
+  │      ├─ POST /api/module_relations（新建关联）
+  │      ├─ GET  /api/module_relations?project_id（列表）
+  │      ├─ DELETE /api/module_relations/{id}（删除）
+  │      └─ 前端 ModulesPage 关联关系编辑面板
+  ├─ [✅] 文档积累：上传时异步抽取业务规则草稿（pending_knowledge JSONB）
+  ├─ [✅] 知识矛盾检测                                                [Task #85]
+  │      ├─ pgvector 余弦相似度窗口：<0.05 视为重复，[0.05, 0.25] 视为冲突
+  │      ├─ 草稿审核面板高亮冲突条目（橙色边框 + 折叠提示）
+  │      └─ 提示用户去知识库页删除旧条目
+  ├─ [✅] 模块自动分类（新增）                                        [Task #86]
+  │      ├─ app/agents/module_classifier.py（LLM 分类器）
+  │      ├─ 置信度 ≥0.7 自动落库 + 系统消息气泡
+  │      ├─ 0.3–0.7 仅建议（不自动应用）
+  │      └─ SSE module_auto_classified 帧 + Message 持久化（刷新可回放）
+  ├─ [✅] 知识库可观测面板（新增）                                    [Task #87]
+  │      ├─ GET /api/knowledge/stats?recent_days=7
+  │      └─ KnowledgePage 顶部"总览"条：总条目 / 近 N 天新增 / 文档数 / 模块覆盖 / 类型分布
+  ├─ [✅] 测试脑图上传支持（新增）
+  │      ├─ Document.role（prd / mindmap）+ ClarificationState.mindmap_document_id
+  │      ├─ POST /api/upload/mindmap/stream（Markdown outline parser）
+  │      ├─ Clarifier / Generator 提示词改造：双输入冲突时以脑图为准
+  │      └─ 前端：上传脑图按钮 + 双 chip 状态 + 刷新回放
+  └─ [✅] 引入 Alembic 做正式数据库迁移管理                           [Task #88]
+         ├─ alembic.ini + alembic/env.py（async engine + 从 app.config 读 URL）
+         ├─ alembic/versions/0001_phase3_baseline.py（无操作 baseline 锚点）
+         ├─ database.py:_run_alembic_upgrade_head()
+         │   ├─ schema 已存在但 alembic_version 为空 → 自动 stamp baseline
+         │   ├─ 已 stamp 的库：upgrade head 推进增量 migration
+         │   └─ 任何异常吞掉但写 warning（不阻塞启动）
+         └─ ⚠️  后续新增列/索引必须放进 alembic/versions/NNNN_*.py，不要再往 init_db 加 ALTER
+
+■ Phase 4 — 反馈驱动进化                                          [🟡 第一阶段完成]
+  ├─ Phase 4.1 — 反馈闭环（已完成）
+  │   ├─ [✅] 反馈差异分析（LLM 分析 edit diff，提取修改意图）       [Task #89]
+  │   │      ├─ app/agents/diff_analyzer.py（DiffAnalysis dataclass）
+  │   │      ├─ intent 固定枚举（补充边界用例 / 修正业务规则 / 改写表达 / 调整步骤 / 其它）
+  │   │      └─ 仅"规则修改"才产 KnowledgeDraft（措辞修改产空）
+  │   ├─ [✅] edit 反馈触发后台分析                                  [Task #90]
+  │   │      ├─ submit_feedback 写库后异步 _analyze_diff_bg(...)
+  │   │      ├─ 仅 feedback_type=='edit' 且字段真有变化时才触发
+  │   │      ├─ 独立 AsyncSessionLocal()，全异常吞掉只 log warning
+  │   │      └─ 沉淀的产品规则 → store_entries(..., source='user_feedback')
+  │   ├─ [✅] GET /api/feedback/recent（前端"最近修改沉淀"卡数据源） [Task #91]
+  │   ├─ [✅] Skill CRUD + 自动归纳                                  [Task #92]
+  │   │      ├─ app/agents/skill_generator.py（LLM 归纳 Markdown Skill）
+  │   │      ├─ POST/PUT/DELETE /api/skills（人工管理）
+  │   │      ├─ POST /api/skills/regenerate（按模块手动触发自动归纳）
+  │   │      └─ source 区分 manual / auto_generated；版本号自增
+  │   ├─ [✅] Skill 注入到 Generator 提示词                          [Task #93]
+  │   │      ├─ generator.py 复用现有 skills 参数
+  │   │      ├─ 注入位置在"项目知识库"块之前（最高优先级）
+  │   │      └─ routes_generate.py 按 module_id 取最新 3 条注入
+  │   └─ [✅] 前端 Skill 抽屉 + 最近修改沉淀卡                       [Task #94]
+  │          ├─ KnowledgePage 头部"测试设计经验"按钮 → Skills 抽屉
+  │          ├─ 抽屉：列表 / 新建 / 编辑 / 删除 / 自动归纳触发
+  │          ├─ stats 面板下方"最近修改沉淀"小卡（intent badge + summary）
+  │          └─ 切换模块自动刷新该模块的最近沉淀
+  └─ Phase 4.2 — Prompt 版本化与人工管理（重定义，第一阶段已完成）
+      ├─ 第一阶段：人工 Prompt 管理（✅ 已完成 2026-06-30）
+      │   ├─ [✅] Prompt 版本化基础设施（DB-only）
+      │   │   ├─ PromptVersion 加 project_id / created_by（项目隔离）+ Alembic 0002 迁移
+      │   │   ├─ app/prompts/registry.py：登记 3 个 key（clarifier_initial /
+      │   │   │   clarifier_followup / generator），默认文本即代码常量"原始建议版本"
+      │   │   ├─ 加载层 get_active_prompt_text / resolve_active_prompt（流式自开 session）
+      │   │   ├─ 回退：DB 无激活版本时用代码默认常量
+      │   │   └─ clarifier(3)+generator(2) 函数加 system_prompt 参数；
+      │   │       routes_upload(3 处)+routes_generate(2 处)注入项目激活提示词
+      │   ├─ [✅] 后端 API（app/api/routes_prompts.py，登录用户可改 + 项目隔离）
+      │   │   ├─ GET    /api/prompts                          列表 + 生效概览
+      │   │   ├─ GET    /api/prompts/{key}/default            取原始建议版本
+      │   │   ├─ GET    /api/prompts/{key}/versions           历史版本列表
+      │   │   ├─ POST   /api/prompts/{key}/versions           保存为新版本（可同时激活）
+      │   │   ├─ POST   /api/prompts/{key}/versions/{id}/activate  切换生效
+      │   │   └─ POST   /api/prompts/{key}/reset              恢复使用原始建议版本
+      │   └─ [✅] 前端 PromptManagerDrawer（KnowledgePage 头部"系统提示词"按钮）
+      │       ├─ 左栏 3 个 prompt + 生效版本徽标；右栏编辑器 + 历史版本
+      │       ├─ 载入原始建议版本 / 保存为新版本 / 设为生效 / 恢复默认
+      │       └─ client.ts 新增 fetchPrompts 等 6 个 API
+      └─ 第二阶段：系统定期给建议 + 人工审核（待开发，暂记录）
+          ├─ 不做实时阈值自动改写、不做无人值守自动上线
+          ├─ 定期分析负反馈 → LLM 产出"建议的 prompt 改动"（草稿形式）
+          ├─ 建议呈现在管理面板，人工审核决定是否采用、如何采用
+          └─ 与 4.1 的"草稿 → 人工审核入库"模式保持一致
+
+■ 模块管理增强（跨阶段补充，2026-06-30）                          [✅ 已完成]
+  ├─ [✅] 模块聚合视图（以模块为中心查看 / 编辑名下资产）
+  │      ├─ 后端 routes_knowledge.py：
+  │      │   ├─ PUT  /api/modules/{id}    改模块名 / 描述（重名 IntegrityError → 400）
+  │      │   ├─ DELETE /api/modules/{id}  删模块（名下文档/Skill/知识靠 ON DELETE
+  │      │   │                            SET NULL 变"未分类"，不级联删数据）
+  │      │   ├─ GET  /api/documents       文档列表（module_id + only_orphan 哨兵 + role 过滤）
+  │      │   ├─ GET  /api/documents/{id}  文档详情（含 truncate_for_llm 截断正文，只读预览）
+  │      │   └─ PATCH /api/documents/{id} 改文档归属模块（module_id=null 取消归属）
+  │      └─ 前端 KnowledgePage：选中具体模块 → ModuleDetailCard
+  │          ├─ 模块名/描述内联编辑 + 删除（二次确认）
+  │          ├─ 需求文档 / 脑图分组列表：查看正文弹窗 / 飞书原文链接 / 下拉改归属
+  │          ├─ Skill 区块：复用已有 Skills 抽屉编辑逻辑
+  │          └─ client.ts 新增 fetchDocuments / fetchDocumentDetail /
+  │              updateDocumentModule / updateModule / deleteModule
+  ├─ [✅] 上传时 LLM 提议新模块（方案 B：保留进化能力 + 人工闸门）
+  │      ├─ 背景：原 module_classifier 只从已有模块归类、从不创建；项目零模块时
+  │      │       连 LLM 都不调 → 全流程跑完不产生任何模块，文档全落 module_id=NULL
+  │      ├─ app/agents/module_classifier.py：
+  │      │   ├─ ModuleSuggestion 加 proposed_name / proposed_description + has_proposal
+  │      │   ├─ SYSTEM_PROMPT 增补：判定都不匹配时额外产出 proposed_module:{name,description}
+  │      │   ├─ _parse 仅在 module_id=null 时采纳提议（命中已有模块则忽略）
+  │      │   └─ classify_module 去掉空候选早退 → 零模块也调 LLM（纯提议模式）
+  │      ├─ app/api/routes_upload.py：
+  │      │   ├─ _auto_classify_module_if_needed 透传带 proposal 的 suggestion
+  │      │   ├─ 抽 _emit_module_classification 辅助，消除 PRD/飞书/脑图三处重复 SSE 块
+  │      │   └─ SSE payload + 落库 ref 新增 document_id + proposed_module
+  │      └─ 前端 ChatPage：会话级临时态 moduleProposal + 确认卡
+  │          ├─ 「创建并归类」→ POST /api/modules + PATCH /api/documents/{id}（复用接口）
+  │          ├─ 「忽略」→ 文档保持未分类
+  │          └─ 临时提示不持久化（分类系统气泡仍照常落库可回放）
+  ├─ [✅] PromptManagerDrawer 布局调整
+  │      └─ 历史版本从编辑器下方挪到右侧竖栏；弹窗加宽 900 → 1140px
+  └─ [✅] 模块中英文双名 + 用例对齐 + 提议确认卡可编辑（2026-07-01）
+         ├─ 背景：用户要求确认卡能改建议的模块名；且确认建模块后，生成用例的
+         │       模块名要与之一致 → 模块需同时有中文名 + 英文名
+         ├─ 决策：模块英文名 = 用例编号前缀 case_prefix（模块/用例模块名/编号前缀三者统一）
+         ├─ 数据模型：Module 加 code 列（String40，可空）+ Alembic 0003_module_code
+         ├─ app/agents/module_classifier.py：
+         │   ├─ ModuleSuggestion 加 proposed_code
+         │   ├─ SYSTEM_PROMPT proposed_module 增加 code（大写英文，如 ORDER-MGMT）
+         │   └─ _parse 用 clarifier._sanitize_case_prefix 归一（非法→None，不硬塞 CASE）
+         ├─ app/api/routes_upload.py：_emit_module_classification 的 proposed 加 code
+         ├─ app/api/routes_knowledge.py：ModuleCreate/Update 加 code + _normalize_module_code；
+         │   list/create/update 返回体带 code
+         ├─ app/api/routes_generate.py（核心对齐）：解析文档所属 Module 后，
+         │   module.code 非空 → 覆盖 case_prefix，保证用例编号前缀 = 模块英文名；
+         │   用例 module 字段仍取中文名（Excel 按中文名分 Sheet）
+         └─ 前端：
+             ├─ client.ts：ModuleSummary/createModule/updateModule/proposed_module 加 code
+             ├─ ChatPage 确认卡：改为中文名/英文名/描述三输入框 + 英文名格式校验
+             └─ KnowledgePage 模块详情卡：展示 code 徽标 + 编辑时可改英文名
+
+■ Phase 5 — Browser Agent（产品自主探索）                          [⬜ 待开发]
+  ├─ Playwright 封装为 LangChain Tool（browse_product）
+  ├─ 浏览策略由 LLM 规划（给定目标模块 → 生成访问计划）
+  ├─ 页面结构分析：导航结构、功能入口、UI 元素识别
+  ├─ 探索结果知识化（LLM 总结 → 存入知识库）
+  ├─ 截图存档（关键页面）
+  ├─ 安全约束：只读操作，不执行删除 / 修改数据
+  ├─ POST /api/explore：触发探索任务
+  └─ 前端：在知识管理页触发探索、查看探索日志
+
+■ Phase 6 — 集成优化与 Dashboard                                  [⬜ 待开发]
+  ├─ 禅道 MCP 集成（query_zentao Tool）
+  │   ├─ 读取 Bug 数据（标题 / 模块 / 严重程度 / 重现步骤）
+  │   ├─ 缺陷热点分析（高风险模块识别）
+  │   ├─ 缺陷模式归纳（LLM 聚类）
+  │   └─ 自动生成回归用例补充建议
+  ├─ Dashboard 统计页（DashboardPage）
+  │   ├─ 用例生成历史记录
+  │   ├─ 反馈正面率趋势图
+  │   ├─ 知识增长曲线
+  │   └─ Bug 覆盖率看板
+  └─ 整体性能调优与压测
+
+================================================================================
+当前可用接口速查
+================================================================================
+  — 鉴权 / 项目 —
+  POST   /api/auth/register         注册
+  POST   /api/auth/login            登录（返回 JWT access_token）
+  GET    /api/auth/me               当前用户
+  GET    /api/projects              项目列表
+  POST   /api/projects              新建项目
+  DELETE /api/projects/{id}         删除项目
+
+  — 会话 / 对话 —
+  POST   /api/chat                  流式对话（SSE）
+  GET    /api/sessions              会话列表
+  POST   /api/sessions              新建会话
+  PATCH  /api/sessions/{id}         会话重命名
+  GET    /api/sessions/{id}/messages 会话消息历史
+  GET    /api/sessions/{id}/clarification_state 会话澄清状态（刷新回放）
+
+  — 上传 / 澄清 / 生成 —
+  POST   /api/upload                上传文档（返回解析结果 + 澄清问题）
+  POST   /api/upload/stream         上传 PRD（SSE：解析 / 知识预览 / 自动分类）
+  POST   /api/upload/mindmap/stream 上传测试脑图（SSE，Markdown outline）
+  POST   /api/upload/lark/stream    飞书文档导入（SSE，调用 lark-cli）
+  POST   /api/clarify/initial/stream 首轮澄清（SSE，PRD/脑图至少一份）
+  POST   /api/clarify/followup/stream 续答澄清（SSE）
+  POST   /api/generate              生成测试用例（PRD + 脑图双输入）
+
+  — 用例 / 导出 —
+  GET    /api/cases                 用例列表（跨会话浏览）
+  GET    /api/sessions/{id}/cases   指定会话用例
+  DELETE /api/cases/{id}            删除用例
+  POST   /api/export/cases          按勾选的用例 ID 导出 Excel
+  GET    /api/export/{session_id}   导出会话全部用例 Excel
+
+  — 反馈 —
+  POST   /api/feedback              提交反馈（like / dislike / edit；edit 异步触发 diff 分析）
+  GET    /api/feedback/recent       最近 N 条已分析的 edit 反馈（intent + summary）
+
+  — 模块 / 知识库 —
+  GET    /api/modules               模块列表（含 code 英文名）
+  POST   /api/modules               新建模块（可带 code 英文名 = 用例编号前缀）
+  PUT    /api/modules/{id}          改模块中文名 / 英文名 code / 描述
+  DELETE /api/modules/{id}          删除模块（名下资产变未分类，不级联删）
+  GET    /api/module_relations      模块关联关系列表
+  POST   /api/module_relations      新建关联
+  DELETE /api/module_relations/{id} 删除关联
+  GET    /api/documents             文档列表（module_id / only_orphan / role 过滤）
+  GET    /api/documents/{id}        文档详情（含截断正文，只读预览）
+  PATCH  /api/documents/{id}        改文档归属模块（module_id=null 取消归属）
+  GET    /api/knowledge/preview     知识预览
+  GET    /api/knowledge/stats       知识库总览（总条目 / 类型 / 模块覆盖 / 近 N 天新增）
+  GET    /api/knowledge             知识条目列表
+  GET    /api/knowledge/{module_id} 指定模块知识条目
+  PUT    /api/knowledge/{id}        更新知识条目
+  DELETE /api/knowledge/{id}        删除知识条目
+  GET    /api/documents/{id}/pending_knowledge          文档待审核知识草稿
+  POST   /api/documents/{id}/confirm_pending_knowledge  确认草稿入库
+
+  — Skill（测试设计经验）—
+  GET    /api/skills                技能列表
+  GET    /api/skills/{id}           Skill 详情（含 content）
+  POST   /api/skills                新建 Skill（人工）
+  PUT    /api/skills/{id}           更新 Skill（content 改变时 version 自增）
+  DELETE /api/skills/{id}           删除 Skill
+  POST   /api/skills/regenerate     按模块自动归纳 Skill（LLM）
+
+  — System Prompt 版本化（Phase 4.2，项目隔离）—
+  GET    /api/prompts                      可管理提示词列表 + 生效概览
+  GET    /api/prompts/{key}/default        取原始建议版本（代码默认）
+  GET    /api/prompts/{key}/versions       历史版本列表
+  POST   /api/prompts/{key}/versions       保存为新版本（activate 可同时设为生效）
+  POST   /api/prompts/{key}/versions/{id}/activate  切换生效版本
+  POST   /api/prompts/{key}/reset          恢复使用原始建议版本
+
+  — 系统 —
+  GET    /health                    健康检查
+
+================================================================================
+快速启动
+================================================================================
+  1. cp .env.example .env  （填写 LLM_API_KEY）
+  2. make up               （Docker 一键启动）
+     或：make db-up && make dev-backend  （+另一终端 make dev-frontend）
+  前端地址：http://localhost:3001（Docker）/ http://localhost:5173（本地开发）
+  后端地址：http://localhost:8001
+  API 文档：http://localhost:8001/docs
+================================================================================
