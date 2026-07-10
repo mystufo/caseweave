@@ -196,7 +196,7 @@ async def classify_module(
         ])
     except Exception as e:
         logger.warning("module classifier LLM call failed: %s", e)
-        return ModuleSuggestion(None, 0.0, f"LLM 调用失败")
+        return ModuleSuggestion(None, 0.0, "LLM 调用失败")
 
     elapsed_ms = (time.perf_counter() - start) * 1000
     raw_content: Any = resp.content

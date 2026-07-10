@@ -18,13 +18,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.agents.diff_analyzer import (
     DiffAnalysis,
     analyze_edit,
-    diff_changed_fields,
     has_real_diff,
 )
+from app.agents.feedback_triage import triage_intent, classify_dislike, targets_to_str
 from app.auth import get_current_user, require_project
 from app.database import AsyncSessionLocal, get_db
 from app.knowledge.store import store_entries
-from app.models.feedback import TestCase, Feedback
+from app.models.feedback import TestCase, Feedback, FeedbackConsumption
 from app.models.knowledge import Module
 from app.models.user import User
 
@@ -38,6 +38,21 @@ class FeedbackRequest(BaseModel):
     feedback_type: str  # like / dislike / edit
     original_content: dict | None = None
     modified_content: dict | None = None
+    reason: str | None = None  # dislike 可选原因文本（进化链路 3）
+
+
+async def _record_consumption(
+    db: AsyncSession, feedback_id: int, output_kind: str, output_ref_id: int | None
+) -> None:
+    """写一条消费台账（幂等：撞唯一约束就忽略）。调用方负责 commit。"""
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+    stmt = (
+        pg_insert(FeedbackConsumption)
+        .values(feedback_id=feedback_id, output_kind=output_kind, output_ref_id=output_ref_id)
+        .on_conflict_do_nothing(constraint="uq_feedback_consumption")
+    )
+    await db.execute(stmt)
 
 
 async def _analyze_diff_bg(
@@ -48,7 +63,7 @@ async def _analyze_diff_bg(
     original: dict[str, Any] | None,
     modified: dict[str, Any] | None,
 ) -> None:
-    """异步后台任务：跑 diff 分析，把结果回写 feedbacks.diff_analysis；规则入知识库。
+    """异步后台任务：跑 diff 分析，回写 diff_analysis + triage/targets；规则入知识库并记消费台账。
 
     完全 fail-open：任何异常都吞掉 + log warning，不影响主请求已经返回的结果。
     """
@@ -60,17 +75,21 @@ async def _analyze_diff_bg(
             logger.info("diff analyzer returned None for feedback=%d (no changes or LLM fail)", feedback_id)
             return
 
+        targets = triage_intent(analysis.intent)
+
         async with AsyncSessionLocal() as db:
-            # 回写 diff_analysis（JSON-as-text）
+            # 回写 diff_analysis（JSON-as-text）+ 分诊结果
             r = await db.execute(select(Feedback).where(Feedback.id == feedback_id))
             fb = r.scalar_one_or_none()
             if fb is None:
                 logger.warning("feedback %d gone before diff analysis landed", feedback_id)
                 return
             fb.diff_analysis = json.dumps(analysis.to_jsonable(), ensure_ascii=False)
+            fb.triage = analysis.intent
+            fb.triage_targets = targets_to_str(targets)
 
-            # 入知识库（仅当 LLM 真的抽到了规则）
-            if analysis.extracted_rules:
+            # 入知识库（仅当分诊到 knowledge 且 LLM 真的抽到了规则）
+            if "knowledge" in targets and analysis.extracted_rules:
                 # 反查 module_id：用例上的 module 字段是名字，按 (project, name) 找；找不到走 project-level NULL
                 module_id: int | None = None
                 if module_name:
@@ -88,20 +107,54 @@ async def _analyze_diff_bg(
                     document_id=None,
                     drafts=analysis.extracted_rules,
                 )
+                # 知识出口在"分析即消费"（store_entries 返回计数不返回 id，ref 记 None）
+                if inserted > 0:
+                    await _record_consumption(db, feedback_id, "knowledge", None)
                 logger.info(
-                    "diff analyzer | feedback=%d module=%s intent=%s rules_extracted=%d rules_inserted=%d",
-                    feedback_id, module_name, analysis.intent,
-                    len(analysis.extracted_rules), inserted,
+                    "diff analyzer | feedback=%d module=%s intent=%s targets=%s rules_inserted=%d",
+                    feedback_id, module_name, analysis.intent, targets, inserted,
                 )
             else:
                 logger.info(
-                    "diff analyzer | feedback=%d intent=%s no rules extracted",
-                    feedback_id, analysis.intent,
+                    "diff analyzer | feedback=%d intent=%s targets=%s (no knowledge consumption)",
+                    feedback_id, analysis.intent, targets,
                 )
 
             await db.commit()
     except Exception as exc:
         logger.warning("diff analysis background task failed (feedback=%d): %s", feedback_id, exc)
+
+
+async def _analyze_dislike_bg(
+    *,
+    feedback_id: int,
+    module_name: str | None,
+    reason: str,
+    case: dict[str, Any] | None,
+) -> None:
+    """带原因的 dislike：LLM 归一到 intent → 写 triage/targets（让 dislike 也进分诊链路）。
+
+    不直接产知识（dislike 无 before/after diff，抽不出规则）；只打分诊标签，
+    供 prompt/skill 出口按 target 取用。fail-open。
+    """
+    try:
+        intent = await classify_dislike(reason=reason, case=case, module_name=module_name)
+        targets = triage_intent(intent)
+        async with AsyncSessionLocal() as db:
+            fb = (await db.execute(select(Feedback).where(Feedback.id == feedback_id))).scalar_one_or_none()
+            if fb is None:
+                return
+            # 存一份精简 analysis，让下游 prompt/skill 聚合能读到 intent/summary
+            fb.diff_analysis = json.dumps(
+                {"intent": intent, "summary": reason.strip()[:200], "changed_fields": []},
+                ensure_ascii=False,
+            )
+            fb.triage = intent
+            fb.triage_targets = targets_to_str(targets)
+            await db.commit()
+        logger.info("dislike triaged | feedback=%d intent=%s targets=%s", feedback_id, intent, targets)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("dislike analysis background task failed (feedback=%d): %s", feedback_id, exc)
 
 
 @router.post("/feedback")
@@ -126,6 +179,7 @@ async def submit_feedback(
         feedback_type=request.feedback_type,
         original_content=request.original_content,
         modified_content=request.modified_content,
+        reason=(request.reason or None),
     )
     db.add(feedback)
 
@@ -152,6 +206,19 @@ async def submit_feedback(
             module_name=test_case.module,
             original=request.original_content,
             modified=request.modified_content,
+        ))
+    # dislike 带原因：走归一分诊链路，让👎也能进化（问题 A）
+    elif feedback.feedback_type == "dislike" and (request.reason or "").strip():
+        case_snapshot = {
+            "name": test_case.name,
+            "steps": test_case.steps,
+            "expected_result": test_case.expected_result,
+        }
+        asyncio.create_task(_analyze_dislike_bg(
+            feedback_id=feedback.id,
+            module_name=test_case.module,
+            reason=request.reason or "",
+            case=case_snapshot,
         ))
 
     return {"id": feedback.id, "status": "recorded"}
@@ -212,3 +279,51 @@ async def list_recent_feedback(
             "created_at": fb.created_at.isoformat() if fb.created_at else None,
         })
     return {"items": items}
+
+
+@router.get("/feedback/evolution/summary")
+async def evolution_summary(
+    project_id: int = Depends(require_project),
+    _user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """反馈进化总览：三出口（knowledge/skill/prompt）的待消费/已消费计数 + 分诊分布。
+
+    第二步「反馈进化」面板的数据源；第一步先落 API，可 curl 验证。
+    """
+    # 本项目所有已分诊反馈（triage_targets 非空）
+    triaged = (await db.execute(
+        select(Feedback.id, Feedback.triage, Feedback.triage_targets)
+        .join(TestCase, TestCase.id == Feedback.test_case_id)
+        .where(TestCase.project_id == project_id, Feedback.triage_targets.isnot(None))
+    )).all()
+
+    # 已消费映射：feedback_id → set(kinds)
+    consumed = (await db.execute(
+        select(FeedbackConsumption.feedback_id, FeedbackConsumption.output_kind)
+        .join(Feedback, Feedback.id == FeedbackConsumption.feedback_id)
+        .join(TestCase, TestCase.id == Feedback.test_case_id)
+        .where(TestCase.project_id == project_id)
+    )).all()
+    consumed_map: dict[int, set[str]] = {}
+    for fid, kind in consumed:
+        consumed_map.setdefault(fid, set()).add(kind)
+
+    outputs = {k: {"pending": 0, "consumed": 0} for k in ("knowledge", "skill", "prompt")}
+    intent_dist: dict[str, int] = {}
+    for fid, intent, targets in triaged:
+        if intent:
+            intent_dist[intent] = intent_dist.get(intent, 0) + 1
+        for kind in (targets.split(",") if targets else []):
+            if kind not in outputs:
+                continue
+            if kind in consumed_map.get(fid, set()):
+                outputs[kind]["consumed"] += 1
+            else:
+                outputs[kind]["pending"] += 1
+
+    return {
+        "outputs": outputs,               # 每出口 待消费/已消费
+        "intent_distribution": intent_dist,  # 归一 intent 分布
+        "triaged_total": len(triaged),
+    }

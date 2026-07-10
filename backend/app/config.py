@@ -21,6 +21,13 @@ class Settings(BaseSettings):
     clarifier_max_tokens: int = 8192
     knowledge_max_tokens: int = 8192
 
+    # ── Phase 4.2 二阶段：系统给 generator 提示词的改进建议 ────────────────────
+    # 定期后台任务只生成 pending 草稿、绝不激活；采用仍靠人工走版本化 API。
+    # interval_hours ≤ 0 关闭后台巡检（仅保留网页端手动按钮）。
+    prompt_suggestion_interval_hours: float = 24.0
+    # 少于该条负反馈样本就不给建议（信号太弱）。手动 / 后台共用。
+    prompt_suggestion_min_samples: int = 3
+
     # Embedding (OpenAI-compatible /v1/embeddings; 用于 Phase 3 知识库语义检索)
     # 留空 → store 静默降级（写入跳过 embedding，搜索退化为按时间倒序），不会阻塞 LLM 主流程
     embedding_provider: str = "openai"           # 目前仅支持 openai 兼容接口

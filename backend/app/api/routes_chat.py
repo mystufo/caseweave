@@ -5,7 +5,7 @@ from typing import AsyncGenerator
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from sqlalchemy import select, desc
+from sqlalchemy import select, desc, delete as sa_delete
 from sqlalchemy.ext.asyncio import AsyncSession
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 
@@ -14,6 +14,7 @@ from app.database import get_db
 from app.models.session import Session, Message
 from app.models.clarification import ClarificationState
 from app.models.knowledge import Document
+from app.models.feedback import TestCase, Feedback
 from app.models.user import User
 from app.config import get_settings
 from app.agents.llm_factory import build_chat_model
@@ -168,6 +169,32 @@ async def update_session(
     }
 
 
+@router.delete("/sessions/{session_id}")
+async def delete_session(
+    session_id: int,
+    project_id: int = Depends(require_project),
+    _user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """删除会话及其从属数据。手动按序清子表——init_db 建表未走迁移，不能保证 DB
+    层真的建了 ON DELETE CASCADE 外键，这里显式删更稳妥。Document 不随会话删除
+    （按 sha256 复用、可能被其他会话共享），仅解绑无需处理——Document 不引用 session。"""
+    session = await _load_session_scoped(session_id, project_id, db)
+
+    # Feedback（挂在 test_case 上）→ TestCase → Message / ClarificationState → Session
+    case_ids = (await db.execute(
+        select(TestCase.id).where(TestCase.session_id == session_id)
+    )).scalars().all()
+    if case_ids:
+        await db.execute(sa_delete(Feedback).where(Feedback.test_case_id.in_(case_ids)))
+    await db.execute(sa_delete(TestCase).where(TestCase.session_id == session_id))
+    await db.execute(sa_delete(Message).where(Message.session_id == session_id))
+    await db.execute(sa_delete(ClarificationState).where(ClarificationState.session_id == session_id))
+    await db.delete(session)
+    await db.commit()
+    return {"deleted": True, "id": session_id}
+
+
 @router.get("/sessions/{session_id}/messages")
 async def get_messages(
     session_id: int,
@@ -224,6 +251,7 @@ async def get_clarification_state(
     mindmap_stats: dict | None = None
     prd_pending_drafts: list | None = None
     mindmap_pending_drafts: list | None = None
+    module_id_by_doc: dict[int, int | None] = {}
     doc_ids = [x for x in (st.document_id, st.mindmap_document_id) if x is not None]
     if doc_ids:
         rd = await db.execute(
@@ -232,6 +260,7 @@ async def get_clarification_state(
             )
         )
         for d in rd.scalars().all():
+            module_id_by_doc[d.id] = d.module_id
             stats = {
                 "chunks": len(d.parsed_content or []),
                 "tables": 0,
@@ -246,6 +275,43 @@ async def get_clarification_state(
                 mindmap_stats = stats
                 mindmap_pending_drafts = d.pending_knowledge if isinstance(d.pending_knowledge, list) else None
 
+    # 重建「建议新建模块」卡片——它原本只由上传时的 SSE 帧填充，刷新后会丢。
+    # 数据源是已落库的 module_auto_classified 系统气泡（meta.ref.proposed_module）。
+    # 只在满足以下条件时复原，避免把已处理的提议又弹回来：
+    #   - applied=false（当时不是高置信自动归类）
+    #   - 引用文档仍未归类（module_id IS NULL）——用户点过「创建并归类」后 module_id 会被写上，提议即作废。
+    # 取时间上最近的一条。用户点「忽略」是纯前端操作，刷新后该提议会再次出现（属可接受行为：这只是一个建议）。
+    module_proposal: dict | None = None
+    mrows = await db.execute(
+        select(Message)
+        .where(Message.session_id == session_id, Message.role == "assistant")
+        .order_by(Message.created_at.desc())
+    )
+    for m in mrows.scalars().all():
+        if not m.meta:
+            continue
+        try:
+            meta = json.loads(m.meta)
+        except Exception:
+            continue
+        if meta.get("kind") != "module_auto_classified":
+            continue
+        ref = meta.get("ref") or {}
+        prop = ref.get("proposed_module")
+        if not prop or ref.get("applied"):
+            continue
+        doc_id = ref.get("document_id")
+        # 引用文档已归类（用户已确认或高置信自动归类）→ 提议作废，跳过
+        if doc_id is not None and module_id_by_doc.get(doc_id) is not None:
+            continue
+        module_proposal = {
+            "document_id": doc_id,
+            "name": prop.get("name") or "",
+            "code": prop.get("code") or "",
+            "description": prop.get("description"),
+        }
+        break
+
     return {
         "session_id": st.session_id,
         "document_id": st.document_id,
@@ -256,6 +322,7 @@ async def get_clarification_state(
         "mindmap_stats": mindmap_stats,
         "prd_pending_drafts": prd_pending_drafts,
         "mindmap_pending_drafts": mindmap_pending_drafts,
+        "module_proposal": module_proposal,
         "summary": st.summary,
         "module_detected": st.module_detected,
         "case_prefix_suggestion": st.case_prefix_suggestion,

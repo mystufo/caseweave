@@ -41,7 +41,9 @@ logs:
 
 # ── Local development ─────────────────────────────────────────────────────────
 dev-backend:
-	cd backend && ../$(VENV)/bin/uvicorn app.main:app --reload --host 0.0.0.0 --port 8001
+	cd backend && ../$(VENV)/bin/uvicorn app.main:app --reload \
+		--reload-dir app --reload-include '*.py' \
+		--host 0.0.0.0 --port 8001
 
 dev-frontend:
 	cd frontend && npm run dev

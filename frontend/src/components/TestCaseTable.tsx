@@ -32,6 +32,9 @@ export default function TestCaseTable({ cases, onExport, onCaseUpdate, onCaseDel
   // 二次确认：第一次点删除展开内联确认条，第二次才真删——避免误触
   const [confirmingDelete, setConfirmingDelete] = useState<number | null>(null)
   const [deleting, setDeleting] = useState<number | null>(null)
+  // 点👎后展开可选原因输入（填了作强信号进分诊，可直接跳过）
+  const [dislikeReasonFor, setDislikeReasonFor] = useState<number | null>(null)
+  const [dislikeReason, setDislikeReason] = useState('')
 
   const performDelete = async (id: number) => {
     setDeleting(id)
@@ -48,8 +51,22 @@ export default function TestCaseTable({ cases, onExport, onCaseUpdate, onCaseDel
   }
 
   const handleFeedback = async (id: number, type: 'like' | 'dislike') => {
+    // 👎：先展开可选原因输入，不立即提交
+    if (type === 'dislike') {
+      setDislikeReasonFor(id)
+      setDislikeReason('')
+      return
+    }
     setFeedback(prev => ({ ...prev, [id]: type }))
     await submitFeedback(id, type)
+  }
+
+  const submitDislike = async (id: number) => {
+    setFeedback(prev => ({ ...prev, [id]: 'dislike' }))
+    const reason = dislikeReason.trim()
+    setDislikeReasonFor(null)
+    setDislikeReason('')
+    await submitFeedback(id, 'dislike', undefined, undefined, reason || undefined)
   }
 
   const startEdit = (tc: TestCase) => {
@@ -211,6 +228,32 @@ export default function TestCaseTable({ cases, onExport, onCaseUpdate, onCaseDel
                             <X size={14} />
                           </button>
                         </>
+                      ) : dislikeReasonFor === tc.id ? (
+                        <>
+                          <input
+                            type="text"
+                            value={dislikeReason}
+                            onChange={e => setDislikeReason(e.target.value)}
+                            onKeyDown={e => { if (e.key === 'Enter') void submitDislike(tc.id) }}
+                            placeholder="原因（可选，如：漏了边界/步骤太粗）"
+                            autoFocus
+                            className="w-44 px-1.5 py-0.5 text-[11px] border border-gray-200 rounded focus:outline-none focus:ring-1 focus:ring-red-300"
+                          />
+                          <button
+                            onClick={() => void submitDislike(tc.id)}
+                            className="text-red-500 hover:text-red-600"
+                            title="提交（可留空）"
+                          >
+                            <Check size={14} />
+                          </button>
+                          <button
+                            onClick={() => { setDislikeReasonFor(null); setDislikeReason('') }}
+                            className="text-gray-400 hover:text-gray-500"
+                            title="取消"
+                          >
+                            <X size={14} />
+                          </button>
+                        </>
                       ) : (
                         <>
                           <button
@@ -223,7 +266,7 @@ export default function TestCaseTable({ cases, onExport, onCaseUpdate, onCaseDel
                           <button
                             onClick={() => handleFeedback(tc.id, 'dislike')}
                             className={`transition-colors ${feedback[tc.id] === 'dislike' ? 'text-red-500' : 'text-gray-300 hover:text-red-400'}`}
-                            title="踩"
+                            title="踩（可补充原因，帮助系统改进）"
                           >
                             <ThumbsDown size={13} />
                           </button>

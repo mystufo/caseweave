@@ -1,5 +1,4 @@
 """Upload & document parsing API."""
-import asyncio
 import hashlib
 import json
 import logging
@@ -628,7 +627,7 @@ async def upload_document_stream(
 
     if not await _verify_session(session_id, project_id):
         raise HTTPException(status_code=404, detail="Session not found")
-    print(f"[DEBUG] step3 session verified", flush=True, file=sys.stderr)
+    print("[DEBUG] step3 session verified", flush=True, file=sys.stderr)
 
     logger.info("Upload(stream) received | filename=%s size=%d session_id=%s", filename, len(file_bytes), session_id)
 
@@ -754,16 +753,33 @@ async def upload_document_stream(
                 module_name = module.name if module else None
 
             ext = filename.rsplit(".", 1)[-1].lower()
-            doc_record = Document(
-                project_id=project_id,
-                filename=filename,
-                sha256=sha256,
-                module_id=effective_module_id,
-                file_type=ext,
-                parsed_content=parsed["chunks"],
-                raw_text=parsed["raw_text"],
-            )
-            db.add(doc_record)
+            # 同 (project_id, sha256) 的 Document 可能已存在（此前上传崩在澄清前、或
+            # 成功过但方案B下 Document.clarification 为空、上面 cache_hit 未命中）。
+            # 无条件 INSERT 会撞唯一约束 uq_documents_project_sha —— 已存在就复用并刷新。
+            existing_doc = (await db.execute(
+                select(Document).where(
+                    Document.sha256 == sha256, Document.project_id == project_id
+                )
+            )).scalar_one_or_none()
+            if existing_doc is not None:
+                doc_record = existing_doc
+                doc_record.filename = filename
+                if effective_module_id is not None:
+                    doc_record.module_id = effective_module_id
+                doc_record.file_type = ext
+                doc_record.parsed_content = parsed["chunks"]
+                doc_record.raw_text = parsed["raw_text"]
+            else:
+                doc_record = Document(
+                    project_id=project_id,
+                    filename=filename,
+                    sha256=sha256,
+                    module_id=effective_module_id,
+                    file_type=ext,
+                    parsed_content=parsed["chunks"],
+                    raw_text=parsed["raw_text"],
+                )
+                db.add(doc_record)
             await db.commit()
             await db.refresh(doc_record)
             document_id = doc_record.id
@@ -789,6 +805,25 @@ async def upload_document_stream(
             "tables": len(parsed["tables"]),
             "raw_text_length": len(parsed["raw_text"]),
         }
+
+        # 步骤顺序：模块归类（上面已发）→ 产品知识草稿抽取 → 知识库预览（注入 + 开始澄清）。
+        # 先同步抽取草稿并停在审核闸门，再算知识预览——保证前端"模块→知识草稿→开始澄清"的推进顺序。
+        yield _sse("stage", {"stage": "knowledge_extract", "message": "正在抽取可沉淀的产品知识…"})
+        drafts = await _extract_and_stash_pending(
+            document_id=document_id,
+            raw_text=parsed["raw_text"],
+            module_name=module_name,
+            project_id=project_id,
+            module_id=effective_module_id,
+        )
+        yield _sse("extracted_knowledge_drafts", {
+            "document_id": document_id,
+            "module_id": effective_module_id,
+            "module_name": module_name,
+            "role": "prd",
+            "drafts": drafts,
+        })
+
         yield _sse("stage", {"stage": "knowledge_lookup", "message": "正在检索项目知识库相关条目…"})
         knowledge_hits = await _compute_knowledge_preview(
             project_id=project_id, module_id=effective_module_id, document_id=document_id,
@@ -811,24 +846,6 @@ async def upload_document_stream(
             "stats": stats,
             "module_name": module_name,
             "hits": knowledge_hits,
-        })
-
-        # 同步抽取产品知识草稿（B 方案"用户确认入库"闸门）：抽取完成后才发 done
-        # —— 让前端在进入澄清前先弹出草稿审核面板。
-        yield _sse("stage", {"stage": "knowledge_extract", "message": "正在抽取可沉淀的产品知识…"})
-        drafts = await _extract_and_stash_pending(
-            document_id=document_id,
-            raw_text=parsed["raw_text"],
-            module_name=module_name,
-            project_id=project_id,
-            module_id=effective_module_id,
-        )
-        yield _sse("extracted_knowledge_drafts", {
-            "document_id": document_id,
-            "module_id": effective_module_id,
-            "module_name": module_name,
-            "role": "prd",
-            "drafts": drafts,
         })
         yield _sse("done", {})
 
@@ -875,7 +892,7 @@ async def upload_lark_stream(
     if not await _verify_session(session_id, project_id):
         raise HTTPException(status_code=404, detail="Session not found")
 
-    async def events():
+    async def _events_inner():
         # module_id 在下面（自动归类命中时）会被重新赋值；不声明 nonlocal 的话
         # Python 会把它当 events() 的局部变量，导致赋值前的读取触发 UnboundLocalError。
         nonlocal module_id
@@ -1049,6 +1066,17 @@ async def upload_lark_stream(
                 module = result.scalar_one_or_none()
                 module_name = module.name if module else None
 
+            # 同 (project_id, sha256) 的 Document 可能已存在——比如此前导入跑到一半
+            # 崩了、或成功过但未走 clarification 缓存分支（方案B下 PRD 澄清在独立端点
+            # 完成，Document.clarification 常为空，上面的 cache_hit 判断对 PRD 基本不命中）。
+            # 若仍无条件 INSERT 会撞唯一约束 uq_documents_project_sha。这里改为：已存在
+            # 就复用该行（刷新可变字段），不存在才新建。
+            existing_doc = (await db.execute(
+                select(Document).where(
+                    Document.sha256 == sha256, Document.project_id == project_id
+                )
+            )).scalar_one_or_none()
+
             if is_mindmap_role:
                 # 脑图：把 lark 抓回来的 markdown 文本喂给 mindmap_parser 拆成层级 chunks，
                 # raw_text 复用 parser 的输出（标准化缩进），与本地 .md 上传路径同 shape。
@@ -1059,32 +1087,56 @@ async def upload_lark_stream(
                     async for ev in emit_error(f"飞书脑图解析失败：{exc}"):
                         yield ev
                     return
-                doc_record = Document(
-                    project_id=project_id,
-                    filename=title,
-                    sha256=sha256,
-                    module_id=module_id,
-                    file_type="mindmap_md",
-                    role="mindmap",
-                    source_type="lark",
-                    source_url=url,
-                    parsed_content=parsed_mm["chunks"],
-                    raw_text=parsed_mm["raw_text"],
-                )
+                if existing_doc is not None:
+                    doc_record = existing_doc
+                    doc_record.filename = title
+                    if module_id is not None:
+                        doc_record.module_id = module_id
+                    doc_record.file_type = "mindmap_md"
+                    doc_record.role = "mindmap"
+                    doc_record.source_type = "lark"
+                    doc_record.source_url = url
+                    doc_record.parsed_content = parsed_mm["chunks"]
+                    doc_record.raw_text = parsed_mm["raw_text"]
+                else:
+                    doc_record = Document(
+                        project_id=project_id,
+                        filename=title,
+                        sha256=sha256,
+                        module_id=module_id,
+                        file_type="mindmap_md",
+                        role="mindmap",
+                        source_type="lark",
+                        source_url=url,
+                        parsed_content=parsed_mm["chunks"],
+                        raw_text=parsed_mm["raw_text"],
+                    )
             else:
-                doc_record = Document(
-                    project_id=project_id,
-                    filename=title,
-                    sha256=sha256,
-                    module_id=module_id,
-                    file_type=file_type,
-                    source_type="lark",
-                    source_url=url,
-                    # 占位 chunks，保持与 file 来源同 shape
-                    parsed_content=[{"type": "markdown", "text": raw_text}],
-                    raw_text=raw_text,
-                )
-            db.add(doc_record)
+                if existing_doc is not None:
+                    doc_record = existing_doc
+                    doc_record.filename = title
+                    if module_id is not None:
+                        doc_record.module_id = module_id
+                    doc_record.file_type = file_type
+                    doc_record.source_type = "lark"
+                    doc_record.source_url = url
+                    doc_record.parsed_content = [{"type": "markdown", "text": raw_text}]
+                    doc_record.raw_text = raw_text
+                else:
+                    doc_record = Document(
+                        project_id=project_id,
+                        filename=title,
+                        sha256=sha256,
+                        module_id=module_id,
+                        file_type=file_type,
+                        source_type="lark",
+                        source_url=url,
+                        # 占位 chunks，保持与 file 来源同 shape
+                        parsed_content=[{"type": "markdown", "text": raw_text}],
+                        raw_text=raw_text,
+                    )
+            if existing_doc is None:
+                db.add(doc_record)
             await db.commit()
             await db.refresh(doc_record)
             document_id = doc_record.id
@@ -1114,6 +1166,25 @@ async def upload_lark_stream(
             ):
                 yield ev
         yield _sse("stage", {"stage": "persisted", "document_id": document_id, "message": "文档已入库"})
+
+        # 步骤顺序：模块归类（上面已发）→ 产品知识草稿抽取 → 知识库预览。
+        # 先同步抽取草稿并停在审核闸门，再算知识预览——与本地上传保持一致的推进顺序。
+        yield _sse("stage", {"stage": "knowledge_extract", "message": "正在抽取可沉淀的产品知识…"})
+        drafts = await _extract_and_stash_pending(
+            document_id=document_id,
+            raw_text=doc_record.raw_text or "",
+            module_name=module_name,
+            project_id=project_id,
+            module_id=module_id,
+        )
+        yield _sse("extracted_knowledge_drafts", {
+            "document_id": document_id,
+            "module_id": module_id,
+            "module_name": module_name,
+            "role": "mindmap" if is_mindmap_role else "prd",
+            "source": "lark",
+            "drafts": drafts,
+        })
 
         # 知识库预览 + 状态写库 + 系统气泡
         yield _sse("stage", {"stage": "knowledge_lookup", "message": "正在检索项目知识库相关条目…"})
@@ -1148,23 +1219,6 @@ async def upload_lark_stream(
                 "source": "lark",
                 "url": url[:200],
             })
-
-            # 知识抽取（同步等待，详见 _extract_and_stash_pending）
-            yield _sse("stage", {"stage": "knowledge_extract", "message": "正在抽取可沉淀的产品知识…"})
-            drafts = await _extract_and_stash_pending(
-                document_id=document_id,
-                raw_text=doc_record.raw_text or "",
-                module_name=module_name,
-                project_id=project_id,
-                module_id=module_id,
-            )
-            yield _sse("extracted_knowledge_drafts", {
-                "document_id": document_id,
-                "module_id": module_id,
-                "module_name": module_name,
-                "role": "mindmap",
-                "drafts": drafts,
-            })
             yield _sse("done", {})
             return
 
@@ -1189,25 +1243,35 @@ async def upload_lark_stream(
             "source": "lark",
             "url": url[:200],
         })
-
-        # 知识抽取（同步等待）
-        yield _sse("stage", {"stage": "knowledge_extract", "message": "正在抽取可沉淀的产品知识…"})
-        drafts = await _extract_and_stash_pending(
-            document_id=document_id,
-            raw_text=raw_text,
-            module_name=module_name,
-            project_id=project_id,
-            module_id=module_id,
-        )
-        yield _sse("extracted_knowledge_drafts", {
-            "document_id": document_id,
-            "module_id": module_id,
-            "module_name": module_name,
-            "role": "prd",
-            "source": "lark",
-            "drafts": drafts,
-        })
         yield _sse("done", {})
+
+    async def events():
+        # 顶层兜底：_events_inner 里任何未预期异常（自动归类 / 知识检索 / DB / 澄清
+        # 等 LLM 或网络调用）都可能抛出。若任其冒泡，StreamingResponse 会中途掐断
+        # chunked 流且不发结束帧 → 浏览器报 ERR_INCOMPLETE_CHUNKED_ENCODING、前端
+        # fetch 抛 TypeError: network error。这里统一转成正常的 error + done 帧，
+        # 让前端拿到可读的中文失败原因并干净复位。
+        try:
+            async for ev in _events_inner():
+                yield ev
+        except Exception as exc:
+            logger.exception("Lark import stream crashed | url=%s", url[:200])
+            try:
+                await _upsert_clarification_state(session_id, project_id, status="error")
+            except Exception:
+                pass
+            err_prefix = "❌ 飞书脑图导入失败：" if is_mindmap_role else "❌ 飞书导入失败："
+            try:
+                msg = await _write_assistant_message(
+                    session_id, f"{err_prefix}{exc}",
+                    kind="mindmap_error" if is_mindmap_role else "lark_error",
+                    ref={"url": url[:200], "role": role},
+                )
+                yield _sse("assistant_message", {"message": msg})
+            except Exception:
+                pass
+            yield _sse("error", {"message": str(exc)})
+            yield _sse("done", {})
 
     return StreamingResponse(
         events(),
@@ -1293,6 +1357,9 @@ async def upload_mindmap_stream(
             )
             yield _sse("assistant_message", {"message": msg})
             yield _sse("error", {"message": message})
+
+        # events() 内会对 module_id 赋值（自动归类命中时），需 nonlocal 否则读它会 UnboundLocalError
+        nonlocal module_id
 
         # Stage 0: 内容指纹 → 命中缓存就直接复用历史 Document（按项目 + sha256）
         yield _sse("stage", {"stage": "fingerprinting", "message": f"计算内容指纹 sha256={sha256[:12]}…"})
@@ -1383,21 +1450,37 @@ async def upload_mindmap_stream(
                 module = mr.scalar_one_or_none()
                 module_name = module.name if module else None
 
-            doc_record = Document(
-                project_id=project_id,
-                filename=filename,
-                sha256=sha256,
-                module_id=module_id,
-                file_type="mindmap_md",
-                role="mindmap",
-                parsed_content=parsed["chunks"],
-                raw_text=parsed["raw_text"],
-            )
-            db.add(doc_record)
+            # 同 sha256 已存在就复用（上面的 cache_hit 只在 existing 命中时早返回；
+            # 这里防御 fingerprint 检查与本次 INSERT 之间的竞态/残留，避免撞唯一约束）。
+            existing_doc = (await db.execute(
+                select(Document).where(
+                    Document.sha256 == sha256, Document.project_id == project_id
+                )
+            )).scalar_one_or_none()
+            if existing_doc is not None:
+                doc_record = existing_doc
+                doc_record.filename = filename
+                if module_id is not None:
+                    doc_record.module_id = module_id
+                doc_record.file_type = "mindmap_md"
+                doc_record.role = "mindmap"
+                doc_record.parsed_content = parsed["chunks"]
+                doc_record.raw_text = parsed["raw_text"]
+            else:
+                doc_record = Document(
+                    project_id=project_id,
+                    filename=filename,
+                    sha256=sha256,
+                    module_id=module_id,
+                    file_type="mindmap_md",
+                    role="mindmap",
+                    parsed_content=parsed["chunks"],
+                    raw_text=parsed["raw_text"],
+                )
+                db.add(doc_record)
             await db.commit()
             await db.refresh(doc_record)
             document_id = doc_record.id
-        logger.info("Mindmap persisted(stream) | document_id=%d", document_id)
         if auto_module_suggestion is not None:
             async for ev in _emit_module_classification(
                 session_id, document_id,
@@ -1407,6 +1490,23 @@ async def upload_mindmap_stream(
             ):
                 yield ev
         yield _sse("stage", {"stage": "persisted", "document_id": document_id, "message": "脑图已入库"})
+
+        # 步骤顺序：模块归类（上面已发）→ 产品知识草稿抽取 → 知识库预览（与 /upload/stream 一致）
+        yield _sse("stage", {"stage": "knowledge_extract", "message": "正在抽取可沉淀的产品知识…"})
+        drafts = await _extract_and_stash_pending(
+            document_id=document_id,
+            raw_text=parsed["raw_text"],
+            module_name=module_name,
+            project_id=project_id,
+            module_id=module_id,
+        )
+        yield _sse("extracted_knowledge_drafts", {
+            "document_id": document_id,
+            "module_id": module_id,
+            "module_name": module_name,
+            "role": "mindmap",
+            "drafts": drafts,
+        })
 
         # Stage 3: 知识库预览 + 状态写库 + 系统气泡（与 /upload/stream 同节奏）
         yield _sse("stage", {"stage": "knowledge_lookup", "message": "正在检索项目知识库相关条目…"})
@@ -1432,23 +1532,6 @@ async def upload_mindmap_stream(
             "module_name": module_name,
             "hits": knowledge_hits,
             "role": "mindmap",
-        })
-
-        # 知识抽取（同步等待）—— 脑图也是有效产品上下文
-        yield _sse("stage", {"stage": "knowledge_extract", "message": "正在抽取可沉淀的产品知识…"})
-        drafts = await _extract_and_stash_pending(
-            document_id=document_id,
-            raw_text=parsed["raw_text"],
-            module_name=module_name,
-            project_id=project_id,
-            module_id=module_id,
-        )
-        yield _sse("extracted_knowledge_drafts", {
-            "document_id": document_id,
-            "module_id": module_id,
-            "module_name": module_name,
-            "role": "mindmap",
-            "drafts": drafts,
         })
         yield _sse("done", {})
 

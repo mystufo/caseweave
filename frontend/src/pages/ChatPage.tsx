@@ -2,15 +2,15 @@ import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import type {
   ChatSession, ChatMessage as IChatMessage, TestCase, UploadResult,
   ClarificationQuestion, ClarificationRoundHistory, ClarificationStateDTO,
-  KnowledgeHit, KnowledgeDraft,
+  KnowledgeHit, KnowledgeDraft, ModuleSummary,
 } from '../api/client'
 import {
-  fetchSessions, fetchMessages, createSession, renameSession,
+  fetchSessions, fetchMessages, createSession, renameSession, deleteSession,
   generateCases, fetchSessionCases, fetchClarificationState, fetchKnowledgePreview,
   streamChat, streamUpload, streamLarkImport, streamLarkMindmapImport, streamFollowupClarification,
   streamInitialClarification, streamMindmapUpload,
   confirmPendingKnowledge,
-  createModule, updateDocumentModule,
+  createModule, updateDocumentModule, fetchModules,
   exportSessionUrl,
 } from '../api/client'
 import SessionList from '../components/SessionList'
@@ -19,12 +19,13 @@ import MessageInput from '../components/MessageInput'
 import ClarificationPanel from '../components/ClarificationPanel'
 import KnowledgePreviewPanel from '../components/KnowledgePreviewPanel'
 import KnowledgeDraftReviewPanel from '../components/KnowledgeDraftReviewPanel'
+import ModuleConfirmPanel from '../components/ModuleConfirmPanel'
 import TestCaseTable from '../components/TestCaseTable'
 import LarkUrlDialog, { type LarkUrlSubmit } from '../components/LarkUrlDialog'
 import MindmapPasteDialog from '../components/MindmapPasteDialog'
 import StopConfirmDialog from '../components/StopConfirmDialog'
 import TabBar, { type ViewKey } from '../components/TabBar'
-import { FileText, Loader2, Square, Layers, Check, X } from 'lucide-react'
+import { FileText, Loader2, Square } from 'lucide-react'
 
 interface PageProps {
   view: ViewKey
@@ -32,6 +33,10 @@ interface PageProps {
 }
 
 const MAX_ROUNDS = 5
+
+// 文档正文喂给 LLM 前的截断阈值（字符数），与后端 doc_parser.DEFAULT_DOC_LIMIT 保持一致。
+// 超过则 chip 显示"已截断"提示。
+const DOC_PREVIEW_LIMIT = 30000
 
 // ── Per-session state ────────────────────────────────────────────────────────
 // 每个会话有一份独立的运行态。切换会话只是换"视角"，不取消任何在跑的任务。
@@ -59,6 +64,9 @@ interface SessionState {
     stats: { chunks: number; tables: number; raw_text_length: number }
   } | null
   confirmedModuleName: string | null
+  // 上一步「模块确认卡」拍板的模块 id（null=无模块）。草稿审核面板据此默认选中同一模块，
+  // 直接用 id 而非名字反查——避免新建模块时 modules 列表异步刷新还没到导致匹配失败。
+  confirmedModuleId: number | null
   confirmedCasePrefix: string | null
   clarificationRounds: ClarificationRoundHistory[]
   currentQuestions: ClarificationQuestion[] | null
@@ -121,13 +129,24 @@ interface SessionState {
     submitting: boolean
   } | null
 
-  // LLM 在上传时判定文档不属于任何已有模块 → 提议新建一个模块。
-  // 临时提示（不持久化）：用户可编辑中文名/英文名/描述，点「创建并归类」才真正建模块并把该文档归入。
-  moduleProposal: {
+  // LLM 在上传时对文档归属模块的判定 → 一律弹「模块确认卡」让用户拍板（即使高置信自动命中也要确认）。
+  // 用户可在下拉里改选其它已有模块 / 不归入模块（项目级）/ 新建模块；确认后把文档归入所选模块。
+  // 处理完（确认或忽略）才解锁下方知识草稿审核与开始澄清。
+  moduleDecision: {
     documentId: number | null
-    name: string
-    code: string
-    description: string | null
+    // LLM 命中的既有模块（自动落库或中置信建议），用于文案与默认选中
+    suggestedModuleId: number | null
+    suggestedModuleName: string | null
+    applied: boolean          // 后端是否已高置信自动落库（仅影响文案）
+    confidence: number
+    reasoning: string
+    // 当前下拉选中的模块 id（null = 不归入模块 / 项目级）
+    selectedModuleId: number | null
+    // 选择「新建模块」时展开的可编辑字段
+    createNew: boolean
+    createName: string
+    createCode: string
+    createDescription: string | null
     creating: boolean
   } | null
 }
@@ -144,6 +163,7 @@ const emptyState = (): SessionState => ({
   uploadResult: null,
   uploadMindmap: null,
   confirmedModuleName: null,
+  confirmedModuleId: null,
   confirmedCasePrefix: null,
   clarificationRounds: [],
   currentQuestions: null,
@@ -156,7 +176,7 @@ const emptyState = (): SessionState => ({
   pendingGenerate: null,
   prdDraftReview: null,
   mindmapDraftReview: null,
-  moduleProposal: null,
+  moduleDecision: null,
 })
 
 const isBusy = (s: SessionState) =>
@@ -259,6 +279,27 @@ function stateFromDTO(dto: ClarificationStateDTO, hasCases: boolean): Partial<Se
         }
       : null
 
+  // 模块确认卡——刷新后由后端从已落库的分类气泡复原（见 clarification_state 路由）。
+  // 后端只复原"建议新建模块"这一种（applied=false 且文档仍未归类）；高置信自动命中的
+  // 确认卡是实时 SSE 流内的一次性交互，刷新后若文档已归类则不再复原（属可接受行为）。
+  const moduleDecision: SessionState['moduleDecision'] =
+    dto.module_proposal && dto.module_proposal.name
+      ? {
+          documentId: dto.module_proposal.document_id,
+          suggestedModuleId: null,
+          suggestedModuleName: null,
+          applied: false,
+          confidence: 0,
+          reasoning: '',
+          selectedModuleId: null,
+          createNew: true,
+          createName: dto.module_proposal.name,
+          createCode: dto.module_proposal.code,
+          createDescription: dto.module_proposal.description,
+          creating: false,
+        }
+      : null
+
   return {
     uploadResult,
     uploadMindmap,
@@ -272,6 +313,7 @@ function stateFromDTO(dto: ClarificationStateDTO, hasCases: boolean): Partial<Se
     knowledgePreview,
     prdDraftReview,
     mindmapDraftReview,
+    moduleDecision,
   }
 }
 
@@ -279,9 +321,19 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
   const [sessions, setSessions] = useState<ChatSession[]>([])
   const [activeSessionId, setActiveSessionId] = useState<number | null>(null)
   const [taskMap, setTaskMap] = useState<Record<number, SessionState>>({})
+  // taskMap 的实时镜像——供那些"每次 taskMap 变都不该重跑"的 effect 读取当前 slot，
+  // 从而把 taskMap 移出依赖数组，避免 effect 自我中断（见 hydrate effect）。
+  const taskMapRef = useRef(taskMap)
+  taskMapRef.current = taskMap
   const [input, setInput] = useState('')
   const [larkDialogOpen, setLarkDialogOpen] = useState(false)
   const [pasteDialogOpen, setPasteDialogOpen] = useState(false)
+  // 项目下所有模块——模块确认卡 / 知识草稿审核面板的下拉数据源。
+  // 进入页面拉一次；新建模块后刷新。
+  const [modules, setModules] = useState<ModuleSummary[]>([])
+  const reloadModules = useCallback(() => {
+    fetchModules().then(setModules).catch(err => console.error('Modules load:', err))
+  }, [])
   // 当前要确认停止的会话 id；null 表示弹窗未开
   const [stopConfirmSid, setStopConfirmSid] = useState<number | null>(null)
 
@@ -313,18 +365,35 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
     })
   }, [])
 
-  // 上传时 LLM 提议新建模块 → 落成临时确认卡（用户点「创建并归类」才真正建）。
-  // applied 的高置信归类不在这里处理（后端已落库，仅靠系统气泡告知）。
+  // 上传时 LLM 对模块的判定 → 一律弹「模块确认卡」（高置信自动命中也要用户确认）。
+  // - applied=true：后端已把文档高置信落库到 suggested 模块；卡片默认选中它，用户可改选。
+  // - proposed_module：LLM 建议新建模块；卡片默认进入"新建模块"分支并预填字段。
+  // - 中置信命中既有模块：默认选中该模块。
+  // 三种情况都需要用户拍板，确认后才把文档归入所选模块并解锁下方流程。
   const handleModuleAutoClassified = useCallback(
     (sid: number, payload: import('../api/client').ModuleAutoClassifiedPayload) => {
       const prop = payload.proposed_module
-      if (!prop || payload.suggestion.applied || !prop.name) return
+      const sug = payload.suggestion
+      // 后端高置信 applied 时 payload.module_id 是落库模块；中置信时用 suggestion.module_id
+      const hitModuleId = sug.applied ? payload.module_id : sug.module_id
+      const hitModuleName = sug.applied ? payload.module_name : null
       patchSession(sid, {
-        moduleProposal: {
+        // 高置信已由后端落库 → 先把 confirmedModuleName/Id 记上，这样即便用户"忽略"确认卡，
+        // 后续草稿审核面板也能默认选中真实归属模块（与后端一致）。
+        ...(sug.applied && hitModuleName ? { confirmedModuleName: hitModuleName, confirmedModuleId: hitModuleId } : {}),
+        moduleDecision: {
           documentId: payload.document_id ?? null,
-          name: prop.name,
-          code: prop.code || '',
-          description: prop.description,
+          suggestedModuleId: hitModuleId,
+          suggestedModuleName: hitModuleName,
+          applied: sug.applied,
+          confidence: sug.confidence,
+          reasoning: sug.reasoning || '',
+          // 命中既有模块 → 默认选它；只有提议新建 → 默认进新建分支
+          selectedModuleId: hitModuleId ?? null,
+          createNew: !hitModuleId && !!(prop && prop.name),
+          createName: prop?.name || '',
+          createCode: prop?.code || '',
+          createDescription: prop?.description ?? null,
           creating: false,
         },
       })
@@ -332,44 +401,67 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
     [patchSession],
   )
 
-  // 更新确认卡里可编辑字段（中文名 / 英文名 / 描述）。
-  const patchModuleProposal = useCallback((
+  // 更新模块确认卡里的可编辑字段（下拉选中 / 新建模块的名字等）。
+  const patchModuleDecision = useCallback((
     sid: number,
-    patch: Partial<{ name: string; code: string; description: string | null }>,
+    patch: Partial<NonNullable<SessionState['moduleDecision']>>,
   ) => {
     patchSession(sid, prev => ({
-      moduleProposal: prev.moduleProposal ? { ...prev.moduleProposal, ...patch } : null,
+      moduleDecision: prev.moduleDecision ? { ...prev.moduleDecision, ...patch } : null,
     }))
   }, [patchSession])
 
-  // 「创建并归类」：建模块（含中/英文名）→ 把该文档归入 → 清掉确认卡。
-  const acceptModuleProposal = useCallback(async (
+  // 「确认归类」：按用户在卡片里的选择把文档归入模块。
+  //   - createNew：先建模块再把文档归入
+  //   - selectedModuleId=某模块：把文档归入该模块（若与自动落库结果不同也纠正）
+  //   - selectedModuleId=null 且非新建：不归入模块（项目级），若之前被自动落库则清空
+  // 完成后清掉确认卡，记录 confirmedModuleName 供后续澄清/生成阶段展示。
+  const confirmModuleDecision = useCallback(async (
     sid: number,
-    proposal: NonNullable<SessionState['moduleProposal']>,
+    decision: NonNullable<SessionState['moduleDecision']>,
   ) => {
     patchSession(sid, prev => ({
-      moduleProposal: prev.moduleProposal ? { ...prev.moduleProposal, creating: true } : null,
+      moduleDecision: prev.moduleDecision ? { ...prev.moduleDecision, creating: true } : null,
     }))
     try {
-      const created = await createModule({
-        name: proposal.name.trim(),
-        code: proposal.code.trim() || null,
-        description: proposal.description,
-      })
-      if (proposal.documentId != null) {
-        await updateDocumentModule(proposal.documentId, created.id)
+      let finalModuleId: number | null
+      let finalModuleName: string | null
+      if (decision.createNew) {
+        const created = await createModule({
+          name: decision.createName.trim(),
+          code: decision.createCode.trim() || null,
+          description: decision.createDescription,
+        })
+        finalModuleId = created.id
+        finalModuleName = created.name
+      } else {
+        finalModuleId = decision.selectedModuleId
+        finalModuleName = finalModuleId != null
+          ? (modules.find(m => m.id === finalModuleId)?.name ?? null)
+          : null
       }
-      patchSession(sid, { moduleProposal: null })
+      // 把文档归入最终模块（null=不归入）。仅当与后端已落库结果不同才需要纠正，
+      // 但无脑调一次也无害——后端幂等更新。documentId 为 null（脑图独立态）时跳过。
+      if (decision.documentId != null) {
+        await updateDocumentModule(decision.documentId, finalModuleId)
+      }
+      if (decision.createNew) reloadModules()
+      patchSession(sid, {
+        moduleDecision: null,
+        confirmedModuleName: finalModuleName,
+        confirmedModuleId: finalModuleId,
+      })
     } catch (e) {
-      console.error('Create proposed module failed:', e)
+      console.error('Confirm module decision failed:', e)
       patchSession(sid, prev => ({
-        moduleProposal: prev.moduleProposal ? { ...prev.moduleProposal, creating: false } : null,
+        moduleDecision: prev.moduleDecision ? { ...prev.moduleDecision, creating: false } : null,
       }))
     }
-  }, [patchSession])
+  }, [patchSession, modules, reloadModules])
 
-  const dismissModuleProposal = useCallback((sid: number) => {
-    patchSession(sid, { moduleProposal: null })
+  // 「忽略」：不改动文档归属（沿用后端当前状态），直接清掉确认卡继续流程。
+  const dismissModuleDecision = useCallback((sid: number) => {
+    patchSession(sid, { moduleDecision: null })
   }, [patchSession])
 
   // The currently-displayed session's state. Falls back to a fresh empty slot
@@ -378,6 +470,17 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
     if (activeSessionId == null) return emptyState()
     return taskMap[activeSessionId] ?? emptyState()
   }, [activeSessionId, taskMap])
+
+  // 草稿审核面板"加入模块"的默认选中：优先用模块确认卡刚拍板的 confirmedModuleId
+  // （新建模块时 modules 列表还没异步刷新到，用 id 才不丢）；没有 id 时（如刷新 hydrate
+  // 只恢复了名字）退回按 confirmedModuleName 反查。都没有 → null（不归入模块）。
+  const draftDefaultModuleId = useMemo(() => {
+    if (active.confirmedModuleId != null) return active.confirmedModuleId
+    if (active.confirmedModuleName != null) {
+      return modules.find(m => m.name === active.confirmedModuleName)?.id ?? null
+    }
+    return null
+  }, [active.confirmedModuleId, active.confirmedModuleName, modules])
 
   // Set of session ids with running work — surfaced in the sidebar.
   const busyIds = useMemo(() => {
@@ -393,15 +496,26 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
     fetchSessions().then(setSessions).catch(console.error)
   }, [])
 
+  // Load module list on mount（模块确认卡 / 草稿审核面板下拉用）
+  useEffect(() => {
+    reloadModules()
+  }, [reloadModules])
+
   // When a session becomes active, lazily load its messages + cases + clarification state.
   // We only fetch once per session (loaded flag), and we never clobber in-progress
   // task state — uploadResult/clarification/etc. stay put.
   useEffect(() => {
     if (activeSessionId == null) return
-    const cur = taskMap[activeSessionId]
+    // 用 ref 读 loaded，而不是把 taskMap 放进依赖数组：否则本 effect 里的 patchSession
+    // 会改动 taskMap → 触发本 effect 重跑 → cleanup 把刚发出的知识预览请求 abort 掉，
+    // catch 又因 cancelled 提前 return，导致 loading 永久卡住。
+    const cur = taskMapRef.current[activeSessionId]
     if (cur?.loaded) return
 
     let cancelled = false
+    // hydrate 阶段拉知识预览也要能被"停止任务"中断：把 controller 挂进 cancelMap，
+    // 切会话/卸载时 cleanup 里 abort + 注销，避免请求泄漏。
+    const previewController = new AbortController()
     Promise.all([
       fetchMessages(activeSessionId).catch(err => { console.error(err); return [] }),
       fetchSessionCases(activeSessionId).catch(err => { console.error(err); return { cases: [] as TestCase[] } }),
@@ -417,7 +531,8 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
       // awaiting_clarification 路径下 stateFromDTO 给了一个 loading 占位面板，
       // 这里异步把 hits 拉回来填上，让用户能看到候选条目继续操作。
       if (clarState?.status === 'awaiting_clarification' && clarState.document_id != null) {
-        fetchKnowledgePreview(activeSessionId).then(preview => {
+        setCancel(activeSessionId, () => previewController.abort())
+        fetchKnowledgePreview(activeSessionId, undefined, previewController.signal).then(preview => {
           if (cancelled) return
           patchSession(activeSessionId, prev => (
             prev.knowledgePreview && prev.knowledgePreview.phase === 'clarify'
@@ -425,19 +540,26 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
               : {}
           ))
         }).catch(err => {
-          console.error('Knowledge preview hydrate failed:', err)
+          const aborted =
+            previewController.signal.aborted
+            || (err as { name?: string; code?: string })?.name === 'CanceledError'
+            || (err as { code?: string })?.code === 'ERR_CANCELED'
+          if (!aborted) console.error('Knowledge preview hydrate failed:', err)
           if (cancelled) return
           patchSession(activeSessionId, prev => (
             prev.knowledgePreview && prev.knowledgePreview.phase === 'clarify'
               ? { knowledgePreview: { ...prev.knowledgePreview, loading: false, hits: [] } }
               : {}
           ))
-        })
+        }).finally(() => setCancel(activeSessionId, null))
       }
     })
 
-    return () => { cancelled = true }
-  }, [activeSessionId, taskMap, patchSession])
+    return () => {
+      cancelled = true
+      previewController.abort()
+    }
+  }, [activeSessionId, patchSession, setCancel])
 
   // Auto-scroll on message or stream change for the active session.
   useEffect(() => {
@@ -558,6 +680,34 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
     // 切换不取消任何在跑任务，也不清空 state — 只是换视角。
     setActiveSessionId(id)
   }, [])
+
+  const handleDeleteSession = useCallback(async (id: number) => {
+    // 先中断该会话可能在跑的任务（导入/生成），再删。
+    const cancel = cancelMapRef.current.get(id)
+    if (cancel) {
+      cancelMapRef.current.delete(id)
+      try { cancel() } catch { /* ignore */ }
+    }
+    try {
+      await deleteSession(id)
+    } catch (err) {
+      console.error('Delete session failed:', err)
+      window.alert('删除会话失败，请重试。')
+      return
+    }
+    setSessions(prev => prev.filter(s => s.id !== id))
+    setTaskMap(prev => {
+      const next = { ...prev }
+      delete next[id]
+      return next
+    })
+    // 删的是当前会话 → 切到剩余第一个（或 null）
+    setActiveSessionId(prev => {
+      if (prev !== id) return prev
+      const rest = sessions.filter(s => s.id !== id)
+      return rest.length > 0 ? rest[0].id : null
+    })
+  }, [sessions])
 
   // ── Chat streaming ───────────────────────────────────────────────────────
 
@@ -931,6 +1081,9 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
     const fallbackTitle = `飞书：${tail}`.slice(0, 60)
 
     let sid = activeSessionId
+    // 记录本次导入是否为此新建了会话——若导入从未产出任何内容就失败，
+    // 把这个空会话删掉，避免反复重试在左侧堆积同名孤儿会话。
+    let createdNewSid = false
     try {
       if (sid == null) {
         const s = await createSession(fallbackTitle)
@@ -938,6 +1091,7 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
         setTaskMap(prev => ({ ...prev, [s.id]: { ...emptyState(), loaded: true } }))
         setActiveSessionId(s.id)
         sid = s.id
+        createdNewSid = true
       } else {
         const cur = sessions.find(x => x.id === sid)
         if (cur && (cur.title === '新会话' || cur.title === 'New Session')) {
@@ -956,6 +1110,9 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
     const runPrd = (url: string) => new Promise<void>(resolve => {
       const stages: string[] = []
       let llmBuffer = ''
+      // 是否已从后端收到过实质内容（result / 知识预览 / 草稿）。用于判断导入失败时
+      // 该会话是不是"从没成过的空壳"——是则删掉，避免堆积孤儿会话。
+      let gotContent = false
       const renderProgress = () =>
         stages.join('\n') + (llmBuffer ? `\n\n\`\`\`\n${llmBuffer}\n\`\`\`` : '')
 
@@ -987,6 +1144,7 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
           patchSession(startSid, { uploadProgress: renderProgress() })
         },
         onResult: (result) => {
+          gotContent = true
           // cache_hit 路径仍会发 result（澄清已缓存）。但若稍后还要跑脑图，澄清入参会变，
           // 这里先把 result 落到 uploadResult 让用户看到 PRD 已就绪；脑图阶段会重置澄清态。
           patchSession(startSid, prev => ({
@@ -1011,6 +1169,7 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
           }
         },
         onKnowledgePreview: (preview) => {
+          gotContent = true
           const fakeUpload: UploadResult = {
             document_id: preview.document_id,
             filename: preview.filename,
@@ -1071,8 +1230,31 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
         },
         onError: (msg) => {
           console.error('Lark import error:', msg)
-          patchSession(startSid, { uploading: false, uploadStage: null, uploadProgress: '' })
           setCancel(startSid, null)
+          // 这次是为导入新建的空会话、全程没收到任何内容、且后面没有脑图阶段要跑
+          // → 直接删掉这个孤儿会话，避免反复重试在左侧堆积同名空会话。
+          if (createdNewSid && !gotContent && !mindmapUrl) {
+            deleteSession(startSid).catch(err => console.error('Cleanup orphan session failed:', err))
+            setSessions(prev => prev.filter(s => s.id !== startSid))
+            setTaskMap(prev => {
+              const next = { ...prev }
+              delete next[startSid]
+              return next
+            })
+            setActiveSessionId(prev => (prev === startSid ? null : prev))
+            resolve()
+            return
+          }
+          // 流被中断（后端重启 / 网络断）时给用户一条可见提示，避免聊天区静默变空白。
+          patchSession(startSid, prev => ({
+            uploading: false, uploadStage: null, uploadProgress: '',
+            messages: [...prev.messages, {
+              id: Date.now(),
+              role: 'assistant',
+              content: `❌ 飞书导入中断：${msg}\n\n可能是后端重启或网络中断，请重新点击导入重试。`,
+              created_at: new Date().toISOString(),
+            }],
+          }))
           resolve()
         },
         onDone: () => {
@@ -1185,7 +1367,15 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
         },
         onError: (msg) => {
           console.error('Lark mindmap import error:', msg)
-          patchSession(startSid, { uploading: false, uploadStage: null, uploadProgress: '' })
+          patchSession(startSid, prev => ({
+            uploading: false, uploadStage: null, uploadProgress: '',
+            messages: [...prev.messages, {
+              id: Date.now(),
+              role: 'assistant',
+              content: `❌ 飞书脑图导入中断：${msg}\n\n可能是后端重启或网络中断，请重新点击导入重试。`,
+              created_at: new Date().toISOString(),
+            }],
+          }))
           setCancel(startSid, null)
           resolve()
         },
@@ -1338,22 +1528,33 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
         loading: true, hits: [],
       },
     })
+    // 注册取消器，让"停止任务"能中断这次预览检索请求。
+    const controller = new AbortController()
+    setCancel(sid, () => controller.abort())
     try {
-      const preview = await fetchKnowledgePreview(sid)
+      const preview = await fetchKnowledgePreview(sid, undefined, controller.signal)
       patchSession(sid, prev => (
         prev.knowledgePreview && prev.knowledgePreview.phase === 'generate'
           ? { knowledgePreview: { ...prev.knowledgePreview, loading: false, hits: preview.hits } }
           : {}
       ))
     } catch (err) {
-      console.error('Knowledge preview failed:', err)
+      // 用户主动点"停止任务" → axios 抛 CanceledError：不算错误，只把 loading 收掉，
+      // handleStopConfirm 的兜底已经把面板 loading 置 false，这里保持一致即可。
+      const aborted =
+        controller.signal.aborted
+        || (err as { name?: string; code?: string })?.name === 'CanceledError'
+        || (err as { code?: string })?.code === 'ERR_CANCELED'
+      if (!aborted) console.error('Knowledge preview failed:', err)
       patchSession(sid, prev => (
         prev.knowledgePreview && prev.knowledgePreview.phase === 'generate'
           ? { knowledgePreview: { ...prev.knowledgePreview, loading: false, hits: [] } }
           : {}
       ))
+    } finally {
+      setCancel(sid, null)
     }
-  }, [patchSession])
+  }, [patchSession, setCancel])
 
   // clarify 阶段的确认：把用户勾选的知识 ids 传给 /api/clarify/initial/stream，
   // 走完整的 Clarifier 事件序列，落到 currentQuestions/currentSummary/currentRound。
@@ -1511,7 +1712,12 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
   // role 区分 PRD / 脑图——决定动哪个 slot；acceptedIndices=null 等同"全部入库"，[] 等同"全部丢弃"。
   // 成功后把对应 slot 置 null；不主动推进下一步——澄清入口由 JSX gating 自然解锁。
   // acceptedDrafts=null → 全部丢弃；非空数组 → 按编辑后的内容入库（可能仅子集，可能 content/type 已被改写）
-  const settleDraftReview = useCallback(async (role: 'prd' | 'mindmap', acceptedDrafts: KnowledgeDraft[] | null) => {
+  // moduleChoice → 用户在面板里选的"加入哪个模块"（applyModule=true 时把入库/文档归属改到 moduleId）
+  const settleDraftReview = useCallback(async (
+    role: 'prd' | 'mindmap',
+    acceptedDrafts: KnowledgeDraft[] | null,
+    moduleChoice?: { applyModule: boolean; moduleId: number | null },
+  ) => {
     if (activeSessionId == null) return
     const sid = activeSessionId
     const cur = taskMap[sid]
@@ -1529,9 +1735,9 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
     try {
       // null 走 acceptedIndices=[] 表示全部丢弃；否则把编辑后的草稿数组直接发给后端
       if (acceptedDrafts === null) {
-        await confirmPendingKnowledge(slot.documentId, { acceptedIndices: [] })
+        await confirmPendingKnowledge(slot.documentId, { acceptedIndices: [] }, moduleChoice)
       } else {
-        await confirmPendingKnowledge(slot.documentId, { acceptedDrafts })
+        await confirmPendingKnowledge(slot.documentId, { acceptedDrafts }, moduleChoice)
       }
       patchSession(sid, { [slotKey]: null } as Partial<SessionState>)
     } catch (err) {
@@ -1566,24 +1772,29 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
     return null
   }, [active])
 
-  // 触发停止确认弹窗：当前会话有 cancel fn 才弹
+  // 触发停止确认弹窗：只要当前会话有正在跑的任务就弹。
+  // 注意：不能再要求「必须注册过 cancel fn」——像「加载知识库预览」这类路径
+  // 没有可 abort 的 controller，但依然需要能停（靠 handleStopConfirm 的兜底清状态）。
   const handleStopRequest = useCallback(() => {
     if (activeSessionId == null) return
-    if (!cancelMapRef.current.has(activeSessionId)) return
+    if (!runningTaskLabel) return
     setStopConfirmSid(activeSessionId)
-  }, [activeSessionId])
+  }, [activeSessionId, runningTaskLabel])
 
   const handleStopConfirm = useCallback(() => {
     const sid = stopConfirmSid
     setStopConfirmSid(null)
     if (sid == null) return
+    // cancel fn 是可选的：能 abort 的任务（streaming/upload/generate）有，
+    // 「加载知识库预览」这类没有——后者只靠下面的兜底清状态解锁 UI。
     const fn = cancelMapRef.current.get(sid)
-    if (!fn) return
-    cancelMapRef.current.delete(sid)
-    try {
-      fn()
-    } catch (e) {
-      console.error('Cancel current task failed:', e)
+    if (fn) {
+      cancelMapRef.current.delete(sid)
+      try {
+        fn()
+      } catch (e) {
+        console.error('Cancel current task failed:', e)
+      }
     }
     // 兜底：如果 abort 走 catch 没及时清状态（e.g. axios 已经发完请求只在等响应），
     // 直接把所有 busy 标记一次性清掉，让 UI 立刻可用——后端的副作用 (已落库) 不会受影响。
@@ -1621,6 +1832,7 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
             const updated = await renameSession(id, title)
             setSessions(prev => prev.map(s => (s.id === id ? { ...s, title: updated.title } : s)))
           }}
+          onDelete={handleDeleteSession}
         />
       </aside>
 
@@ -1642,25 +1854,56 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
             <ChatMessage role="assistant" content={active.streamBuffer} isStreaming />
           )}
 
-          {/* 已上传 PRD / 脑图 chips —— 让用户随时感知本会话两个 slot 各自的状态 */}
+          {/* 已上传 PRD / 脑图 chips —— 让用户随时感知本会话两个 slot 各自的状态。
+              附带正文总字符数 + 是否超过预览截断阈值（与后端 DEFAULT_DOC_LIMIT=30000 一致）。 */}
           {!active.uploading && !active.generating && (active.uploadResult || active.uploadMindmap) && (
             <div className="flex flex-wrap gap-2">
-              {active.uploadResult && active.uploadResult.filename && (
-                <span className="inline-flex items-center gap-1 px-2 py-1 rounded-full bg-blue-50 border border-blue-200 text-xs text-blue-700">
-                  <FileText size={12} />
-                  PRD：{active.uploadResult.filename}
-                </span>
-              )}
-              {active.uploadMindmap && (
-                <span className="inline-flex items-center gap-1 px-2 py-1 rounded-full bg-emerald-50 border border-emerald-200 text-xs text-emerald-700">
-                  <FileText size={12} />
-                  脑图：{active.uploadMindmap.filename}
-                </span>
-              )}
+              {active.uploadResult && active.uploadResult.filename && (() => {
+                const len = active.uploadResult.stats?.raw_text_length ?? 0
+                const truncated = len > DOC_PREVIEW_LIMIT
+                return (
+                  <span className="inline-flex items-center gap-1 px-2 py-1 rounded-full bg-blue-50 border border-blue-200 text-xs text-blue-700">
+                    <FileText size={12} />
+                    PRD：{active.uploadResult.filename}
+                    {len > 0 && (
+                      <span className="text-blue-500/80">· {len.toLocaleString()} 字</span>
+                    )}
+                    {truncated && (
+                      <span
+                        className="px-1 py-0.5 rounded bg-amber-100 text-amber-700 border border-amber-200"
+                        title={`正文超过预览上限（${DOC_PREVIEW_LIMIT.toLocaleString()} 字），喂给大模型时会保留开头与结尾、省略中间部分`}
+                      >
+                        已截断
+                      </span>
+                    )}
+                  </span>
+                )
+              })()}
+              {active.uploadMindmap && (() => {
+                const len = active.uploadMindmap.stats?.raw_text_length ?? 0
+                const truncated = len > DOC_PREVIEW_LIMIT
+                return (
+                  <span className="inline-flex items-center gap-1 px-2 py-1 rounded-full bg-emerald-50 border border-emerald-200 text-xs text-emerald-700">
+                    <FileText size={12} />
+                    脑图：{active.uploadMindmap.filename}
+                    {len > 0 && (
+                      <span className="text-emerald-600/80">· {len.toLocaleString()} 字</span>
+                    )}
+                    {truncated && (
+                      <span
+                        className="px-1 py-0.5 rounded bg-amber-100 text-amber-700 border border-amber-200"
+                        title={`正文超过预览上限（${DOC_PREVIEW_LIMIT.toLocaleString()} 字），喂给大模型时会保留开头与结尾、省略中间部分`}
+                      >
+                        已截断
+                      </span>
+                    )}
+                  </span>
+                )
+              })()}
             </div>
           )}
 
-          {(active.uploadResult || active.uploadMindmap) && active.currentQuestions && active.currentQuestions.length > 0 && !active.generating && !active.followupActive && !active.prdDraftReview && !active.mindmapDraftReview && (
+          {(active.uploadResult || active.uploadMindmap) && active.currentQuestions && active.currentQuestions.length > 0 && !active.generating && !active.followupActive && !active.prdDraftReview && !active.mindmapDraftReview && !active.moduleDecision && (
             <ClarificationPanel
               questions={active.currentQuestions}
               summary={active.currentSummary || active.uploadResult?.clarification?.summary || ''}
@@ -1679,109 +1922,58 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
             />
           )}
 
-          {/* 知识草稿审核闸门——上传完成后 LLM 抽取出的产品规则/约束/术语先让用户勾选要入库的条目。
-              两个 slot 独立呈现；非 null 时阻塞下方 ClarificationPanel / KnowledgePreviewPanel 渲染。 */}
-          {active.prdDraftReview && (
+          {/* 第 1 步：模块确认卡。LLM 判定文档归属后（含高置信自动命中）一律让用户拍板。
+              未处理时阻塞下方知识草稿审核与知识预览，保证「模块 → 知识草稿 → 开始澄清」的顺序。 */}
+          {active.moduleDecision && activeSessionId != null && (
+            <ModuleConfirmPanel
+              modules={modules}
+              suggestedModuleId={active.moduleDecision.suggestedModuleId}
+              suggestedModuleName={active.moduleDecision.suggestedModuleName}
+              applied={active.moduleDecision.applied}
+              confidence={active.moduleDecision.confidence}
+              reasoning={active.moduleDecision.reasoning}
+              selectedModuleId={active.moduleDecision.selectedModuleId}
+              createNew={active.moduleDecision.createNew}
+              createName={active.moduleDecision.createName}
+              createCode={active.moduleDecision.createCode}
+              createDescription={active.moduleDecision.createDescription}
+              creating={active.moduleDecision.creating}
+              onPatch={(patch) => patchModuleDecision(activeSessionId, patch)}
+              onConfirm={() => confirmModuleDecision(activeSessionId, active.moduleDecision!)}
+              onDismiss={() => dismissModuleDecision(activeSessionId)}
+            />
+          )}
+
+          {/* 第 2 步：知识草稿审核闸门——上传后 LLM 抽取出的产品规则/约束/术语先让用户勾选要入库的条目。
+              两个 slot 独立呈现；moduleDecision 未处理时不渲染（先走模块确认）。 */}
+          {active.prdDraftReview && !active.moduleDecision && (
             <KnowledgeDraftReviewPanel
               documentId={active.prdDraftReview.documentId}
               role="prd"
               filename={active.prdDraftReview.filename}
               moduleName={active.prdDraftReview.moduleName}
+              modules={modules}
+              defaultModuleId={draftDefaultModuleId}
               drafts={active.prdDraftReview.drafts}
               submitting={active.prdDraftReview.submitting}
-              onConfirm={(drafts) => settleDraftReview('prd', drafts)}
+              onConfirm={(drafts, moduleChoice) => settleDraftReview('prd', drafts, moduleChoice)}
               onDiscard={() => settleDraftReview('prd', null)}
             />
           )}
-          {active.mindmapDraftReview && (
+          {active.mindmapDraftReview && !active.moduleDecision && (
             <KnowledgeDraftReviewPanel
               documentId={active.mindmapDraftReview.documentId}
               role="mindmap"
               filename={active.mindmapDraftReview.filename}
               moduleName={active.mindmapDraftReview.moduleName}
+              modules={modules}
+              defaultModuleId={draftDefaultModuleId}
               drafts={active.mindmapDraftReview.drafts}
               submitting={active.mindmapDraftReview.submitting}
-              onConfirm={(drafts) => settleDraftReview('mindmap', drafts)}
+              onConfirm={(drafts, moduleChoice) => settleDraftReview('mindmap', drafts, moduleChoice)}
               onDiscard={() => settleDraftReview('mindmap', null)}
             />
           )}
-
-          {/* 模块提议确认卡：LLM 判定文档不属于任何已有模块时，建议新建一个；中文名/英文名/描述均可编辑，由用户拍板。 */}
-          {active.moduleProposal && activeSessionId != null && (() => {
-            const mp = active.moduleProposal
-            const nameOk = mp.name.trim().length > 0
-            const codeOk = mp.code.trim() === '' || /^[A-Z][A-Z0-9-]{0,39}$/.test(mp.code.trim())
-            const canCreate = nameOk && codeOk && !mp.creating
-            return (
-              <div className="bg-teal-50/70 border border-teal-200 rounded-xl p-3 space-y-3">
-                <div className="flex items-center gap-2 text-sm font-medium text-teal-800">
-                  <Layers size={15} />
-                  建议新建模块
-                  <span className="text-xs font-normal text-teal-600/80">这份文档未匹配到已有模块，确认后将新建并归入该模块</span>
-                </div>
-                <div className="grid grid-cols-2 gap-2">
-                  <label className="text-xs text-gray-600 space-y-1">
-                    <span>中文名</span>
-                    <input
-                      type="text"
-                      value={mp.name}
-                      onChange={e => patchModuleProposal(activeSessionId, { name: e.target.value })}
-                      disabled={mp.creating}
-                      placeholder="如：订单管理"
-                      className="w-full px-2 py-1 text-sm border border-gray-200 rounded focus:outline-none focus:ring-2 focus:ring-teal-200"
-                    />
-                  </label>
-                  <label className="text-xs text-gray-600 space-y-1">
-                    <span>英文名（用例编号前缀）</span>
-                    <input
-                      type="text"
-                      value={mp.code}
-                      onChange={e => patchModuleProposal(activeSessionId, { code: e.target.value.toUpperCase() })}
-                      disabled={mp.creating}
-                      placeholder="如：ORDER-MGMT"
-                      className={`w-full px-2 py-1 text-sm border rounded font-mono focus:outline-none focus:ring-2 ${
-                        codeOk ? 'border-gray-200 focus:ring-teal-200' : 'border-red-300 focus:ring-red-200'
-                      }`}
-                    />
-                  </label>
-                </div>
-                {!codeOk && (
-                  <div className="text-[11px] text-red-500">英文名须为大写字母开头，仅含 A–Z 0–9 和短横线（如 ORDER-MGMT）</div>
-                )}
-                <label className="text-xs text-gray-600 space-y-1 block">
-                  <span>描述（可选）</span>
-                  <input
-                    type="text"
-                    value={mp.description || ''}
-                    onChange={e => patchModuleProposal(activeSessionId, { description: e.target.value || null })}
-                    disabled={mp.creating}
-                    placeholder="一句话概括该模块职责"
-                    className="w-full px-2 py-1 text-sm border border-gray-200 rounded focus:outline-none focus:ring-2 focus:ring-teal-200"
-                  />
-                </label>
-                <div className="flex items-center gap-2 pt-1">
-                  <button
-                    type="button"
-                    onClick={() => acceptModuleProposal(activeSessionId, mp)}
-                    disabled={!canCreate}
-                    className="inline-flex items-center gap-1 px-3 py-1.5 text-sm bg-teal-600 text-white rounded-md hover:bg-teal-700 disabled:opacity-50"
-                  >
-                    {mp.creating ? <Loader2 size={14} className="animate-spin" /> : <Check size={14} />}
-                    创建并归类
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => dismissModuleProposal(activeSessionId)}
-                    disabled={mp.creating}
-                    className="inline-flex items-center gap-1 px-3 py-1.5 text-sm text-gray-500 border border-gray-200 rounded-md hover:bg-gray-50 disabled:opacity-50"
-                  >
-                    <X size={14} />
-                    忽略
-                  </button>
-                </div>
-              </div>
-            )
-          })()}
 
           {active.followupActive && !active.prdDraftReview && !active.mindmapDraftReview && (
             <div className="bg-amber-50/60 border border-amber-200 rounded-xl p-3 space-y-2">
@@ -1799,7 +1991,11 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
             </div>
           )}
 
-          {active.knowledgePreview && !active.generating && !active.prdDraftReview && !active.mindmapDraftReview && (
+          {/* 上传 SSE 里 knowledge_preview 帧先于产品知识抽取（knowledge_extract 阶段）到达，
+              但抽取仍在跑（uploading 尚未 done）。此时不渲染预览面板，避免"开始澄清"按钮
+              抢在抽取完成/草稿审核之前出现。抽取完成后 onDone 置 uploading=false，面板才亮。
+              phase='generate' 的预览由 startKnowledgePreview 触发（uploading 早已 false），不受影响。 */}
+          {active.knowledgePreview && !active.uploading && !active.generating && !active.prdDraftReview && !active.mindmapDraftReview && !active.moduleDecision && (
             <KnowledgePreviewPanel
               loading={active.knowledgePreview.loading}
               hits={active.knowledgePreview.hits}

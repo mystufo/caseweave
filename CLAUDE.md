@@ -45,8 +45,8 @@ Copy `.env.example` to `.env` and fill in `LLM_API_KEY` before running.
 - `tools/doc_parser.py` — `.docx` via python-docx, `.pdf` via pdfplumber
 - `tools/excel_export.py` — openpyxl export, per-module sheets, frozen header
 
-**Database** — PostgreSQL + pgvector; tables auto-created via `init_db()` (no migrations yet)
-- Key models: `Session`, `Message` (chat history), `TestCase`, `Feedback`, `Module`, `KnowledgeEntry`, `Skill`, `PromptVersion`, `Document`
+**Database** — PostgreSQL + pgvector; tables auto-created via `init_db()`, schema changes via Alembic migrations (`backend/alembic/versions/`)
+- Key models: `Session`, `Message` (chat history), `TestCase`, `Feedback` (+ `reason`/`triage`/`triage_targets` for evolution triage), `FeedbackConsumption` (consumption ledger), `Module`, `KnowledgeEntry`, `Skill`, `PromptVersion`, `PromptSuggestion`, `Document`
 
 **Data flow for core use case:**
 1. `POST /api/upload` → parse doc → run Clarifier Agent → return questions
@@ -64,7 +64,7 @@ Copy `.env.example` to `.env` and fill in `LLM_API_KEY` before running.
 | 1 — Scaffold | ✅ Done | Project skeleton, DB models, basic streaming chat |
 | 2 — Core flow | ✅ Done | Doc upload, Clarifier Agent, Generator Agent, Excel export, Feedback |
 | 3 — Knowledge system | ✅ Done | pgvector semantic search, background knowledge extraction, doc accumulation, knowledge injection into Clarifier/Generator |
-| 4 — Feedback evolution | ✅ Done (4.1 + 4.2 stage 1) | 4.1: edit-diff analysis (`diff_analyzer`), rule distillation, Skill CRUD + per-module auto-generation, Skill injection into Generator. 4.2 stage 1: prompt versioning (PromptVersion table, per-project, manual edit/activate via UI). 4.2 stage 2 (LLM-suggested prompt edits + human review) — not started |
+| 4 — Feedback evolution | ✅ Done | 4.1: edit-diff analysis (`diff_analyzer`), rule distillation, Skill CRUD + per-module auto-generation, Skill injection into Generator. 4.2 stage 1: prompt versioning (PromptVersion table, per-project, manual edit/activate via UI). 4.2 stage 2: system-generated prompt-improvement suggestions for `generator` — `PromptSuggestion` draft table, `prompt_optimizer` agent (feedback-driven, contract-guarded), manual + periodic-background generation (drafts only, never auto-activate), human review/adopt via `PromptManagerDrawer`. Adopting a suggestion still goes through the existing versioning API |
 | 5 — Browser Agent | Pending | Playwright-based product exploration |
 | 6 — Zentao MCP + Dashboard | Pending | Bug analysis, regression case generation, stats dashboard |
 

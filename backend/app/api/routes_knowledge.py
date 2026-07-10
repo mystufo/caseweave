@@ -16,7 +16,7 @@ from app.database import get_db
 from app.knowledge.store import search_relevant, store_entries, KnowledgeDraft
 from app.config import get_settings
 from app.models.clarification import ClarificationState
-from app.models.feedback import Feedback, TestCase
+from app.models.feedback import Feedback, TestCase, FeedbackConsumption
 from app.models.knowledge import Document, Module, ModuleRelation, KnowledgeEntry, Skill
 from app.models.session import Session
 from app.models.user import User
@@ -533,6 +533,10 @@ async def get_knowledge(
 class KnowledgeUpdate(BaseModel):
     content: str | None = None
     confidence: float | None = None
+    # 是否改所属模块：apply_module=true 时按 module_id 更新（None=转为项目级）。
+    # 不传时不动 module_id（保持既有行为）。
+    apply_module: bool = False
+    module_id: int | None = None
 
 
 async def _load_entry_scoped(entry_id: int, project_id: int, db: AsyncSession) -> KnowledgeEntry:
@@ -565,9 +569,20 @@ async def update_knowledge(
         entry.version += 1
     if data.confidence is not None:
         entry.confidence = data.confidence
+    if data.apply_module:
+        # 校验目标模块归属（None=转项目级，跳过校验）
+        if data.module_id is not None:
+            mr = await db.execute(
+                select(Module).where(
+                    Module.id == data.module_id, Module.project_id == project_id
+                )
+            )
+            if mr.scalar_one_or_none() is None:
+                raise HTTPException(status_code=404, detail="Module not found")
+        entry.module_id = data.module_id
 
     await db.commit()
-    return {"id": entry.id, "version": entry.version}
+    return {"id": entry.id, "version": entry.version, "module_id": entry.module_id}
 
 
 @router.delete("/knowledge/{entry_id}")
@@ -640,10 +655,17 @@ async def get_document(
     _user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """文档详情，含截断后的解析正文（只读预览用）。"""
+    """文档详情，含截断后的解析正文（只读预览用）。
+
+    额外回传原始正文总字符数与是否被截断，供前端提示"当次文档共 N 字 / 已截断"。
+    """
     doc = await _load_project_document(document_id, project_id, db)
     payload = _document_summary(doc)
-    payload["content"] = truncate_for_llm(doc.raw_text) if doc.raw_text else ""
+    raw = doc.raw_text or ""
+    content = truncate_for_llm(raw) if raw else ""
+    payload["content"] = content
+    payload["raw_text_length"] = len(raw)
+    payload["truncated"] = len(raw) > len(content)
     return payload
 
 
@@ -715,6 +737,12 @@ class ConfirmPendingKnowledgeRequest(BaseModel):
     # 都不传 / null → 全部按原 pending 入库；都给空列表 → 一条都不入。
     accepted_indices: list[int] | None = None
     accepted_drafts: list[AcceptedDraftIn] | None = None
+    # 用户在草稿审核面板里选择"加入哪个模块"：
+    #   - apply_module=false（默认）→ 沿用文档当前 module_id（保持既有行为）
+    #   - apply_module=true 且 module_id 为某模块 → 按该模块入库，并把该模块回写到文档
+    #   - apply_module=true 且 module_id=None → 显式"不归入模块"（项目级，module_id=NULL）
+    apply_module: bool = False
+    module_id: int | None = None
 
 
 @router.post("/documents/{document_id}/confirm_pending_knowledge")
@@ -738,6 +766,21 @@ async def confirm_pending_knowledge(
     if not isinstance(pending, list):
         # 已 settle 过；幂等成功
         return {"document_id": doc.id, "stored": 0, "settled": True}
+
+    # 解析入库目标模块：用户在审核面板显式选了模块 → 以它为准（含"不归入模块"=None），
+    # 并回写到文档；否则沿用文档当前 module_id（保持既有行为）。
+    target_module_id = doc.module_id
+    if body.apply_module:
+        if body.module_id is not None:
+            mr = await db.execute(
+                select(Module).where(
+                    Module.id == body.module_id, Module.project_id == project_id
+                )
+            )
+            if mr.scalar_one_or_none() is None:
+                raise HTTPException(status_code=404, detail="Module not found")
+        target_module_id = body.module_id
+        doc.module_id = target_module_id
 
     # 优先使用前端编辑过的 accepted_drafts；否则按 indices 从原 pending 取
     if body.accepted_drafts is not None:
@@ -777,14 +820,14 @@ async def confirm_pending_knowledge(
     stored = 0
     if drafts:
         stored = await store_entries(
-            db, project_id=project_id, module_id=doc.module_id,
+            db, project_id=project_id, module_id=target_module_id,
             document_id=doc.id, drafts=drafts,
         )
 
     # 清空 pending，标记已审核
     doc.pending_knowledge = None
     await db.commit()
-    return {"document_id": doc.id, "stored": stored, "settled": True}
+    return {"document_id": doc.id, "stored": stored, "settled": True, "module_id": target_module_id}
 
 
 # ── Skills ────────────────────────────────────────────────────────────────────
@@ -987,21 +1030,29 @@ async def regenerate_skill(
     if module is None:
         raise HTTPException(status_code=404, detail="Module not found")
 
-    # 拉最近 N 条已分析的 edit 反馈（按 module name 过滤 test_cases）
+    # 拉该模块待消费的 skill 反馈：分诊到 skill、且尚未被 skill 出口消费（问题 B）
+    consumed_skill_subq = (
+        select(FeedbackConsumption.feedback_id)
+        .where(FeedbackConsumption.output_kind == "skill")
+    ).scalar_subquery()
+
     fb_rows = (await db.execute(
         select(Feedback)
         .join(TestCase, TestCase.id == Feedback.test_case_id)
         .where(
             TestCase.project_id == project_id,
             TestCase.module == module.name,
-            Feedback.feedback_type == "edit",
             Feedback.diff_analysis.is_not(None),
+            Feedback.triage_targets.isnot(None),
+            Feedback.triage_targets.like("%skill%"),
+            Feedback.id.notin_(consumed_skill_subq),
         )
         .order_by(Feedback.id.desc())
         .limit(max(1, min(body.feedback_limit, 50)))
     )).scalars().all()
 
     feedback_samples: list[dict] = []
+    consumed_feedback_ids: list[int] = []
     for fb in fb_rows:
         try:
             obj = json.loads(fb.diff_analysis) if fb.diff_analysis else {}
@@ -1013,6 +1064,7 @@ async def regenerate_skill(
             "intent": obj.get("intent"),
             "summary": obj.get("summary"),
         })
+        consumed_feedback_ids.append(fb.id)
 
     # 拉该模块下 source='user_feedback' 的最新若干条知识
     ke_rows = (await db.execute(
@@ -1064,6 +1116,20 @@ async def regenerate_skill(
 
     await db.commit()
     await db.refresh(skill)
+
+    # 消费回写：把本次用到的反馈记为"已被 skill 出口消费"（幂等），避免下次重复归纳同一批
+    if consumed_feedback_ids:
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+        await db.execute(
+            pg_insert(FeedbackConsumption)
+            .values([
+                {"feedback_id": fid, "output_kind": "skill", "output_ref_id": skill.id}
+                for fid in consumed_feedback_ids
+            ])
+            .on_conflict_do_nothing(constraint="uq_feedback_consumption")
+        )
+        await db.commit()
+
     logger.info(
         "skill regenerated | module=%s skill_id=%d action=%s feedback=%d knowledge=%d",
         module.name, skill.id, action, len(feedback_samples), len(knowledge_entries),

@@ -120,3 +120,28 @@ class PromptVersion(Base):
     created_by = Column(Integer, nullable=True)  # users.id（谁保存了这个版本）
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
+
+class PromptSuggestion(Base):
+    """Phase 4.2 二阶段：系统分析负反馈后产出的「建议的 prompt 改动」草稿。
+
+    定位：只读建议 + 人工审核闸门。系统（手动按钮 / 定期后台）只往这里写 pending 草稿，
+    绝不自动激活。采用 = 前端把 suggested_template 灌进现有编辑器（可再改）→ 走一阶段
+    已有的 POST /prompts/{key}/versions 保存为新版本并生效。本表自身不改任何生效状态，
+    只记 status（pending / adopted / dismissed）。与 pending_knowledge / auto_generated
+    Skill 同构。
+    """
+    __tablename__ = "prompt_suggestions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    project_id = Column(Integer, index=True, nullable=False)  # 项目隔离
+    prompt_id = Column(String(100), nullable=False, index=True)  # 逻辑 key（本期仅 generator）
+    base_version_id = Column(Integer, nullable=True)  # 针对哪个生效版本；NULL=针对代码默认常量
+    base_template = Column(Text, nullable=False)  # 生成建议时的基线全文快照（防基线漂移）
+    suggested_template = Column(Text, nullable=False)  # LLM 产出的改进后全文
+    rationale = Column(Text, nullable=True)  # 为什么这么改（一段话）
+    evidence = Column(JSON, nullable=True)  # {feedback_count, samples:[{intent,summary}...]}
+    status = Column(String(20), nullable=False, server_default="pending", index=True)  # pending / adopted / dismissed
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    reviewed_by = Column(Integer, nullable=True)  # users.id（谁审核的）
+    reviewed_at = Column(DateTime(timezone=True), nullable=True)
+

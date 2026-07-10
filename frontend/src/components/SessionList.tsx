@@ -1,5 +1,5 @@
 import { useState, type KeyboardEvent } from 'react'
-import { Plus, MessageSquare, Pencil, Check, X, Loader2 } from 'lucide-react'
+import { Plus, MessageSquare, Pencil, Check, X, Loader2, Trash2 } from 'lucide-react'
 import type { ChatSession } from '../api/client'
 
 interface Props {
@@ -9,9 +9,10 @@ interface Props {
   onSelect: (id: number) => void
   onNew: () => void
   onRename: (id: number, title: string) => Promise<void> | void
+  onDelete: (id: number) => Promise<void> | void
 }
 
-export default function SessionList({ sessions, activeId, busyIds, onSelect, onNew, onRename }: Props) {
+export default function SessionList({ sessions, activeId, busyIds, onSelect, onNew, onRename, onDelete }: Props) {
   const [editingId, setEditingId] = useState<number | null>(null)
   const [draft, setDraft] = useState('')
 
@@ -113,6 +114,18 @@ export default function SessionList({ sessions, activeId, busyIds, onSelect, onN
                     title="重命名"
                   >
                     <Pencil size={12} />
+                  </button>
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation()
+                      if (window.confirm(`确定删除会话「${s.title}」？该会话下的用例与澄清记录将一并删除，无法恢复。`)) {
+                        onDelete(s.id)
+                      }
+                    }}
+                    className="opacity-0 group-hover:opacity-100 text-gray-400 hover:text-red-600 transition-opacity flex-shrink-0"
+                    title="删除会话"
+                  >
+                    <Trash2 size={12} />
                   </button>
                 </>
               )}

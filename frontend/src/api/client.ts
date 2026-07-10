@@ -173,6 +173,9 @@ export const createSession = (title: string, module_id?: number) =>
 export const renameSession = (sessionId: number, title: string) =>
   api.patch<ChatSession>(`/api/sessions/${sessionId}`, { title }).then(r => r.data)
 
+export const deleteSession = (sessionId: number) =>
+  api.delete<{ deleted: boolean; id: number }>(`/api/sessions/${sessionId}`).then(r => r.data)
+
 export const fetchMessages = (sessionId: number) =>
   api.get<ChatMessage[]>(`/api/sessions/${sessionId}/messages`).then(r => r.data)
 
@@ -189,6 +192,14 @@ export interface ClarificationStateDTO {
   // [] 表示抽取完成但没产出条目（前端按"无草稿"处理）。
   prd_pending_drafts: KnowledgeDraft[] | null
   mindmap_pending_drafts: KnowledgeDraft[] | null
+  // 「建议新建模块」提议——刷新后从已落库的 module_auto_classified 气泡复原；
+  // 引用文档仍未归类且当时未自动落库时才有值，否则为 null。
+  module_proposal: {
+    document_id: number | null
+    name: string
+    code: string
+    description: string | null
+  } | null
   summary: string | null
   module_detected: string | null
   case_prefix_suggestion: string | null
@@ -325,6 +336,7 @@ export function streamUpload(
     const reader = res.body.getReader()
     const decoder = new TextDecoder()
     let buffer = ''
+    let sawTerminal = false  // 是否收到过 done/error 终止帧；用于识别"连接被中途掐断"
 
     while (true) {
       const { done, value } = await reader.read()
@@ -363,8 +375,10 @@ export function streamUpload(
             void type
             callbacks.onModuleAutoClassified?.(rest as ModuleAutoClassifiedPayload)
           } else if (payload.type === 'error') {
+            sawTerminal = true
             callbacks.onError(payload.message)
           } else if (payload.type === 'done') {
+            sawTerminal = true
             callbacks.onDone()
           }
         } catch {
@@ -372,6 +386,9 @@ export function streamUpload(
         }
       }
     }
+    // 循环因 EOF 正常结束，但从未收到 done/error 帧 → 连接被中途掐断（如后端重启）。
+    // 走 onError 让上层给出可见提示并复位，避免"既不 done 也不 error"的僵状态。
+    if (!sawTerminal) callbacks.onError('连接中断（未收到结束帧），请重试')
   }).catch(err => {
     // abort（用户主动停止）走 onDone 让上层把 streaming/generating 等状态清掉，
     // 不要走 onError 弹"异常"红字——用户自己点的就不算错。
@@ -409,6 +426,7 @@ export function streamLarkImport(
     const reader = res.body.getReader()
     const decoder = new TextDecoder()
     let buffer = ''
+    let sawTerminal = false  // 是否收到过 done/error 终止帧；用于识别"连接被中途掐断"
 
     while (true) {
       const { done, value } = await reader.read()
@@ -446,8 +464,10 @@ export function streamLarkImport(
             void type
             callbacks.onModuleAutoClassified?.(rest as ModuleAutoClassifiedPayload)
           } else if (payload.type === 'error') {
+            sawTerminal = true
             callbacks.onError(payload.message)
           } else if (payload.type === 'done') {
+            sawTerminal = true
             callbacks.onDone()
           }
         } catch {
@@ -455,6 +475,9 @@ export function streamLarkImport(
         }
       }
     }
+    // 循环因 EOF 正常结束，但从未收到 done/error 帧 → 连接被中途掐断（如后端重启）。
+    // 走 onError 让上层给出可见提示并复位，避免"既不 done 也不 error"的僵状态。
+    if (!sawTerminal) callbacks.onError('连接中断（未收到结束帧），请重试')
   }).catch(err => {
     // abort（用户主动停止）走 onDone 让上层把 streaming/generating 等状态清掉，
     // 不要走 onError 弹"异常"红字——用户自己点的就不算错。
@@ -496,6 +519,7 @@ export function streamMindmapUpload(
     const reader = res.body.getReader()
     const decoder = new TextDecoder()
     let buffer = ''
+    let sawTerminal = false  // 是否收到过 done/error 终止帧；用于识别"连接被中途掐断"
 
     while (true) {
       const { done, value } = await reader.read()
@@ -533,8 +557,10 @@ export function streamMindmapUpload(
             void type
             callbacks.onModuleAutoClassified?.(rest as ModuleAutoClassifiedPayload)
           } else if (payload.type === 'error') {
+            sawTerminal = true
             callbacks.onError(payload.message)
           } else if (payload.type === 'done') {
+            sawTerminal = true
             callbacks.onDone()
           }
         } catch {
@@ -542,6 +568,9 @@ export function streamMindmapUpload(
         }
       }
     }
+    // 循环因 EOF 正常结束，但从未收到 done/error 帧 → 连接被中途掐断（如后端重启）。
+    // 走 onError 让上层给出可见提示并复位，避免"既不 done 也不 error"的僵状态。
+    if (!sawTerminal) callbacks.onError('连接中断（未收到结束帧），请重试')
   }).catch(err => {
     // abort（用户主动停止）走 onDone 让上层把 streaming/generating 等状态清掉，
     // 不要走 onError 弹"异常"红字——用户自己点的就不算错。
@@ -765,9 +794,10 @@ export interface KnowledgePreview {
   hits: KnowledgeHit[]
 }
 
-export const fetchKnowledgePreview = (sessionId: number, topK = 8) =>
+export const fetchKnowledgePreview = (sessionId: number, topK = 8, signal?: AbortSignal) =>
   api.get<KnowledgePreview>('/api/knowledge/preview', {
     params: { session_id: sessionId, top_k: topK },
+    signal,
   }).then(r => r.data)
 
 // ── Pending knowledge drafts (人工审核入库闸门) ────────────────────────────────
@@ -787,15 +817,22 @@ export const fetchPendingKnowledge = (documentId: number) =>
 //   - acceptedDrafts：用户已编辑的完整草稿（推荐，支持改 content / type）
 //   - acceptedIndices=null：全部按原 pending 入库
 //   - acceptedIndices=[]：一条都不入（等价于丢弃）
+// module 选项：applyModule=true 时把入库/文档归属改到 moduleId（null=不归入模块）；
+//              不传或 false 时沿用文档当前模块（保持既有行为）。
 export const confirmPendingKnowledge = (
   documentId: number,
   payload: { acceptedDrafts: KnowledgeDraft[] } | { acceptedIndices: number[] | null },
+  moduleChoice?: { applyModule: boolean; moduleId: number | null },
 ) => {
-  const body =
+  const body: Record<string, unknown> =
     'acceptedDrafts' in payload
       ? { accepted_drafts: payload.acceptedDrafts }
       : { accepted_indices: payload.acceptedIndices }
-  return api.post<{ document_id: number; stored: number; settled: boolean }>(
+  if (moduleChoice?.applyModule) {
+    body.apply_module = true
+    body.module_id = moduleChoice.moduleId
+  }
+  return api.post<{ document_id: number; stored: number; settled: boolean; module_id: number | null }>(
     `/api/documents/${documentId}/confirm_pending_knowledge`,
     body,
   ).then(r => r.data)
@@ -822,6 +859,17 @@ export const fetchKnowledgeStats = (recentDays = 7) =>
   api.get<KnowledgeStats>('/api/knowledge/stats', { params: { recent_days: recentDays } })
     .then(r => r.data)
 
+// ── 反馈进化总览（进化闭环第二步）──────────────────────────────────────────
+// 三出口（knowledge/skill/prompt）的 待消费/已消费 计数 + 归一 intent 分布。
+export interface EvolutionSummary {
+  outputs: Record<'knowledge' | 'skill' | 'prompt', { pending: number; consumed: number }>
+  intent_distribution: Record<string, number>
+  triaged_total: number
+}
+
+export const fetchEvolutionSummary = () =>
+  api.get<EvolutionSummary>('/api/feedback/evolution/summary').then(r => r.data)
+
 export const fetchProjectKnowledge = (params: {
   q?: string
   moduleId?: number | null   // null（注意：与 undefined 不同）= "项目级（无模块）"过滤
@@ -840,9 +888,19 @@ export const fetchProjectKnowledge = (params: {
 
 export const updateKnowledge = (
   entryId: number,
-  patch: { content?: string; confidence?: number },
-) =>
-  api.put<{ id: number; version: number }>(`/api/knowledge/${entryId}`, patch).then(r => r.data)
+  patch: { content?: string; confidence?: number; applyModule?: boolean; moduleId?: number | null },
+) => {
+  const body: Record<string, unknown> = {}
+  if (patch.content !== undefined) body.content = patch.content
+  if (patch.confidence !== undefined) body.confidence = patch.confidence
+  if (patch.applyModule) {
+    body.apply_module = true
+    body.module_id = patch.moduleId ?? null
+  }
+  return api.put<{ id: number; version: number; module_id: number | null }>(
+    `/api/knowledge/${entryId}`, body,
+  ).then(r => r.data)
+}
 
 export const deleteKnowledge = (entryId: number) =>
   api.delete<{ deleted: boolean; id: number }>(`/api/knowledge/${entryId}`).then(r => r.data)
@@ -921,12 +979,14 @@ export const submitFeedback = (
   feedbackType: 'like' | 'dislike' | 'edit',
   modified?: Record<string, string>,
   original?: Record<string, string>,
+  reason?: string,
 ) =>
   api.post('/api/feedback', {
     test_case_id: testCaseId,
     feedback_type: feedbackType,
     original_content: original,
     modified_content: modified,
+    reason: reason,
   }).then(r => r.data)
 
 // ── Cases (delete) ────────────────────────────────────────────────────────────
@@ -973,7 +1033,9 @@ export interface DocumentSummary {
 }
 
 export interface DocumentDetail extends DocumentSummary {
-  content: string         // 截断后的解析正文（只读预览）
+  content: string          // 截断后的解析正文（只读预览）
+  raw_text_length: number  // 原始解析正文总字符数（截断前）
+  truncated: boolean       // content 是否相对原文被截断
 }
 
 export const fetchDocuments = (opts?: { moduleId?: number | null; onlyOrphan?: boolean; role?: string }) => {
@@ -1195,7 +1257,7 @@ export const fetchPromptVersions = (key: string) =>
 
 export const createPromptVersion = (
   key: string,
-  payload: { template: string; activate?: boolean },
+  payload: { template: string; activate?: boolean; from_suggestion_id?: number },
 ) =>
   api.post<PromptVersionItem>(`/api/prompts/${key}/versions`, payload).then(r => r.data)
 
@@ -1205,4 +1267,40 @@ export const activatePromptVersion = (key: string, versionId: number) =>
 
 export const resetPromptToDefault = (key: string) =>
   api.post<{ key: string; using_default: boolean }>(`/api/prompts/${key}/reset`, {})
+    .then(r => r.data)
+
+// ── Phase 4.2 二阶段: 系统给的 prompt 改进建议（只读建议 + 人工审核，本期仅 generator）──
+
+export interface PromptSuggestion {
+  id: number
+  prompt_id: string
+  base_version_id: number | null
+  base_template: string
+  suggested_template: string
+  rationale: string | null
+  evidence: {
+    feedback_count?: number
+    samples?: { intent?: string | null; summary?: string | null; changed_fields?: string[] | null }[]
+  } | null
+  status: string            // pending / adopted / dismissed
+  created_at: string | null
+}
+
+export interface GenerateSuggestionResult {
+  created: boolean
+  reason?: string
+  suggestion?: PromptSuggestion
+  feedback_count: number
+}
+
+export const generatePromptSuggestion = (key: string) =>
+  api.post<GenerateSuggestionResult>(`/api/prompts/${key}/suggestions/generate`, {})
+    .then(r => r.data)
+
+export const fetchPromptSuggestions = (key: string, status = 'pending') =>
+  api.get<PromptSuggestion[]>(`/api/prompts/${key}/suggestions`, { params: { status_filter: status } })
+    .then(r => r.data)
+
+export const dismissPromptSuggestion = (suggestionId: number) =>
+  api.post<{ id: number; status: string }>(`/api/prompts/suggestions/${suggestionId}/dismiss`, {})
     .then(r => r.data)

@@ -1,6 +1,6 @@
 ================================================================================
 TestCraft AI — 开发进度记录
-更新时间：2026-07-01
+更新时间：2026-07-06
 ================================================================================
 
 ■ Phase 1 — 基础骨架                                              [✅ 已完成]
@@ -122,7 +122,7 @@ TestCraft AI — 开发进度记录
          │   └─ 任何异常吞掉但写 warning（不阻塞启动）
          └─ ⚠️  后续新增列/索引必须放进 alembic/versions/NNNN_*.py，不要再往 init_db 加 ALTER
 
-■ Phase 4 — 反馈驱动进化                                          [🟡 第一阶段完成]
+■ Phase 4 — 反馈驱动进化                                          [✅ 已完成]
   ├─ Phase 4.1 — 反馈闭环（已完成）
   │   ├─ [✅] 反馈差异分析（LLM 分析 edit diff，提取修改意图）       [Task #89]
   │   │      ├─ app/agents/diff_analyzer.py（DiffAnalysis dataclass）
@@ -169,11 +169,24 @@ TestCraft AI — 开发进度记录
       │       ├─ 左栏 3 个 prompt + 生效版本徽标；右栏编辑器 + 历史版本
       │       ├─ 载入原始建议版本 / 保存为新版本 / 设为生效 / 恢复默认
       │       └─ client.ts 新增 fetchPrompts 等 6 个 API
-      └─ 第二阶段：系统定期给建议 + 人工审核（待开发，暂记录）
-          ├─ 不做实时阈值自动改写、不做无人值守自动上线
-          ├─ 定期分析负反馈 → LLM 产出"建议的 prompt 改动"（草稿形式）
-          ├─ 建议呈现在管理面板，人工审核决定是否采用、如何采用
-          └─ 与 4.1 的"草稿 → 人工审核入库"模式保持一致
+      └─ 第二阶段：系统给建议 + 人工审核（✅ 已完成 2026-07-06）
+          ├─ 范围：本期仅 generator（唯一有真实可归因负反馈的 prompt）
+          ├─ 数据模型：PromptSuggestion 表（pending/adopted/dismissed 草稿）+ Alembic 0004
+          ├─ app/agents/prompt_optimizer.py：聚合负反馈 → LLM 增量修订 prompt；
+          │   MIN_SAMPLES 门槛 + 契约护栏（产出必须保留 {CASE_PREFIX}/JSON数组/priority
+          │   等关键约定，缺失即丢弃，防止把 prompt 改坏拖垮生成）
+          ├─ API（routes_prompts.py，仅 generator）：
+          │   ├─ POST /prompts/{key}/suggestions/generate  手动分析负反馈生成 pending 草稿
+          │   ├─ GET  /prompts/{key}/suggestions           列建议（默认 pending）
+          │   ├─ POST /prompts/suggestions/{id}/dismiss     忽略
+          │   └─ 采用无独立端点：走既有 POST /versions（可带 from_suggestion_id 标 adopted）
+          ├─ 定期后台：main.py lifespan 起纯 asyncio 周期任务，只生成草稿绝不激活；
+          │   config 加 prompt_suggestion_interval_hours（默认 24，≤0 禁用）+ _min_samples
+          └─ 前端 PromptManagerDrawer：generator 专属「改进建议」块——生成按钮 +
+              pending 卡（行级 diff 红绿高亮 vs 当前生效版本 + rationale + 证据）+
+              采用（灌进编辑器可改，再走既有「保存为新版本」）/ 忽略；
+              client.ts 加 generate/fetch/dismissPromptSuggestion 三个 API
+          ★ 安全边界：新增全是只读建议，唯一改 prompt 的写路径仍是一阶段的人工版本化 API
 
 ■ 模块管理增强（跨阶段补充，2026-06-30）                          [✅ 已完成]
   ├─ [✅] 模块聚合视图（以模块为中心查看 / 编辑名下资产）
@@ -252,6 +265,273 @@ TestCraft AI — 开发进度记录
   └─ 整体性能调优与压测
 
 ================================================================================
+变更 / 修复记录（倒序，最新在上）
+================================================================================
+■ 2026-07-06 — 反馈进化总览面板（进化闭环第二步，前端）
+  在知识库页头部「总览」下方加一条「反馈进化」横条（仅当已有分诊反馈时显示）：
+  ├─ 三出口（知识库/Skill/系统提示词）各自的 待消化/已消化 计数
+  ├─ 归一 intent 分布徽标
+  └─ 数据源 GET /api/feedback/evolution/summary（第一步已就绪，纯前端消费，不扩后端）
+  实现（前端）：client.ts 加 EvolutionSummary 类型 + fetchEvolutionSummary；
+  KnowledgePage 加 evolution 态 + reloadEvolution，接入首次加载与「切入知识库 tab」激活刷新。
+  验证：ASGI 造分诊反馈实测 summary 计数正确（skill 待1/已1 等）、intent 分布聚合正确；tsc 净。
+
+■ 2026-07-06 — 负反馈统一分诊 + 消费台账（进化闭环第一步，后端）
+  背景：Phase 4.2 二阶段验收暴露三问题——① 每次生成建议都重复分析同一批负反馈；
+        ② 负反馈只喂 prompt 不够全面；③（核实发现）裸👎 dislike 对三出口零贡献。
+        根因：缺统一的「分诊 + 消费台账」中枢。设计见 docs/feedback-evolution-design.md。
+  数据模型（feedback.py + Alembic 0005）：
+  ├─ Feedback 加 reason（dislike 可选原因）/ triage（归一 intent）/
+  │   triage_targets（出口串 "prompt,skill"；注意用 VARCHAR 非 JSON——JSON 列不支持
+  │   LIKE/包含查询，会报 operator does not exist: json ~~ text）。
+  └─ 新增 FeedbackConsumption 台账表，唯一约束 (feedback_id, output_kind) 保证幂等。
+  分诊层（agents/feedback_triage.py）：
+  ├─ triage_intent 纯函数：修正业务规则→knowledge+skill；补充边界/调整步骤→prompt+skill；
+  │   改写表达/其它→不消费。
+  └─ classify_dislike：带原因的 dislike 用 LLM 归一到 intent 枚举（fail-open→其它），
+      让👎也能进分诊链路。
+  三出口改「只吃未消费增量」+ 消费回写：
+  ├─ 知识（routes_feedback._analyze_diff_bg）：分诊到 knowledge 时入库并记 kind=knowledge。
+  ├─ Prompt（routes_prompts）：样本只取 target 含 prompt 且未被 prompt 消费的；建议 evidence
+  │   记 feedback_ids；采用（create_version 带 from_suggestion_id）时批量写 kind=prompt 消费，
+  │   dismiss 不写 → 反馈仍可用。彻底解决问题①。
+  └─ Skill（routes_knowledge.regenerate_skill）：只取 target 含 skill 且未消费的；归纳成功
+      写 kind=skill 消费。
+  新端点：GET /api/feedback/evolution/summary（三出口 待消费/已消费 计数 + intent 分布），
+          为第二步前端「反馈进化」总览面板预留。
+  dislike UI（前端 TestCaseTable + client.ts）：点👎展开可选原因输入（可留空直接提交），
+          reason 透传后端。
+  验证：迁移建表/加列核验；ASGI 实测分诊过滤（knowledge-only 反馈不进 prompt 池）、
+        消费后去重（问题①根治）、台账幂等、evolution/summary 计数、generate 不再报 SQL 错；
+        lint + tsc 净。第二步（前端总览面板 + dislike 富交互）单独交付。
+
+■ 2026-07-06 — Phase 4.2 二阶段：系统给 generator prompt 改进建议 + 人工审核
+  需求：系统定期/手动分析负反馈 → LLM 产出"建议的 prompt 改动"草稿 → 人工审核采用。
+        明确不做无人值守自动改写；唯一改 prompt 的写路径仍是一阶段的人工版本化 API。
+  后端：
+  ├─ 数据模型 PromptSuggestion（prompt_suggestions 表）+ Alembic 0004（CREATE IF NOT EXISTS）。
+  ├─ agents/prompt_optimizer.py：聚合 dislike+edit 负反馈（复用 diff_analysis 的
+  │   intent/summary/changed_fields）→ LLM 增量修订；MIN_SAMPLES 门槛 + 契约护栏
+  │   （产出必须保留 {CASE_PREFIX}/JSON数组/case_number/priority/expected_result，
+  │   缺任一即丢弃，防改坏 prompt 拖垮生成）；吞异常返回 None。
+  ├─ routes_prompts.py：+3 端点（suggestions/generate、list、dismiss）；run_generator_suggestion
+  │   共用于手动与后台，去重（同 base_template 已有 pending 不重复插）；create_version
+  │   加 from_suggestion_id，采用后标该建议 adopted + reviewed_by/at。
+  └─ main.py lifespan：纯 asyncio 周期任务（无调度依赖），遍历有负反馈的项目只生成
+      pending 草稿、绝不激活，shutdown 时 cancel；config 加 prompt_suggestion_interval_hours
+      （默认 24，≤0 禁用）+ _min_samples（默认 3）。
+  前端（PromptManagerDrawer.tsx + client.ts）：
+  └─ generator 专属「改进建议」块：生成按钮（含"信号不足"文案）+ pending 卡
+      （SuggestionDiff 行级 LCS diff 红绿高亮 vs 当前生效版本 + rationale + 证据）+
+      采用（灌进编辑器可改，再走既有"保存为新版本"，回传 from_suggestion_id）/ 忽略。
+  验证：DB 迁移建表 OK；ASGI 实测 generate(信号不足→created:false)/list/dismiss/adopt 全通；
+        契约护栏单测（真 prompt 通过、缺 {CASE_PREFIX} 被丢弃）通过；前端 tsc + 后端 ruff 净。
+
+■ 2026-07-06 — 知识库"类型分布"计数随所选模块刷新（补登，之前漏记）
+  现象：知识库切换模块时，顶部"类型分布"按钮的计数不刷新、且与下方列表条数对不上。
+  根因：类型分布取自 stats.by_type（项目级全局统计，切模块不重拉、后端也不按模块过滤），
+        而下方列表 items 是按模块拉的。
+  修复（前端 KnowledgePage.tsx）：新增派生值 typeDistribution，用 useMemo 从已按模块加载的
+        items 现算类型计数（降序）；类型分布渲染由 stats.by_type 改为 typeDistribution。
+        切模块 items 一变计数即刷新，且数字恰等于点该类型后列表能看到的条数。
+
+■ 2026-07-04（续 6）— 草稿审核"加入模块"默认选中上一步确认的模块
+  现象/需求：确认产品知识草稿时，"加入模块"下拉应默认选中模块确认卡刚拍板的模块。
+  隐患：原先用 confirmedModuleName 按名字反查 id 传给面板，新建模块时 modules 列表异步
+        刷新还没到 → 名字匹配失败退回"无模块"。
+  修复（前端 ChatPage.tsx）：新增 SessionState.confirmedModuleId，在 handleModuleAutoClassified
+        （高置信）与 confirmModuleDecision（用户确认）里同时记 id；草稿面板 defaultModuleId
+        改由 draftDefaultModuleId memo 提供——优先用 confirmedModuleId，缺失时才按名字反查兜底。
+
+■ 2026-07-04（续 5）— 孤儿文档可重新归类 + 知识条目可改所属模块
+  需求（用户）：① 文档"取消归属"后要能重新找到并添加/归类；② 编辑知识条目时能改所属模块。
+  后端（routes_knowledge.py，PUT /knowledge/{id}）：
+  └─ KnowledgeUpdate 新增 apply_module + module_id：apply_module=true 时校验模块归属后
+     更新 entry.module_id（None=转项目级）；返回体带回 module_id。
+  前端（client.ts + KnowledgePage.tsx）：
+  ├─ updateKnowledge 支持 applyModule/moduleId；EditDraft 加 moduleId，知识条目编辑区
+  │  新增"所属模块"下拉（各模块 + 项目级无模块），保存时按需带 apply_module 并刷新统计。
+  ├─ 新增 OrphanDocsCard：选左侧「项目级（无模块）」筛选时展示未分类文档列表，
+  │  每行可查看正文 / 下拉"归类到某模块"。取消归属后在此重新归类。
+  ├─ ModuleDetailCard 需求文档区新增「添加已有文档」入口：展开列出孤儿文档，点"添加"挂进本模块。
+  └─ 抽取文档正文预览弹窗为公用组件 DocViewerModal（模块卡 / 孤儿文档卡共用）。
+
+■ 2026-07-04（续 4）— 切到知识库 tab 时实时刷新
+  现象：生成用例后点知识库 tab，新沉淀的知识/统计/最近修改不刷新，需手动刷新页面。
+  根因：App.tsx 用 hidden/block 切 tab，各页面始终挂载 → KnowledgePage 首次挂载后的
+        "进页面拉数据" effect 不再重跑，切回来看的是旧快照。
+  修复（前端 KnowledgePage.tsx）：新增 view 激活刷新 effect——每次 view 由其它 tab 切入
+        'knowledge' 时主动重拉 reload()/reloadStats()/fetchModules()/reloadRecentFeedback()。
+        用 ref 持最新刷新逻辑、effect 仅依赖 view，避免回调 identity 变化导致的重复触发。
+
+■ 2026-07-04（续 3）— 对话页已上传文档 chip 显示字符数与截断标记
+  需求（用户）：在对话列表（对话页 PRD/脑图 chip）也显示当次文档总字符数与是否截断。
+  前端（ChatPage.tsx）：
+  ├─ 新增常量 DOC_PREVIEW_LIMIT=30000（与后端 doc_parser.DEFAULT_DOC_LIMIT 对齐）。
+  └─ PRD/脑图 chip 追加"· N 字"，正文超阈值时加琥珀"已截断"徽章（title 说明截断规则）。
+     字符数取 stats.raw_text_length（上传/刷新 hydrate 均已填充）。
+
+■ 2026-07-04（续 2）— 文档"查看"弹窗显示总字符数与是否截断
+  后端（routes_knowledge.py，GET /api/documents/{id}）：
+  └─ 返回体新增 raw_text_length（原文总字符数）+ truncated（content 是否相对原文被截断，
+     即 len(raw) > len(truncate_for_llm(raw)) → 超过 DEFAULT_DOC_LIMIT=30000 字）。
+  前端（client.ts DocumentDetail 加两字段；KnowledgePage.tsx 查看弹窗头部）：
+  └─ 文件名下方显示"共 N 字" + 徽章（已截断预览 / 完整显示），截断徽章 title 说明规则。
+
+■ 2026-07-04（续）— 知识库"类型分布"支持点击筛选
+  需求（用户）：在知识库页通过点击"类型分布"里的不同类型按钮来筛选条目列表。
+  实现（前端 KnowledgePage.tsx，纯前端过滤——列表本就一次性全量拉回）：
+  ├─ 新增 typeFilter 状态；把类型分布徽章从 <span> 改为可点击 <button>，
+  │  点某类型只看该类型、再点同类型或点"全部"取消；选中态加 ring 高亮。
+  ├─ 新增 visibleItems = items 按 typeFilter 过滤；列表渲染改用 visibleItems。
+  ├─ 切换模块 / 变更搜索词后自动清空 typeFilter，避免旧类型隐藏新结果集。
+  └─ 该类型下无条目时给单独空态 + "清除类型筛选"入口。
+
+■ 2026-07-04 — 上传流程重排为「模块确认 → 知识草稿 → 开始澄清」，模块可交互选择
+  需求（用户）：
+  ├─ 上传文档后先走模块归类，再抽产品知识草稿，最后才注入知识开始澄清。
+  ├─ 即使自动命中了模块也要用户再确认一下（原先高置信直接落库、静默跳过）。
+  └─ 知识草稿入库要能选"加入哪个模块"（原先无选择、直接进无模块状态）。
+  后端（routes_upload.py，PRD / lark / mindmap 三条路径）：
+  ├─ 调整 SSE 帧顺序：module_auto_classified →（knowledge_extract +
+  │  extracted_knowledge_drafts）→（knowledge_lookup + knowledge_preview）→ done。
+  │  即先抽知识草稿并停在审核闸门，再算知识预览，保证前端推进顺序。
+  后端（routes_knowledge.py，confirm_pending_knowledge）：
+  ├─ 请求体新增 apply_module + module_id：apply_module=true 时校验模块归属、
+  │  按该模块 store_entries 入库，并把该模块回写到 doc.module_id；
+  │  module_id=None 表示"不归入模块"（项目级）。不传时沿用文档当前模块（旧行为）。
+  前端：
+  ├─ 新增 ModuleConfirmPanel 组件：LLM 判定归属后一律弹「确认归属模块」卡（含高置信
+  │  自动命中）。下拉可选：任一已有模块 / 不归入模块（项目级）/ 新建模块（中/英文名/描述）。
+  │  高置信默认选中命中模块，提议新建则默认进新建分支；确认后把文档归入所选模块。
+  ├─ SessionState.moduleProposal 重构为 moduleDecision（承载建议模块、置信度、下拉选中、
+  │  新建字段）。刷新复原沿用后端 module_proposal（仅"建议新建"这一种）。
+  ├─ 高置信自动命中时先记 confirmedModuleName，用户即使"忽略"确认卡，草稿面板也能默认对模块。
+  ├─ KnowledgeDraftReviewPanel 增加"加入模块"下拉（默认=已确认模块，可改/可选无模块），
+  │  确认时把 { applyModule, moduleId } 透传 confirmPendingKnowledge。
+  └─ 渲染门控：moduleDecision 未处理时阻塞草稿审核 / 澄清面板 / 知识预览，
+     落地「模块 → 知识草稿 → 开始澄清」的严格顺序。
+
+■ 2026-07-02（续 5）— 产品知识抽取进行中不显示「开始澄清」按钮
+  现象：上传需求文档后，SSE 的 knowledge_preview 帧先于 knowledge_extract（产品
+        知识稿抽取）到达；抽取仍在同步跑（uploading 尚未 done）时，知识预览面板已
+        渲染出"开始澄清"按钮，用户可抢在抽取完成/草稿审核前开始澄清。
+  修复（前端 ChatPage.tsx）：KnowledgePreviewPanel 渲染条件追加 !active.uploading，
+        抽取完成后 onDone 置 uploading=false，面板才亮。phase='generate' 的预览由
+        startKnowledgePreview 触发（uploading 早已 false），不受影响。
+
+■ 2026-07-02（续 4）— 「开始澄清」需等所有前置弹窗处理完才可点
+  现象：知识预览面板（phase='clarify'，含"开始澄清"按钮）的渲染门控只挡了
+        prdDraftReview / mindmapDraftReview 两个知识草稿审核弹窗，漏了
+        moduleProposal「建议新建模块」卡 → 模块建议卡还在时用户已能点"开始澄清"。
+  修复（前端 ChatPage.tsx）：KnowledgePreviewPanel 渲染条件追加 !active.moduleProposal，
+        与草稿审核闸门一致——三个前置弹窗任一存在都隐藏知识预览面板、阻止提前开始澄清。
+
+■ 2026-07-02（续 3）— 修复刷新后永久卡在"正在执行：加载知识库预览"
+  现象：awaiting_clarification 状态下刷新页面，底部一直显示"正在执行：加载知识库
+        预览"，loading 转圈永不消失，知识预览面板也出不来。
+  根因（前端 ChatPage.tsx hydrate effect 自我中断）：
+  ├─ 该 effect 依赖数组里含 taskMap，而它自身的 patchSession 又会改 taskMap。
+  ├─ Promise.all 完成 → patchSession(挂 loading 占位) → 同一同步回调里发出
+  │   fetchKnowledgePreview 请求。
+  ├─ 上一步的 setState 使 taskMap 变化 → effect 重跑：先执行旧 cleanup
+  │   （cancelled=true + previewController.abort()）→ 刚发出的预览请求被 abort。
+  └─ 请求 reject 进 catch，判定 aborted 且 cancelled → 提前 return，
+      永远没跑到 loading:false → loading 永久为 true。
+  修复：
+  ├─ 新增 taskMapRef（taskMap 实时镜像），hydrate effect 改用 ref 读 loaded 标记；
+  └─ 依赖数组去掉 taskMap（只在 activeSessionId 变化时跑一次，符合 lazy-load-once 语义）。
+
+■ 2026-07-02（续 2）— 修复刷新后「建议新建模块」卡片丢失、卡在"加载知识库预览"
+  现象：上传飞书链接后同时出现「建议新建模块」卡 + 知识草稿/知识预览面板；
+        此时刷新页面，模块建议卡消失，底部长期显示"正在执行：加载知识库预览"。
+  根因：moduleProposal 是纯前端态，只由上传时的 SSE 帧 onModuleAutoClassified 填充；
+        stateFromDTO() 刷新回放时重建了 uploadResult/knowledgePreview/草稿面板，
+        唯独没有重建 moduleProposal → 卡片丢失。（"加载知识库预览"loader 是
+        awaiting_clarification 状态下的正常占位，hits 拉回后即消，非本 bug 主因，
+        但模块卡消失后用户误以为卡住。）
+  修复（无需迁移，复用已落库数据）：
+  ├─ backend/app/api/routes_chat.py get_clarification_state：扫描本会话
+  │   role=assistant 且 meta.kind=module_auto_classified 的气泡，取最近一条
+  │   满足 applied=false 且引用文档 module_id IS NULL 的 ref.proposed_module，
+  │   作为 module_proposal 返回。文档已归类（用户点过"创建并归类"或高置信自动落库）
+  │   则提议作废、不复原。
+  └─ 前端 client.ts ClarificationStateDTO 加 module_proposal 字段；
+      ChatPage.tsx stateFromDTO() 映射回 SessionState.moduleProposal。
+      注："忽略"是纯前端操作，刷新后提议会再次出现（可接受——它只是建议）。
+
+■ 2026-07-02（续）— 修复重复导入撞唯一约束 uq_documents_project_sha
+  背景：上一条的 SSE 顶层兜底把真凶暴露了出来——飞书导入报
+        asyncpg UniqueViolationError: duplicate key ... uq_documents_project_sha
+        Key (project_id, sha256)=(7, 9016a…) already exists。
+  根因：方案B下 PRD 澄清移到独立端点 /clarify/initial/stream，上传阶段不再写
+        Document.clarification，所以缓存命中判断 `existing and existing.clarification`
+        对 PRD 几乎永远为假 → 每次导入同一文档都跳过复用、直接 INSERT → 第二次起
+        必撞 (project_id, sha256) 唯一约束。DB 实证：sha 9016a… 存在两行，
+        id=25(project6,有clarification) / id=26(project7,clarification空)，
+        报错的正是 project7 那行。文件上传 /upload/stream、脑图上传两条路径同样隐患。
+  修复（backend/app/api/routes_upload.py，三处 persist 全改）：
+  ├─ /upload/lark/stream：persist 前先按 (project_id, sha256) 查 existing_doc，
+  │   命中就复用该行并刷新 filename/module/parsed_content/raw_text，不再无条件 INSERT。
+  ├─ /upload/stream（文件）：同样加 existing_doc 复用分支。
+  └─ /upload/mindmap/stream（脑图文件）：同样加 existing_doc 复用分支（防 fingerprint
+      检查与 INSERT 间的竞态/残留）。
+  说明：复用而非报错，符合"同一份文档重复导入应幂等"的预期；已落库的 clarification
+        仍走上面的 cache_hit 早返回分支，行为不变。
+
+■ 2026-07-02 — 根治飞书导入 TypeError: network error + 清理重复孤儿会话
+  背景：飞书导入报「❌ 飞书导入中断：TypeError: network error」，左侧堆积 6+ 个
+        同名飞书会话。排查确认：后端 worker 已连续在线 22h、本次并未 reload，故
+        07-01 归因的「--reload 掐断」不是这次主因。真正根因是 /upload/lark/stream
+        的 events() 生成器无顶层异常兜底——自动归类 / 知识检索 / 澄清等 LLM 调用
+        一旦抛未捕获异常，StreamingResponse 会中途掐断 chunked 流且不发结束帧
+        → 浏览器 ERR_INCOMPLETE_CHUNKED_ENCODING → 前端 fetch 抛 TypeError:
+        network error（前端 sawTerminal 兜底只处理干净 EOF，救不了 chunked 崩断）。
+        而会话在导入前就已 createSession，每次崩断留一个空壳，刷新后 activeSessionId
+        重置为 null，重试再建 → 攒成一堆。DB 实证：文档 AVfuw… 的 session 48 成功
+        （42 用例/8 消息），其后 49~55 全是 0 用例 0 消息的空孤儿。
+  ├─ 根治（后端）：events() 拆成 _events_inner() + 外层 events() 包裹，捕获所有
+  │   未预期异常 → 统一转成 assistant_message + error + done 帧，流干净收尾，前端
+  │   拿到可读中文原因并复位（backend/app/api/routes_upload.py，PRD/脑图两端点共用）。
+  ├─ 新增 DELETE /api/sessions/{id}：手动按序级联删 Feedback→TestCase→Message→
+  │   ClarificationState→Session（init_db 建表未走迁移，不依赖 DB 层 CASCADE）。
+  │   前端 SessionList 每行加垃圾桶按钮（hover 显示 + 二次确认），client.ts 加
+  │   deleteSession，ChatPage 加 handleDeleteSession（删前先 abort 在跑任务、删后
+  │   切到剩余首个会话或 null）。用于清掉现有孤儿会话。
+  └─ 前端孤儿防护：handleLarkImport 记录 createdNewSid + gotContent，若「本次为
+      导入新建的会话 + 全程没收到任何内容 + 无后续脑图阶段」则在 onError 里直接删掉
+      这个空会话，不再插错误气泡，避免重试堆积（frontend/src/pages/ChatPage.tsx）。
+
+■ 2026-07-01 — 修复飞书链接导入过一会儿界面内容消失
+  背景：飞书导入进度出现后聊天区变空白，Console 报
+        net::ERR_INCOMPLETE_CHUNKED_ENCODING 200 + TypeError: network error。
+        根因是 make dev-backend 的 uvicorn --reload 在长导入（lark-cli 抓取 +
+        LLM 澄清/知识抽取）过程中被 backend/ 下文件变动触发热重载、掐断 SSE 流。
+  ├─ 根治：Makefile dev-backend 加 --reload-dir app --reload-include '*.py'，
+  │   只在 app/ 下 .py 变动时重载，非代码写入不再打断流式请求。
+  ├─ 前端可见提示：handleLarkImport 的 PRD/脑图两处 onError 改为在清进度的同时
+  │   插入一条 assistant 错误气泡（❌ 飞书导入中断…请重试），不再静默变空白
+  │   （frontend/src/pages/ChatPage.tsx）。
+  └─ 前端中断兜底：streamUpload/streamLarkImport/streamMindmapUpload 加
+      sawTerminal 标记，SSE 因 EOF 结束却从未收到 done/error 帧时主动 onError，
+      避免"既不 done 也不 error"的僵状态（frontend/src/api/client.ts）。
+
+■ 2026-07-01 — 「停止任务」真正中断所有任务（前端 + 后端）
+  背景：点右下角「停止任务」时任务一直「正在执行」无反应；用户要求停止 =
+        真正中断请求与后端 LLM 调用，而非仅前端解锁 UI。
+  ├─ 前端 handleStopRequest/handleStopConfirm：不再要求必须注册过 cancel fn，
+  │   有 runningTaskLabel 即弹确认框；cancel fn 可选，无则只走兜底清 UI 状态。
+  ├─ 知识库预览（此前卡死那条）：fetchKnowledgePreview 新增可选 AbortSignal；
+  │   startKnowledgePreview 与会话恢复 hydrate 路径均注册 AbortController，
+  │   「停止」可真正取消该 GET 请求（frontend/src/api/client.ts、pages/ChatPage.tsx）。
+  └─ 非流式 /api/generate：generate() 增参 raw_request: Request，把
+      generate_test_cases 包成 asyncio 任务与「断连轮询」竞速，客户端断开即
+      llm_task.cancel() → 取消底层 httpx → 真正停到大模型，且不落库、返回 499
+      （backend/app/api/routes_generate.py）。
+  说明：chat / upload / lark / mindmap / clarify / generate(流式) 本就通过 SSE
+        AbortController + Starlette 断连取消能真正停止，无需改动。
+
+================================================================================
 当前可用接口速查
 ================================================================================
   — 鉴权 / 项目 —
@@ -287,8 +567,9 @@ TestCraft AI — 开发进度记录
   GET    /api/export/{session_id}   导出会话全部用例 Excel
 
   — 反馈 —
-  POST   /api/feedback              提交反馈（like / dislike / edit；edit 异步触发 diff 分析）
+  POST   /api/feedback              提交反馈（like / dislike / edit；edit 异步触发 diff 分析；dislike 可带 reason 进分诊）
   GET    /api/feedback/recent       最近 N 条已分析的 edit 反馈（intent + summary）
+  GET    /api/feedback/evolution/summary  反馈进化总览（三出口 待消费/已消费 计数 + intent 分布）
 
   — 模块 / 知识库 —
   GET    /api/modules               模块列表（含 code 英文名）
@@ -325,6 +606,12 @@ TestCraft AI — 开发进度记录
   POST   /api/prompts/{key}/versions       保存为新版本（activate 可同时设为生效）
   POST   /api/prompts/{key}/versions/{id}/activate  切换生效版本
   POST   /api/prompts/{key}/reset          恢复使用原始建议版本
+
+  — Prompt 改进建议（Phase 4.2 二阶段，仅 generator，只读建议+人工审核）—
+  POST   /api/prompts/{key}/suggestions/generate  分析负反馈生成 pending 建议（不激活）
+  GET    /api/prompts/{key}/suggestions           建议列表（默认 status=pending）
+  POST   /api/prompts/suggestions/{id}/dismiss    忽略建议
+  （采用建议无独立端点：走 POST /prompts/{key}/versions，可带 from_suggestion_id 标 adopted）
 
   — 系统 —
   GET    /health                    健康检查

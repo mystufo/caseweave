@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { Sparkles, Trash2, BookPlus, Edit2, Check, AlertTriangle, ChevronDown, ChevronUp } from 'lucide-react'
-import type { KnowledgeDraft } from '../api/client'
+import type { KnowledgeDraft, ModuleSummary } from '../api/client'
 
 interface Props {
   // 文档信息——决定调哪一份 documents/{id}/confirm_pending_knowledge
@@ -8,11 +8,18 @@ interface Props {
   role?: 'prd' | 'mindmap'
   filename?: string | null
   moduleName?: string | null
+  // "加入哪个模块"下拉的数据源 + 默认选中（通常为上一步确认的模块 id；null=不归入模块）
+  modules?: ModuleSummary[]
+  defaultModuleId?: number | null
   drafts: KnowledgeDraft[]
   // submitting=true 时 disabled 所有按钮，防重复点击
   submitting?: boolean
   // 入库（按勾选 + 已编辑后的草稿）/ 全部丢弃。父组件负责调后端接口并 settle 草稿状态。
-  onConfirm: (acceptedDrafts: KnowledgeDraft[]) => void
+  // moduleChoice 承载用户在下拉里选的入库模块（applyModule=true 时后端按它入库并回写文档归属）。
+  onConfirm: (
+    acceptedDrafts: KnowledgeDraft[],
+    moduleChoice: { applyModule: boolean; moduleId: number | null },
+  ) => void
   onDiscard: () => void
 }
 
@@ -35,7 +42,7 @@ const TYPE_OPTIONS: { value: string; label: string }[] = [
 ]
 
 export default function KnowledgeDraftReviewPanel({
-  documentId, role, filename, moduleName, drafts, submitting, onConfirm, onDiscard,
+  documentId, role, filename, moduleName, modules, defaultModuleId, drafts, submitting, onConfirm, onDiscard,
 }: Props) {
   // 默认全勾。drafts 变化（切会话 / 重新抽取）时重置一次。
   const [selected, setSelected] = useState<Set<number>>(() => new Set(drafts.map((_, i) => i)))
@@ -45,6 +52,9 @@ export default function KnowledgeDraftReviewPanel({
   const [editingIdx, setEditingIdx] = useState<number | null>(null)
   // 哪些行展开了"潜在冲突"详情（按索引）。冲突默认折叠。
   const [expandedConflicts, setExpandedConflicts] = useState<Set<number>>(new Set())
+  // "加入哪个模块"选中值——默认取上一步确认的模块 id（null=不归入模块）。
+  // 渲染门控保证本面板出现时模块确认已完成，defaultModuleId 已稳定，故初始化一次即可。
+  const [targetModuleId, setTargetModuleId] = useState<number | null>(defaultModuleId ?? null)
 
   useEffect(() => {
     setSelected(new Set(drafts.map((_, i) => i)))
@@ -88,7 +98,8 @@ export default function KnowledgeDraftReviewPanel({
     const accepted = indices
       .map(i => edited[i])
       .filter(d => d && d.content.trim().length > 0 && d.knowledge_type.trim().length > 0)
-    onConfirm(accepted)
+    // 有模块下拉时才带 applyModule；否则维持后端"沿用文档当前模块"的旧行为。
+    onConfirm(accepted, { applyModule: !!modules, moduleId: targetModuleId })
   }
 
   const roleLabel = role === 'mindmap' ? '脑图' : 'PRD'
@@ -113,6 +124,26 @@ export default function KnowledgeDraftReviewPanel({
         勾选要永久写入项目知识库的条目；点 <Edit2 size={11} className="inline -mt-0.5" /> 可修订内容、改类型、调置信度。
         草稿是基于本次上传文档抽取出的可沉淀产品知识，入库后将参与未来同模块用例生成的检索召回。
       </div>
+
+      {/* 加入哪个模块——默认取上一步确认的模块；可改选其它模块或"不归入模块"（项目级）。 */}
+      {modules && (
+        <label className="flex items-center gap-2 text-xs text-amber-800">
+          <span className="whitespace-nowrap">加入模块</span>
+          <select
+            value={targetModuleId != null ? String(targetModuleId) : '__none__'}
+            onChange={e => setTargetModuleId(e.target.value === '__none__' ? null : Number(e.target.value))}
+            disabled={submitting}
+            className="flex-1 px-2 py-1 text-xs border border-amber-300 rounded bg-white focus:outline-none focus:ring-1 focus:ring-amber-400 disabled:opacity-50"
+          >
+            {modules.map(m => (
+              <option key={m.id} value={String(m.id)}>
+                {m.name}{m.code ? `（${m.code}）` : ''}
+              </option>
+            ))}
+            <option value="__none__">不归入任何模块（项目级）</option>
+          </select>
+        </label>
+      )}
 
       {drafts.length > 0 && (
         <div className="flex items-center justify-between text-xs text-amber-700/80">

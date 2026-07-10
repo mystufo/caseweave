@@ -1,14 +1,15 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   fetchModules, createModule, updateModule, deleteModule,
   fetchProjectKnowledge, updateKnowledge, deleteKnowledge,
   fetchModuleRelations, createModuleRelation, deleteModuleRelation,
   fetchKnowledgeStats,
+  fetchEvolutionSummary,
   fetchSkills, fetchSkillDetail, createSkill, updateSkill, deleteSkill, regenerateSkill,
   fetchRecentFeedback,
   fetchDocuments, fetchDocumentDetail, updateDocumentModule,
   type KnowledgeHit, type ModuleSummary, type ModuleRelation, type ModuleRelationType,
-  type KnowledgeStats,
+  type KnowledgeStats, type EvolutionSummary,
   type SkillSummary, type RecentFeedbackItem,
   type DocumentSummary, type DocumentDetail,
 } from '../api/client'
@@ -46,7 +47,7 @@ const TYPE_BADGE: Record<string, string> = {
 const ALL = -1  // 模块过滤的"全部"哨兵——后端 module_id 用 null 表示不过滤
 const ORPHAN = -2  // 项目级（module_id = NULL）的条目
 
-type EditDraft = { content: string; confidence: number }
+type EditDraft = { content: string; confidence: number; moduleId: number | null }
 
 const RELATION_LABEL: Record<ModuleRelationType, string> = {
   depends_on: '依赖',
@@ -75,6 +76,117 @@ const FILE_TYPE_LABEL: Record<string, string> = {
   lark_wiki: '飞书知识库',
   lark_sheet: '飞书表格',
   mindmap_md: '脑图',
+}
+
+/**
+ * 未分类（项目级）文档卡：选中「项目级（无模块）」筛选时展示。
+ * 列出所有 module_id=NULL 的孤儿文档，可查看正文、可归类到某个模块。
+ * —— 取消归属后文档变孤儿，这里是重新找到并归类它们的入口。
+ */
+function OrphanDocsCard({
+  modules,
+  onViewDoc,
+  onChanged,
+}: {
+  modules: ModuleSummary[]
+  onViewDoc: (docId: number) => void
+  onChanged: () => void
+}) {
+  const [docs, setDocs] = useState<DocumentSummary[]>([])
+  const [loading, setLoading] = useState(false)
+  const [assigning, setAssigning] = useState<number | null>(null)
+
+  const reload = useCallback(async () => {
+    setLoading(true)
+    try {
+      setDocs(await fetchDocuments({ onlyOrphan: true }))
+    } catch (e) {
+      console.error('Load orphan documents failed:', e)
+    } finally {
+      setLoading(false)
+    }
+  }, [])
+
+  useEffect(() => { void reload() }, [reload])
+
+  const assign = async (docId: number, moduleId: number) => {
+    setAssigning(docId)
+    try {
+      await updateDocumentModule(docId, moduleId)
+      setDocs(prev => prev.filter(d => d.id !== docId))
+      onChanged()
+    } catch (e) {
+      console.error('Assign orphan document failed:', e)
+    } finally {
+      setAssigning(null)
+    }
+  }
+
+  return (
+    <div className="mb-4 rounded-lg border border-gray-200 bg-gray-50/50 overflow-hidden">
+      <div className="flex items-center justify-between px-4 py-3 border-b border-gray-100 bg-white/60">
+        <div className="flex items-center gap-2 text-sm font-medium text-gray-700">
+          <FileText size={15} className="text-gray-400" />
+          未分类文档（{docs.length}）
+          <span className="text-xs font-normal text-gray-400">未归属到任何模块，可在此归类</span>
+        </div>
+        <button
+          type="button"
+          onClick={() => void reload()}
+          className="p-1 text-gray-400 hover:text-gray-700"
+          title="刷新"
+        >
+          <RefreshCw size={12} className={loading ? 'animate-spin' : ''} />
+        </button>
+      </div>
+      <div className="p-4">
+        {loading && docs.length === 0 ? (
+          <div className="flex items-center gap-2 text-xs text-gray-400 py-2">
+            <Loader2 size={12} className="animate-spin" /> 加载未分类文档…
+          </div>
+        ) : docs.length === 0 ? (
+          <div className="text-xs text-gray-400 py-2">暂无未分类文档</div>
+        ) : (
+          <div className="space-y-1.5">
+            {docs.map(d => (
+              <div key={d.id} className="flex items-center gap-2 px-3 py-2 bg-white border border-gray-100 rounded hover:border-gray-200">
+                <FileText size={13} className="text-gray-400 flex-shrink-0" />
+                <span className="text-sm text-gray-800 truncate flex-1" title={d.filename}>{d.filename}</span>
+                <span className="text-[10px] px-1.5 py-0.5 rounded bg-gray-100 text-gray-600 whitespace-nowrap">
+                  {d.role === 'mindmap' ? '脑图' : 'PRD'}
+                </span>
+                {d.source_url && (
+                  <a href={d.source_url} target="_blank" rel="noreferrer" className="text-gray-400 hover:text-blue-600" title="打开飞书原文">
+                    <ExternalLink size={13} />
+                  </a>
+                )}
+                <button
+                  type="button"
+                  onClick={() => onViewDoc(d.id)}
+                  className="inline-flex items-center gap-1 text-[11px] text-gray-500 hover:text-amber-700 px-1"
+                  title="查看解析正文"
+                >
+                  <Eye size={13} /> 查看
+                </button>
+                <select
+                  value=""
+                  disabled={assigning === d.id || modules.length === 0}
+                  onChange={e => { if (e.target.value) void assign(d.id, Number(e.target.value)) }}
+                  className="text-[11px] border border-gray-200 rounded px-1 py-0.5 text-gray-600 focus:outline-none focus:ring-1 focus:ring-amber-300 disabled:opacity-50"
+                  title="归类到模块"
+                >
+                  <option value="" disabled>归类到…</option>
+                  {modules.map(m => (
+                    <option key={m.id} value={m.id}>归入「{m.name}」</option>
+                  ))}
+                </select>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  )
 }
 
 /**
@@ -117,6 +229,12 @@ function ModuleDetailCard({
   const [reassigning, setReassigning] = useState<number | null>(null)
   const [viewing, setViewing] = useState<DocumentDetail | null>(null)
   const [viewLoading, setViewLoading] = useState(false)
+
+  // 「添加已有文档」——把未分类（孤儿）文档挂进本模块
+  const [attachOpen, setAttachOpen] = useState(false)
+  const [orphanDocs, setOrphanDocs] = useState<DocumentSummary[]>([])
+  const [orphanLoading, setOrphanLoading] = useState(false)
+  const [attaching, setAttaching] = useState<number | null>(null)
 
   const reload = useCallback(async () => {
     setLoading(true)
@@ -194,6 +312,35 @@ function ModuleDetailCard({
       setErr('调整文档归属失败')
     } finally {
       setReassigning(null)
+    }
+  }
+
+  // 展开「添加已有文档」时拉未分类文档列表
+  const openAttach = async () => {
+    setAttachOpen(true)
+    setOrphanLoading(true)
+    try {
+      setOrphanDocs(await fetchDocuments({ onlyOrphan: true }))
+    } catch (e) {
+      console.error('Load orphan documents failed:', e)
+      setErr('加载未分类文档失败')
+    } finally {
+      setOrphanLoading(false)
+    }
+  }
+
+  // 把某未分类文档挂进本模块
+  const attachDoc = async (docId: number) => {
+    setAttaching(docId)
+    try {
+      await updateDocumentModule(docId, module.id)
+      setOrphanDocs(prev => prev.filter(d => d.id !== docId))
+      await reload()  // 刷新本模块文档列表
+    } catch (e) {
+      console.error('Attach document failed:', e)
+      setErr('添加文档失败')
+    } finally {
+      setAttaching(null)
     }
   }
 
@@ -386,9 +533,52 @@ function ModuleDetailCard({
           <>
             {/* 需求文档 */}
             <section>
-              <div className="text-xs font-semibold text-gray-500 mb-1.5">
-                需求文档（{prdDocs.length}）
+              <div className="flex items-center justify-between mb-1.5">
+                <span className="text-xs font-semibold text-gray-500">
+                  需求文档（{prdDocs.length}）
+                </span>
+                <button
+                  type="button"
+                  onClick={() => (attachOpen ? setAttachOpen(false) : void openAttach())}
+                  className="inline-flex items-center gap-1 text-[11px] text-amber-600 hover:text-amber-800"
+                  title="把未分类文档添加到本模块"
+                >
+                  <Plus size={12} /> 添加已有文档
+                </button>
               </div>
+              {/* 添加已有文档：列出未分类（孤儿）文档，点即挂进本模块 */}
+              {attachOpen && (
+                <div className="mb-2 rounded border border-amber-200 bg-amber-50/40 p-2">
+                  {orphanLoading ? (
+                    <div className="flex items-center gap-2 text-xs text-gray-400 py-1">
+                      <Loader2 size={12} className="animate-spin" /> 加载未分类文档…
+                    </div>
+                  ) : orphanDocs.length === 0 ? (
+                    <div className="text-xs text-gray-400 py-1">暂无未分类文档</div>
+                  ) : (
+                    <div className="space-y-1">
+                      {orphanDocs.map(d => (
+                        <div key={d.id} className="flex items-center gap-2 text-xs">
+                          <FileText size={12} className="text-gray-400 flex-shrink-0" />
+                          <span className="truncate flex-1 text-gray-700" title={d.filename}>{d.filename}</span>
+                          <span className="text-[10px] px-1 py-0.5 rounded bg-gray-100 text-gray-500 whitespace-nowrap">
+                            {d.role === 'mindmap' ? '脑图' : 'PRD'}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => void attachDoc(d.id)}
+                            disabled={attaching === d.id}
+                            className="inline-flex items-center gap-0.5 px-1.5 py-0.5 text-[11px] text-white bg-amber-600 rounded hover:bg-amber-700 disabled:opacity-50"
+                          >
+                            {attaching === d.id ? <Loader2 size={11} className="animate-spin" /> : <Plus size={11} />}
+                            添加
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
               {prdDocs.length === 0 ? (
                 <div className="text-xs text-gray-400 py-1">该模块暂无需求文档</div>
               ) : (
@@ -455,37 +645,68 @@ function ModuleDetailCard({
       </div>
 
       {/* 文档正文只读预览 */}
-      {(viewing || viewLoading) && (
-        <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50" onClick={() => setViewing(null)}>
-          <div
-            className="bg-white rounded-lg shadow-xl w-[760px] max-w-[92vw] h-[80vh] flex flex-col"
-            onClick={e => e.stopPropagation()}
-          >
-            <div className="flex items-center justify-between px-5 py-3 border-b border-gray-200">
-              <div className="flex items-center gap-2 min-w-0">
-                <FileText size={15} className="text-amber-600 flex-shrink-0" />
-                <h3 className="text-sm font-semibold text-gray-800 truncate">
-                  {viewing?.filename || '加载中…'}
-                </h3>
-              </div>
-              <button type="button" onClick={() => setViewing(null)} className="p-1 text-gray-400 hover:text-gray-700">
-                <X size={16} />
-              </button>
-            </div>
-            <div className="flex-1 overflow-y-auto px-5 py-4">
-              {viewLoading ? (
-                <div className="flex items-center justify-center py-16 text-sm text-gray-400">
-                  <Loader2 size={14} className="animate-spin mr-2" /> 加载中…
+      <DocViewerModal viewing={viewing} viewLoading={viewLoading} onClose={() => setViewing(null)} />
+    </div>
+  )
+}
+
+/** 文档解析正文只读预览弹窗（模块卡 / 项目级孤儿文档卡共用）。 */
+function DocViewerModal({
+  viewing, viewLoading, onClose,
+}: {
+  viewing: DocumentDetail | null
+  viewLoading: boolean
+  onClose: () => void
+}) {
+  if (!viewing && !viewLoading) return null
+  return (
+    <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50" onClick={onClose}>
+      <div
+        className="bg-white rounded-lg shadow-xl w-[760px] max-w-[92vw] h-[80vh] flex flex-col"
+        onClick={e => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between px-5 py-3 border-b border-gray-200">
+          <div className="flex items-center gap-2 min-w-0">
+            <FileText size={15} className="text-amber-600 flex-shrink-0" />
+            <div className="min-w-0">
+              <h3 className="text-sm font-semibold text-gray-800 truncate">
+                {viewing?.filename || '加载中…'}
+              </h3>
+              {viewing && (
+                <div className="flex items-center gap-2 mt-0.5 text-[11px]">
+                  <span className="text-gray-500">共 {viewing.raw_text_length.toLocaleString()} 字</span>
+                  {viewing.truncated ? (
+                    <span
+                      className="px-1.5 py-0.5 rounded bg-amber-100 text-amber-700 border border-amber-200"
+                      title="正文超过预览上限（30000 字），已保留开头与结尾、省略中间部分"
+                    >
+                      已截断预览
+                    </span>
+                  ) : (
+                    <span className="px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-700 border border-emerald-200">
+                      完整显示
+                    </span>
+                  )}
                 </div>
-              ) : (
-                <pre className="whitespace-pre-wrap break-words font-sans text-xs leading-relaxed text-gray-700">
-                  {viewing?.content || '（无解析正文）'}
-                </pre>
               )}
             </div>
           </div>
+          <button type="button" onClick={onClose} className="p-1 text-gray-400 hover:text-gray-700">
+            <X size={16} />
+          </button>
         </div>
-      )}
+        <div className="flex-1 overflow-y-auto px-5 py-4">
+          {viewLoading ? (
+            <div className="flex items-center justify-center py-16 text-sm text-gray-400">
+              <Loader2 size={14} className="animate-spin mr-2" /> 加载中…
+            </div>
+          ) : (
+            <pre className="whitespace-pre-wrap break-words font-sans text-xs leading-relaxed text-gray-700">
+              {viewing?.content || '（无解析正文）'}
+            </pre>
+          )}
+        </div>
+      </div>
     </div>
   )
 }
@@ -495,6 +716,8 @@ export default function KnowledgePage({ view, onChangeView }: PageProps) {
   const [activeModule, setActiveModule] = useState<number>(ALL)
   const [items, setItems] = useState<KnowledgeHit[]>([])
   const [loading, setLoading] = useState(false)
+  // 点击"类型分布"里的某个类型 → 只显示该类型条目；再次点击同一类型或点"全部"取消。null=不过滤。
+  const [typeFilter, setTypeFilter] = useState<string | null>(null)
   const [searchInput, setSearchInput] = useState('')
   const [query, setQuery] = useState('')   // 实际下发的搜索词（点搜索/回车后）
   const [editingId, setEditingId] = useState<number | null>(null)
@@ -503,6 +726,20 @@ export default function KnowledgePage({ view, onChangeView }: PageProps) {
   const [deletingId, setDeletingId] = useState<number | null>(null)
   const [confirmDelete, setConfirmDelete] = useState<KnowledgeHit | null>(null)
   const [errorMsg, setErrorMsg] = useState<string | null>(null)
+
+  // 项目级孤儿文档卡里"查看正文"用的预览态（与 ModuleDetailCard 内的同名态独立）
+  const [orphanViewing, setOrphanViewing] = useState<DocumentDetail | null>(null)
+  const [orphanViewLoading, setOrphanViewLoading] = useState(false)
+  const viewOrphanDoc = useCallback(async (docId: number) => {
+    setOrphanViewLoading(true)
+    try {
+      setOrphanViewing(await fetchDocumentDetail(docId))
+    } catch (e) {
+      console.error('Load document detail failed:', e)
+    } finally {
+      setOrphanViewLoading(false)
+    }
+  }, [])
 
   // 新建模块表单
   const [newModuleName, setNewModuleName] = useState('')
@@ -531,6 +768,16 @@ export default function KnowledgePage({ view, onChangeView }: PageProps) {
       console.error('Knowledge stats failed:', err)
     } finally {
       setStatsLoading(false)
+    }
+  }, [])
+
+  // 反馈进化总览（进化闭环第二步）：三出口 待消费/已消费 + intent 分布
+  const [evolution, setEvolution] = useState<EvolutionSummary | null>(null)
+  const reloadEvolution = useCallback(async () => {
+    try {
+      setEvolution(await fetchEvolutionSummary())
+    } catch (err) {
+      console.error('Evolution summary failed:', err)
     }
   }, [])
 
@@ -574,6 +821,22 @@ export default function KnowledgePage({ view, onChangeView }: PageProps) {
     return m
   }, [modules])
 
+  // 按"类型分布"选中的类型对已加载条目做前端过滤（列表本就一次性全量拉回，无需再打后端）。
+  const visibleItems = useMemo(
+    () => (typeFilter == null ? items : items.filter(it => it.knowledge_type === typeFilter)),
+    [items, typeFilter],
+  )
+
+  // 类型分布按当前已加载（已按模块过滤）的 items 现算——切模块时随 items 自动刷新，
+  // 且计数恰好等于点该类型后列表能看到的条数。不用 stats.by_type（那是项目级全局、不随模块变）。
+  const typeDistribution = useMemo(() => {
+    const counts = new Map<string, number>()
+    for (const it of items) counts.set(it.knowledge_type, (counts.get(it.knowledge_type) ?? 0) + 1)
+    return [...counts.entries()]
+      .map(([knowledge_type, count]) => ({ knowledge_type, count }))
+      .sort((a, b) => b.count - a.count)
+  }, [items])
+
   const reload = useCallback(async () => {
     setLoading(true)
     setErrorMsg(null)
@@ -595,10 +858,16 @@ export default function KnowledgePage({ view, onChangeView }: PageProps) {
     }
   }, [activeModule, query])
 
+  // 切换模块 / 变更搜索词后清掉类型过滤，避免旧类型把新结果集全部隐藏。
+  useEffect(() => {
+    setTypeFilter(null)
+  }, [activeModule, query])
+
   useEffect(() => {
     fetchModules().then(setModules).catch(err => console.error('Modules load:', err))
     void reloadStats()
-  }, [reloadStats])
+    void reloadEvolution()
+  }, [reloadStats, reloadEvolution])
 
   useEffect(() => {
     void reload()
@@ -611,9 +880,31 @@ export default function KnowledgePage({ view, onChangeView }: PageProps) {
     void reloadRecentFeedback(realModuleId)
   }, [activeModule, reloadRecentFeedback])
 
+  // App.tsx 用 hidden/block 切 tab，各页面始终挂载 → 首次挂载后的"进页面拉数据" effect 不再重跑。
+  // 所以每次 view 切到 'knowledge' 时主动刷新一遍（生成用例会异步沉淀新知识，需实时反映）。
+  // 用 ref 持有最新刷新逻辑，effect 只依赖 view，避免因回调 identity 变化而重复触发。
+  const refreshOnActivateRef = useRef<() => void>(() => {})
+  refreshOnActivateRef.current = () => {
+    void reload()
+    void reloadStats()
+    void reloadEvolution()
+    fetchModules().then(setModules).catch(err => console.error('Modules load:', err))
+    const realModuleId =
+      activeModule === ALL || activeModule === ORPHAN ? null : activeModule
+    void reloadRecentFeedback(realModuleId)
+  }
+  const prevViewRef = useRef<ViewKey>(view)
+  useEffect(() => {
+    // 仅在"从别的 tab 切入 knowledge"这一刻刷新；停留在 knowledge 内的其它状态变化不触发。
+    if (view === 'knowledge' && prevViewRef.current !== 'knowledge') {
+      refreshOnActivateRef.current()
+    }
+    prevViewRef.current = view
+  }, [view])
+
   const startEdit = (item: KnowledgeHit) => {
     setEditingId(item.id)
-    setEditDraft({ content: item.content, confidence: item.confidence })
+    setEditDraft({ content: item.content, confidence: item.confidence, moduleId: item.module_id })
   }
   const cancelEdit = () => {
     setEditingId(null)
@@ -623,9 +914,13 @@ export default function KnowledgePage({ view, onChangeView }: PageProps) {
     if (!editDraft) return
     const cur = items.find(x => x.id === id)
     if (!cur) return
-    const patch: { content?: string; confidence?: number } = {}
+    const patch: { content?: string; confidence?: number; applyModule?: boolean; moduleId?: number | null } = {}
     if (editDraft.content !== cur.content) patch.content = editDraft.content
     if (editDraft.confidence !== cur.confidence) patch.confidence = editDraft.confidence
+    if (editDraft.moduleId !== cur.module_id) {
+      patch.applyModule = true
+      patch.moduleId = editDraft.moduleId
+    }
     if (Object.keys(patch).length === 0) {
       cancelEdit()
       return
@@ -637,8 +932,11 @@ export default function KnowledgePage({ view, onChangeView }: PageProps) {
         ...x,
         content: editDraft.content,
         confidence: editDraft.confidence,
+        module_id: result.module_id,
         version: result.version,
       } : x)))
+      // 改了模块归属可能影响"按模块筛选"下的可见性与类型/模块统计，刷新统计。
+      if (patch.applyModule) void reloadStats()
       cancelEdit()
     } catch (e) {
       console.error('Update knowledge failed:', e)
@@ -1066,17 +1364,94 @@ export default function KnowledgePage({ view, onChangeView }: PageProps) {
                 <RefreshCw size={12} className={statsLoading ? 'animate-spin' : ''} />
               </button>
             </div>
-            {stats.by_type.length > 0 && (
+            {typeDistribution.length > 0 && (
               <div className="mt-2 flex flex-wrap items-center gap-1.5">
                 <span className="text-[11px] text-amber-800/70">类型分布：</span>
-                {stats.by_type.map(t => (
-                  <span
-                    key={t.knowledge_type}
-                    className={`px-1.5 py-0.5 text-[11px] rounded border ${TYPE_BADGE[t.knowledge_type] || 'bg-gray-100 text-gray-700 border-gray-200'}`}
-                  >
-                    {TYPE_LABEL[t.knowledge_type] || t.knowledge_type} · {t.count}
-                  </span>
-                ))}
+                <button
+                  type="button"
+                  onClick={() => setTypeFilter(null)}
+                  className={`px-1.5 py-0.5 text-[11px] rounded border transition ${
+                    typeFilter == null
+                      ? 'bg-amber-500 text-white border-amber-500'
+                      : 'bg-white text-amber-800/80 border-amber-200 hover:bg-amber-100'
+                  }`}
+                >
+                  全部
+                </button>
+                {typeDistribution.map(t => {
+                  const active = typeFilter === t.knowledge_type
+                  return (
+                    <button
+                      key={t.knowledge_type}
+                      type="button"
+                      onClick={() => setTypeFilter(active ? null : t.knowledge_type)}
+                      title={active ? '点击取消筛选' : '点击只看该类型'}
+                      className={`px-1.5 py-0.5 text-[11px] rounded border transition ${
+                        active
+                          ? 'ring-2 ring-amber-400 ring-offset-1 ' + (TYPE_BADGE[t.knowledge_type] || 'bg-gray-100 text-gray-700 border-gray-200')
+                          : (TYPE_BADGE[t.knowledge_type] || 'bg-gray-100 text-gray-700 border-gray-200') + ' hover:opacity-80'
+                      }`}
+                    >
+                      {TYPE_LABEL[t.knowledge_type] || t.knowledge_type} · {t.count}
+                    </button>
+                  )
+                })}
+              </div>
+            )}
+          </div>
+        )}
+
+        {evolution && evolution.triaged_total > 0 && (
+          <div className="px-6 py-3 border-b border-gray-200 bg-gradient-to-r from-indigo-50/60 to-violet-50/40">
+            <div className="flex items-start gap-4 flex-wrap">
+              <div className="flex items-center gap-2 text-xs font-semibold text-indigo-800/90">
+                <Sparkles size={14} />
+                反馈进化
+                <span className="font-normal text-[11px] text-indigo-400">
+                  负反馈已分诊 {evolution.triaged_total} 条，流向三个进化出口
+                </span>
+              </div>
+              <div className="flex flex-wrap gap-3">
+                {(['knowledge', 'skill', 'prompt'] as const).map(kind => {
+                  const o = evolution.outputs[kind]
+                  const label = kind === 'knowledge' ? '知识库' : kind === 'skill' ? 'Skill' : '系统提示词'
+                  return (
+                    <div
+                      key={kind}
+                      className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-white border border-indigo-100 text-xs"
+                      title={`分诊到「${label}」的负反馈：${o.pending} 条待消费 / ${o.consumed} 条已消费`}
+                    >
+                      <span className="font-medium text-gray-700">{label}</span>
+                      <span className="text-amber-600">待消化 {o.pending}</span>
+                      <span className="text-gray-300">·</span>
+                      <span className="text-emerald-600">已消化 {o.consumed}</span>
+                    </div>
+                  )
+                })}
+              </div>
+              <div className="flex-1" />
+              <button
+                type="button"
+                onClick={() => void reloadEvolution()}
+                className="p-1 text-gray-400 hover:text-gray-700"
+                title="刷新反馈进化总览"
+              >
+                <RefreshCw size={12} />
+              </button>
+            </div>
+            {Object.keys(evolution.intent_distribution).length > 0 && (
+              <div className="mt-2 flex flex-wrap items-center gap-1.5">
+                <span className="text-[11px] text-indigo-800/70">意图分布：</span>
+                {Object.entries(evolution.intent_distribution)
+                  .sort((a, b) => b[1] - a[1])
+                  .map(([intent, count]) => (
+                    <span
+                      key={intent}
+                      className="px-1.5 py-0.5 text-[11px] rounded border bg-white text-indigo-800/80 border-indigo-200"
+                    >
+                      {intent} · {count}
+                    </span>
+                  ))}
               </div>
             )}
           </div>
@@ -1142,10 +1517,33 @@ export default function KnowledgePage({ view, onChangeView }: PageProps) {
             />
           )}
 
+          {/* 项目级（无模块）视图：列出未分类文档，可查看正文 / 归类到某模块 */}
+          {activeModule === ORPHAN && (
+            <OrphanDocsCard
+              modules={modules}
+              onViewDoc={viewOrphanDoc}
+              onChanged={() => { void reload(); void reloadStats() }}
+            />
+          )}
+
           {loading && items.length === 0 && (
             <div className="flex items-center justify-center py-16 text-sm text-gray-400">
               <Loader2 size={14} className="animate-spin mr-2" />
               加载中…
+            </div>
+          )}
+
+          {!loading && items.length > 0 && visibleItems.length === 0 && typeFilter != null && (
+            <div className="flex flex-col items-center justify-center py-16 text-sm text-gray-400">
+              <BookOpen size={32} className="opacity-30 mb-3" />
+              <div>「{TYPE_LABEL[typeFilter] || typeFilter}」类型下没有知识条目</div>
+              <button
+                type="button"
+                onClick={() => setTypeFilter(null)}
+                className="text-xs mt-1 text-amber-600 hover:underline"
+              >
+                清除类型筛选
+              </button>
             </div>
           )}
 
@@ -1157,7 +1555,7 @@ export default function KnowledgePage({ view, onChangeView }: PageProps) {
             </div>
           )}
 
-          {items.map(item => {
+          {visibleItems.map(item => {
             const isEditing = editingId === item.id
             const typeLabel = TYPE_LABEL[item.knowledge_type] || item.knowledge_type
             const typeBadge = TYPE_BADGE[item.knowledge_type] || 'bg-gray-100 text-gray-700 border-gray-200'
@@ -1206,6 +1604,24 @@ export default function KnowledgePage({ view, onChangeView }: PageProps) {
                           <span className="text-xs font-mono text-amber-700 w-12 text-right">
                             {(editDraft.confidence * 100).toFixed(0)}%
                           </span>
+                        </div>
+                        <div className="flex items-center gap-3">
+                          <label className="text-xs text-gray-600 whitespace-nowrap">所属模块</label>
+                          <select
+                            value={editDraft.moduleId != null ? String(editDraft.moduleId) : '__none__'}
+                            onChange={e => setEditDraft(d => d ? {
+                              ...d,
+                              moduleId: e.target.value === '__none__' ? null : Number(e.target.value),
+                            } : d)}
+                            className="flex-1 max-w-xs px-2 py-1 text-xs border border-amber-300 rounded bg-white focus:outline-none focus:ring-2 focus:ring-amber-200"
+                          >
+                            {modules.map(m => (
+                              <option key={m.id} value={String(m.id)}>
+                                {m.name}{m.code ? `（${m.code}）` : ''}
+                              </option>
+                            ))}
+                            <option value="__none__">项目级（无模块）</option>
+                          </select>
                         </div>
                       </div>
                     ) : (
@@ -1620,6 +2036,13 @@ export default function KnowledgePage({ view, onChangeView }: PageProps) {
       )}
 
       <PromptManagerDrawer open={promptDrawerOpen} onClose={() => setPromptDrawerOpen(false)} />
+
+      {/* 项目级孤儿文档卡的正文预览弹窗 */}
+      <DocViewerModal
+        viewing={orphanViewing}
+        viewLoading={orphanViewLoading}
+        onClose={() => setOrphanViewing(null)}
+      />
     </div>
   )
 }

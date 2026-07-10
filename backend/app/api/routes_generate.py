@@ -1,7 +1,8 @@
 """Test case generation and export API."""
+import asyncio
 import json
 import re
-from fastapi import APIRouter, Depends, HTTPException, Query, Header
+from fastapi import APIRouter, Depends, HTTPException, Query, Header, Request
 from fastapi.responses import StreamingResponse, Response
 from pydantic import BaseModel
 from sqlalchemy import select
@@ -95,6 +96,7 @@ def _normalize_case_number(raw: str, prefix: str, fallback_index: int) -> str:
 @router.post("/generate")
 async def generate(
     request: GenerateRequest,
+    raw_request: Request,
     project_id: int = Depends(require_project),
     _user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
@@ -318,8 +320,11 @@ async def generate(
         knowledge_ids=request.knowledge_ids,
     )
 
-    # Non-streaming: generate and persist
-    cases = await generate_test_cases(
+    # Non-streaming: generate and persist.
+    # 前端"停止任务"会 abort axios 请求 → 关闭连接。非流式 handler 默认不会因此被取消
+    # （它从不 await receive()），LLM 调用会白跑到底。这里让 LLM 任务与"断连轮询"竞速：
+    # 客户端一断开就 cancel 掉 llm_task → 取消底层 httpx 请求 → 真正停止到大模型的调用。
+    llm_task = asyncio.create_task(generate_test_cases(
         doc_content=doc_content,
         module_name=module_name,
         case_prefix=case_prefix,
@@ -329,7 +334,39 @@ async def generate(
         relevant_knowledge=relevant_knowledge,
         mindmap_content=mindmap_content,
         system_prompt=generator_system_prompt,
+    ))
+
+    async def _watch_disconnect():
+        # 轮询客户端连接状态；断开即返回，触发上面 llm_task 的取消。
+        while True:
+            if await raw_request.is_disconnected():
+                return
+            await asyncio.sleep(0.5)
+
+    watch_task = asyncio.create_task(_watch_disconnect())
+    done, _pending = await asyncio.wait(
+        {llm_task, watch_task}, return_when=asyncio.FIRST_COMPLETED
     )
+
+    if llm_task in done:
+        # LLM 正常跑完：停掉轮询，取回结果继续落库。
+        watch_task.cancel()
+        try:
+            await watch_task
+        except asyncio.CancelledError:
+            pass
+        cases = llm_task.result()
+    else:
+        # 客户端已断开：取消 LLM 任务（连带取消到大模型的 httpx 请求），不落库直接返回。
+        llm_task.cancel()
+        try:
+            await llm_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
+        # 客户端已断开，返回体不会被读取；499 = Client Closed Request。
+        return Response(status_code=499)
 
     # Persist test cases. Force every row's module + case_number prefix so the
     # whole batch stays consistent regardless of what the LLM emitted.

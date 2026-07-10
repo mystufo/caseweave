@@ -2,15 +2,67 @@ import { useCallback, useEffect, useState } from 'react'
 import {
   fetchPrompts, fetchPromptVersions, fetchPromptDefault,
   createPromptVersion, activatePromptVersion, resetPromptToDefault,
-  type PromptSummary, type PromptVersionItem,
+  generatePromptSuggestion, fetchPromptSuggestions, dismissPromptSuggestion,
+  type PromptSummary, type PromptVersionItem, type PromptSuggestion,
 } from '../api/client'
 import {
   X, Loader2, RefreshCw, Save, RotateCcw, Check, FileCog, ChevronLeft,
+  Wand2, Lightbulb, ArrowRightLeft,
 } from 'lucide-react'
+
+const GENERATOR_KEY = 'generator'  // 本期唯一支持「改进建议」的 prompt
 
 interface Props {
   open: boolean
   onClose: () => void
+}
+
+/**
+ * 轻量行级 diff：把基线与建议按行 LCS 对齐，删除行标红、新增行标绿、未变行灰显。
+ * 纯展示用，帮助人工一眼看清建议改了哪里；不追求 word-level 精度。
+ */
+function SuggestionDiff({ base, next }: { base: string; next: string }) {
+  const a = base.split('\n')
+  const b = next.split('\n')
+  // LCS 表
+  const m = a.length, n = b.length
+  const dp: number[][] = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0))
+  for (let i = m - 1; i >= 0; i--)
+    for (let j = n - 1; j >= 0; j--)
+      dp[i][j] = a[i] === b[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1])
+  const rows: { kind: 'ctx' | 'del' | 'add'; text: string }[] = []
+  let i = 0, j = 0
+  while (i < m && j < n) {
+    if (a[i] === b[j]) { rows.push({ kind: 'ctx', text: a[i] }); i++; j++ }
+    else if (dp[i + 1][j] >= dp[i][j + 1]) { rows.push({ kind: 'del', text: a[i] }); i++ }
+    else { rows.push({ kind: 'add', text: b[j] }); j++ }
+  }
+  while (i < m) { rows.push({ kind: 'del', text: a[i] }); i++ }
+  while (j < n) { rows.push({ kind: 'add', text: b[j] }); j++ }
+
+  const changed = rows.filter(r => r.kind !== 'ctx').length
+  return (
+    <div className="rounded border border-gray-200 bg-gray-50 max-h-56 overflow-auto">
+      <div className="flex items-center gap-1 px-2 py-1 text-[10px] text-gray-500 border-b border-gray-100 bg-white/70 sticky top-0">
+        <ArrowRightLeft size={10} /> 与当前生效版本对比（{changed} 行变化）
+      </div>
+      <pre className="font-mono text-[11px] leading-snug p-2 whitespace-pre-wrap break-words">
+        {rows.map((r, idx) => (
+          <div
+            key={idx}
+            className={
+              r.kind === 'del' ? 'bg-red-50 text-red-700'
+                : r.kind === 'add' ? 'bg-emerald-50 text-emerald-700'
+                  : 'text-gray-400'
+            }
+          >
+            <span className="select-none opacity-60">{r.kind === 'del' ? '- ' : r.kind === 'add' ? '+ ' : '  '}</span>
+            {r.text || ' '}
+          </div>
+        ))}
+      </pre>
+    </div>
+  )
 }
 
 /**
@@ -36,8 +88,17 @@ export default function PromptManagerDrawer({ open, onClose }: Props) {
   const [error, setError] = useState<string | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
 
+  // Phase 4.2 二阶段：generator 改进建议
+  const [suggestions, setSuggestions] = useState<PromptSuggestion[]>([])
+  const [suggestLoading, setSuggestLoading] = useState(false)   // 拉列表
+  const [generating, setGenerating] = useState(false)           // 触发分析生成
+  const [suggestMsg, setSuggestMsg] = useState<string | null>(null)
+  // 当前编辑器内容源自哪条建议（采用后 setDraft 时记下，保存时回传 from_suggestion_id）
+  const [adoptingId, setAdoptingId] = useState<number | null>(null)
+
   const activePrompt = prompts.find(p => p.key === activeKey) || null
   const dirty = draft !== draftBaseline
+  const isGenerator = activeKey === GENERATOR_KEY
 
   const reloadPrompts = useCallback(async () => {
     setLoading(true)
@@ -91,7 +152,63 @@ export default function PromptManagerDrawer({ open, onClose }: Props) {
     setActiveKey(key)
     setNotice(null)
     setError(null)
+    setSuggestMsg(null)
+    setSuggestions([])
+    setAdoptingId(null)
     void loadVersions(key)
+    if (key === GENERATOR_KEY) void loadSuggestions(key)
+  }
+
+  const loadSuggestions = useCallback(async (key: string) => {
+    setSuggestLoading(true)
+    try {
+      setSuggestions(await fetchPromptSuggestions(key, 'pending'))
+    } catch {
+      // 建议是增益功能，拉取失败不打断主流程，仅静默
+      setSuggestions([])
+    } finally {
+      setSuggestLoading(false)
+    }
+  }, [])
+
+  const generateSuggestion = async () => {
+    if (!activeKey) return
+    setGenerating(true)
+    setSuggestMsg(null)
+    setError(null)
+    try {
+      const r = await generatePromptSuggestion(activeKey)
+      if (r.created) {
+        setSuggestMsg(`已生成 1 条改进建议（基于 ${r.feedback_count} 条负反馈）`)
+        await loadSuggestions(activeKey)
+      } else {
+        setSuggestMsg(`未生成建议：${r.reason || '信号不足'}（负反馈样本 ${r.feedback_count} 条）`)
+      }
+    } catch {
+      setSuggestMsg('生成建议失败，请稍后重试')
+    } finally {
+      setGenerating(false)
+    }
+  }
+
+  // 采用建议：把建议全文灌进编辑器（人可继续改），保存时走既有版本化 API 并回传来源 id
+  const adoptSuggestion = (s: PromptSuggestion) => {
+    setDraft(s.suggested_template)
+    setAdoptingId(s.id)
+    setNotice('已把建议载入编辑器，可继续修改后点「保存为新版本」')
+  }
+
+  const dismiss = async (id: number) => {
+    setBusyAction(`dismiss-${id}`)
+    try {
+      await dismissPromptSuggestion(id)
+      setSuggestions(prev => prev.filter(s => s.id !== id))
+      if (adoptingId === id) setAdoptingId(null)
+    } catch {
+      setError('忽略建议失败，请重试')
+    } finally {
+      setBusyAction(null)
+    }
   }
 
   const loadDefaultIntoEditor = async () => {
@@ -116,10 +233,16 @@ export default function PromptManagerDrawer({ open, onClose }: Props) {
     setError(null)
     setNotice(null)
     try {
-      await createPromptVersion(activeKey, { template: draft, activate: true })
+      await createPromptVersion(activeKey, {
+        template: draft,
+        activate: true,
+        from_suggestion_id: adoptingId ?? undefined,
+      })
       setNotice('已保存为新版本并设为生效')
+      setAdoptingId(null)
       await loadVersions(activeKey)
       await reloadPrompts()
+      if (activeKey === GENERATOR_KEY) await loadSuggestions(activeKey)
     } catch {
       setError('保存失败，请重试')
     } finally {
@@ -281,8 +404,8 @@ export default function PromptManagerDrawer({ open, onClose }: Props) {
                 </div>
 
                 <div className="flex-1 min-h-0 flex">
-                  {/* 编辑器 */}
-                  <div className="flex-1 px-5 pb-4 min-w-0 flex flex-col">
+                  {/* 编辑器 + 改进建议 */}
+                  <div className="flex-1 px-5 pb-4 min-w-0 flex flex-col gap-3">
                     <textarea
                       value={draft}
                       onChange={e => setDraft(e.target.value)}
@@ -290,6 +413,86 @@ export default function PromptManagerDrawer({ open, onClose }: Props) {
                       className="flex-1 w-full resize-none font-mono text-xs leading-relaxed p-3 border border-gray-200 rounded-md focus:outline-none focus:ring-2 focus:ring-teal-200 focus:border-teal-400"
                       placeholder="System Prompt 内容…"
                     />
+
+                    {/* 改进建议（仅 generator）：系统分析负反馈产出的草稿，人工审核后采用 */}
+                    {isGenerator && (
+                      <div className="flex-shrink-0 max-h-[40%] overflow-y-auto border border-indigo-100 rounded-md bg-indigo-50/40">
+                        <div className="flex items-center justify-between px-3 py-2 border-b border-indigo-100 bg-white/60 sticky top-0">
+                          <div className="flex items-center gap-1.5 text-xs font-semibold text-indigo-700">
+                            <Lightbulb size={13} />
+                            改进建议（{suggestions.length}）
+                            <span className="font-normal text-[11px] text-indigo-400">
+                              系统分析负反馈生成，采用需人工确认
+                            </span>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => void generateSuggestion()}
+                            disabled={generating}
+                            className="inline-flex items-center gap-1 px-2 py-1 text-[11px] bg-indigo-600 text-white rounded hover:bg-indigo-700 disabled:opacity-50"
+                            title="分析本项目对用例生成的负反馈，产出一条 prompt 改进建议草稿"
+                          >
+                            {generating ? <Loader2 size={11} className="animate-spin" /> : <Wand2 size={11} />}
+                            分析负反馈生成建议
+                          </button>
+                        </div>
+                        <div className="p-3 space-y-2">
+                          {suggestMsg && (
+                            <div className="text-[11px] text-indigo-700 bg-indigo-100/60 rounded px-2 py-1">
+                              {suggestMsg}
+                            </div>
+                          )}
+                          {suggestLoading ? (
+                            <div className="flex items-center gap-2 text-[11px] text-gray-400 py-1">
+                              <Loader2 size={11} className="animate-spin" /> 加载建议…
+                            </div>
+                          ) : suggestions.length === 0 ? (
+                            <div className="text-[11px] text-gray-400 py-1">
+                              暂无待审核建议。点右上按钮基于负反馈生成一条。
+                            </div>
+                          ) : (
+                            suggestions.map(s => (
+                              <div key={s.id} className="rounded border border-indigo-200 bg-white p-2.5">
+                                {s.rationale && (
+                                  <div className="text-xs text-gray-700 mb-1.5">
+                                    <span className="font-medium text-indigo-700">改动理由：</span>
+                                    {s.rationale}
+                                  </div>
+                                )}
+                                {s.evidence?.feedback_count != null && (
+                                  <div className="text-[11px] text-gray-400 mb-1.5">
+                                    证据：引用 {s.evidence.feedback_count} 条负反馈
+                                    {s.evidence.samples && s.evidence.samples.length > 0 && (
+                                      <> · {Array.from(new Set(s.evidence.samples.map(x => x.intent).filter(Boolean))).join(' / ')}</>
+                                    )}
+                                  </div>
+                                )}
+                                <SuggestionDiff base={s.base_template} next={s.suggested_template} />
+                                <div className="flex items-center gap-2 mt-2">
+                                  <button
+                                    type="button"
+                                    onClick={() => adoptSuggestion(s)}
+                                    className="inline-flex items-center gap-1 px-2 py-1 text-[11px] bg-teal-600 text-white rounded hover:bg-teal-700"
+                                    title="把建议全文载入上方编辑器（可继续改），再点「保存为新版本」生效"
+                                  >
+                                    <Check size={11} /> 采用（载入编辑器）
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => void dismiss(s.id)}
+                                    disabled={busyAction === `dismiss-${s.id}`}
+                                    className="inline-flex items-center gap-1 px-2 py-1 text-[11px] text-gray-500 border border-gray-200 rounded hover:bg-gray-50 disabled:opacity-50"
+                                  >
+                                    {busyAction === `dismiss-${s.id}` ? <Loader2 size={11} className="animate-spin" /> : <X size={11} />}
+                                    忽略
+                                  </button>
+                                </div>
+                              </div>
+                            ))
+                          )}
+                        </div>
+                      </div>
+                    )}
                   </div>
 
                   {/* 版本历史（右侧竖栏） */}
