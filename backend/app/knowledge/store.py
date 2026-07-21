@@ -253,15 +253,18 @@ async def find_similar_entries(
     project_id: int,
     module_id: Optional[int],
     content: str,
-    top_k: int = 3,
-    min_distance: float = 0.05,
-    max_distance: float = 0.25,
+    top_k: int = 5,
+    min_distance: float = 0.0,
+    max_distance: float = 0.30,
 ) -> list[SimilarEntry]:
-    """找出和 content 语义近似（但不是完全重复）的已有条目。
+    """找出和 content 语义近似的已有条目（含完全重复项）。
 
-    与 store_entries 内部的去重不同——那里 < 0.05 视为重复直接 skip；
-    这里返回 [min_distance, max_distance] 区间内的"邻居"，用于 UI 上提示
-    "有 N 条已有条目和该草稿描述近似，可能存在冲突，请确认"。
+    这里返回 [min_distance, max_distance] 区间内的"邻居"，交给上层 LLM 判定
+    与草稿的关系（duplicate / similar / conflict / unrelated）。
+
+    注意：min_distance 默认 0.0，让**完全重复**（距离极小）的条目也能进候选——
+    去重不再在检索层用阈值一刀切，而是交给 LLM 语义判定（区分"重复"与"相似"）。
+    top_k 略放宽到 5，覆盖多条相关旧条目。
 
     无 embedding 服务 / 没有命中 / pgvector 异常 → 返回空列表（不抛）。
     """

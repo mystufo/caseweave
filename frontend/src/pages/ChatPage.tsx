@@ -6,10 +6,10 @@ import type {
 } from '../api/client'
 import {
   fetchSessions, fetchMessages, createSession, renameSession, deleteSession,
-  generateCases, fetchSessionCases, fetchClarificationState, fetchKnowledgePreview,
+  generateCases, generateMindmap, fetchSessionCases, fetchClarificationState, fetchKnowledgePreview,
   streamChat, streamUpload, streamLarkImport, streamLarkMindmapImport, streamFollowupClarification,
-  streamInitialClarification, streamMindmapUpload,
-  confirmPendingKnowledge,
+  streamInitialClarification, streamMindmapUpload, streamPipelineStart,
+  confirmPendingKnowledge, extractCombinedDrafts,
   createModule, updateDocumentModule, fetchModules,
   exportSessionUrl,
 } from '../api/client'
@@ -20,12 +20,13 @@ import ClarificationPanel from '../components/ClarificationPanel'
 import KnowledgePreviewPanel from '../components/KnowledgePreviewPanel'
 import KnowledgeDraftReviewPanel from '../components/KnowledgeDraftReviewPanel'
 import ModuleConfirmPanel from '../components/ModuleConfirmPanel'
+import FlowSteps from '../components/FlowSteps'
 import TestCaseTable from '../components/TestCaseTable'
 import LarkUrlDialog, { type LarkUrlSubmit } from '../components/LarkUrlDialog'
 import MindmapPasteDialog from '../components/MindmapPasteDialog'
 import StopConfirmDialog from '../components/StopConfirmDialog'
 import TabBar, { type ViewKey } from '../components/TabBar'
-import { FileText, Loader2, Square } from 'lucide-react'
+import { FileText, Loader2, Square, Brain, ExternalLink, Upload, Network, Pencil, Link as LinkIcon } from 'lucide-react'
 
 interface PageProps {
   view: ViewKey
@@ -42,6 +43,8 @@ const DOC_PREVIEW_LIMIT = 30000
 // 每个会话有一份独立的运行态。切换会话只是换"视角"，不取消任何在跑的任务。
 // 流式回调通过启动时捕获的 sid 写回对应 slot，所以切走再切回来能看到最新结果。
 interface SessionState {
+  // 会话用途（对话页顶层选定，固定不变）：cases=生成用例；mindmap=从需求文档生成测试脑图。
+  mode: 'cases' | 'mindmap'
   messages: IChatMessage[]
   testCases: TestCase[]
   loaded: boolean  // messages + testCases 是否已从后端拉过
@@ -54,6 +57,10 @@ interface SessionState {
   uploading: boolean
   uploadStage: string | null
   uploadProgress: string
+
+  // 「开始生成」闸门：上传只暂存文档，用户点「开始生成」后跑模块分类 + 知识检索预览。
+  // 期间显示按钮 loading，完成后进入模块确认卡 / 知识审核 / 澄清流程。
+  pipelineStarting: boolean
 
   // clarification
   uploadResult: UploadResult | null
@@ -77,6 +84,12 @@ interface SessionState {
 
   // generation
   generating: boolean
+  // 从 PRD 生成测试脑图并写入飞书：生成中标志 + 结果链接（仅本会话可见，随 taskMap 隔离）
+  mindmapGenerating: boolean
+  mindmapResult: { url: string; title: string } | null
+  // 脑图模式专用：澄清是否已完成、可以生成脑图了。初轮/追问返回 ready_to_generate 或
+  // 问题为空、或达 MAX_ROUNDS 时置 true —— 露出「生成测试脑图」卡的门控。
+  mindmapReadyToGenerate: boolean
   // 知识库确认阶段。两个时机都会用到这个面板：
   //   phase: 'clarify'  → 文档刚 persist 完，跑 Clarifier 之前；onConfirm 调 streamInitialClarification
   //   phase: 'generate' → 澄清完成，跑 Generator 之前；onConfirm 调 runGenerate
@@ -129,6 +142,10 @@ interface SessionState {
     submitting: boolean
   } | null
 
+  // 上传完成后正在跑「PRD + 脑图」合并知识抽取（脑图优先）。抽取期间显示 loader，
+  // 抽完把草稿落到 prdDraftReview / mindmapDraftReview 其一。
+  extractingDrafts: boolean
+
   // LLM 在上传时对文档归属模块的判定 → 一律弹「模块确认卡」让用户拍板（即使高置信自动命中也要确认）。
   // 用户可在下拉里改选其它已有模块 / 不归入模块（项目级）/ 新建模块；确认后把文档归入所选模块。
   // 处理完（确认或忽略）才解锁下方知识草稿审核与开始澄清。
@@ -151,7 +168,8 @@ interface SessionState {
   } | null
 }
 
-const emptyState = (): SessionState => ({
+const emptyState = (mode: 'cases' | 'mindmap' = 'cases'): SessionState => ({
+  mode,
   messages: [],
   testCases: [],
   loaded: false,
@@ -160,6 +178,7 @@ const emptyState = (): SessionState => ({
   uploading: false,
   uploadStage: null,
   uploadProgress: '',
+  pipelineStarting: false,
   uploadResult: null,
   uploadMindmap: null,
   confirmedModuleName: null,
@@ -172,18 +191,45 @@ const emptyState = (): SessionState => ({
   followupActive: false,
   followupBuffer: '',
   generating: false,
+  mindmapGenerating: false,
+  mindmapResult: null,
+  mindmapReadyToGenerate: false,
   knowledgePreview: null,
   pendingGenerate: null,
   prdDraftReview: null,
   mindmapDraftReview: null,
+  extractingDrafts: false,
   moduleDecision: null,
 })
 
 const isBusy = (s: SessionState) =>
   s.streaming || s.uploading || s.followupActive || s.generating
-  || (s.knowledgePreview?.loading ?? false)
+  || s.pipelineStarting
+  || s.extractingDrafts  || (s.knowledgePreview?.loading ?? false)
   || (s.prdDraftReview?.submitting ?? false)
   || (s.mindmapDraftReview?.submitting ?? false)
+
+// 从 SessionState 推导流程步骤条的「当前步」索引（0-based）。返回值 ≥ 步数表示全部完成。
+// 只读现有字段，不新增状态。
+const deriveFlowStep = (s: SessionState): number => {
+  if (s.mode === 'mindmap') {
+    // 脑图：0 上传需求文档 / 1 澄清 / 2 生成脑图 / 3 存入飞书
+    if (s.mindmapResult) return 4
+    if (s.mindmapReadyToGenerate) return 2
+    if (s.uploadResult?.document_id != null) return 1
+    return 0
+  }
+  // 用例：0 上传资料 / 1 确认模块 / 2 审核知识 / 3 澄清 / 4 生成用例
+  if (s.testCases.length > 0) return 5
+  if (s.generating || s.pendingGenerate) return 4
+  if (s.knowledgePreview?.phase === 'generate'
+      || (s.currentQuestions && s.currentQuestions.length > 0)
+      || s.followupActive) return 3
+  if (s.prdDraftReview || s.mindmapDraftReview) return 2
+  if (s.moduleDecision) return 1
+  if (s.uploadResult || s.uploadMindmap) return 1  // 上传完成，等下一步
+  return 0
+}
 
 // 把后端返回的澄清运行态映射回 SessionState 部分字段。
 // uploadResult 是面板渲染的"哨兵字段"——伪造一个最小 shape，filename/stats 此时已无渲染消费方。
@@ -309,6 +355,12 @@ function stateFromDTO(dto: ClarificationStateDTO, hasCases: boolean): Partial<Se
     currentQuestions: dto.status === 'awaiting_answers' ? dto.current_questions : null,
     currentSummary: dto.summary || '',
     currentRound: dto.current_round,
+    // 脑图模式刷新恢复：澄清已完成（非"待答问题"/"知识预览"）即视为就绪，露出生成卡。
+    // 该字段仅被脑图模式 JSX 消费，对用例模式无副作用。
+    mindmapReadyToGenerate:
+      dto.document_id != null
+      && dto.status !== 'awaiting_answers'
+      && dto.status !== 'awaiting_clarification',
     pendingGenerate: pending,
     knowledgePreview,
     prdDraftReview,
@@ -319,6 +371,9 @@ function stateFromDTO(dto: ClarificationStateDTO, hasCases: boolean): Partial<Se
 
 export default function ChatPage({ view, onChangeView }: PageProps) {
   const [sessions, setSessions] = useState<ChatSession[]>([])
+  // sessions 的实时镜像，供 hydrate effect 读取当前会话的 mode（不进依赖数组）
+  const sessionsRef = useRef(sessions)
+  sessionsRef.current = sessions
   const [activeSessionId, setActiveSessionId] = useState<number | null>(null)
   const [taskMap, setTaskMap] = useState<Record<number, SessionState>>({})
   // taskMap 的实时镜像——供那些"每次 taskMap 变都不该重跑"的 effect 读取当前 slot，
@@ -346,7 +401,14 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
     else cancelMapRef.current.delete(sid)
   }, [])
 
+  // 合并抽取的 latest-wins 守卫：补传第二份文档会再触发一次抽取，用 per-session 递增
+  // token 保证只有最后一次的结果落面板，避免两次抽取竞态把旧结果覆盖新结果。
+  const extractTokenRef = useRef<Map<number, number>>(new Map())
+
   const bottomRef = useRef<HTMLDivElement>(null)
+  // 引导卡里的「上传文档」按钮通过这两个隐藏 input 触发，复用 handleFileSelect / handleMindmapSelect。
+  const guideFileRef = useRef<HTMLInputElement>(null)
+  const guideMindmapRef = useRef<HTMLInputElement>(null)
   // probe useEffect 里要在 generate 中断时静默重发，但 runGenerate 是后定义的 useCallback；
   // 用一个 ref 桥接，避免重新声明 effect 依赖时引发重新订阅。
   const runGenerateRef = useRef<((
@@ -354,6 +416,10 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
     rounds: ClarificationRoundHistory[],
     moduleName: string, casePrefix: string, knowledgeIds: number[] | null,
   ) => void) | null>(null)
+
+  // 同理：脑图模式上传处理器在前定义，而 startMindmapClarification 在后；用 ref 桥接，
+  // 让上传 onDone 能在脑图模式下自动触发首轮澄清。
+  const startMindmapClarificationRef = useRef<((sid: number, documentId: number) => void) | null>(null)
 
   // Helper: update a single session's state by id. Idempotent — if the session
   // has been deleted from the map (shouldn't happen, but defensive), no-op.
@@ -364,6 +430,47 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
       return { ...prev, [sid]: { ...cur, ...delta } }
     })
   }, [])
+
+  // 上传完成后触发一次「PRD + 脑图」合并知识抽取（脑图优先）。后端把草稿落到主文档
+  // 并清空副文档，返回 role 指明落到哪个审核 slot；另一个 slot 一并清空，保证只出一个面板。
+  const triggerCombinedExtraction = useCallback(async (sid: number) => {
+    const token = (extractTokenRef.current.get(sid) ?? 0) + 1
+    extractTokenRef.current.set(sid, token)
+    patchSession(sid, { extractingDrafts: true })
+    try {
+      const payload = await extractCombinedDrafts(sid)
+      // 有更晚的抽取已经发起 → 丢弃本次结果（latest-wins）
+      if (extractTokenRef.current.get(sid) !== token) return
+
+      const drafts = payload.drafts || []
+      const filename =
+        payload.role === 'mindmap'
+          ? (taskMapRef.current[sid]?.uploadMindmap?.filename ?? null)
+          : (taskMapRef.current[sid]?.uploadResult?.filename ?? null)
+      const slot =
+        drafts.length > 0 && payload.document_id != null
+          ? {
+              documentId: payload.document_id,
+              role: payload.role,
+              filename,
+              moduleName: payload.module_name,
+              drafts,
+              submitting: false,
+            }
+          : null
+      patchSession(sid, {
+        extractingDrafts: false,
+        // 草稿只落一个 slot，另一个清空——合并后永远只出一个审核面板
+        prdDraftReview: payload.role === 'prd' ? (slot as SessionState['prdDraftReview']) : null,
+        mindmapDraftReview: payload.role === 'mindmap' ? (slot as SessionState['mindmapDraftReview']) : null,
+      })
+    } catch (err) {
+      console.error('Combined extraction failed:', err)
+      if (extractTokenRef.current.get(sid) === token) {
+        patchSession(sid, { extractingDrafts: false })
+      }
+    }
+  }, [patchSession])
 
   // 上传时 LLM 对模块的判定 → 一律弹「模块确认卡」（高置信自动命中也要用户确认）。
   // - applied=true：后端已把文档高置信落库到 suggested 模块；卡片默认选中它，用户可改选。
@@ -522,7 +629,9 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
       fetchClarificationState(activeSessionId).catch(err => { console.error(err); return null }),
     ]).then(([msgs, casesRes, clarState]) => {
       if (cancelled) return
+      const sessionMode = sessionsRef.current.find(s => s.id === activeSessionId)?.mode ?? 'cases'
       patchSession(activeSessionId, {
+        mode: sessionMode,
         messages: msgs,
         testCases: casesRes.cases,
         loaded: true,
@@ -669,10 +778,11 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
 
   // ── Session actions ──────────────────────────────────────────────────────
 
-  const handleNewSession = useCallback(async () => {
-    const s = await createSession('新会话')
+  // 用户在侧边栏选定模式后创建会话并进入。mode 固定该会话用途。
+  const handleCreateSession = useCallback(async (mode: 'cases' | 'mindmap') => {
+    const s = await createSession('新会话', undefined, mode)
     setSessions(prev => [s, ...prev])
-    setTaskMap(prev => ({ ...prev, [s.id]: { ...emptyState(), loaded: true } }))
+    setTaskMap(prev => ({ ...prev, [s.id]: { ...emptyState(mode), loaded: true } }))
     setActiveSessionId(s.id)
   }, [])
 
@@ -799,6 +909,8 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
     // 锁定一份这次上传的 stage / token 累积器（不依赖最新 state，避免回调串台）
     const stages: string[] = []
     let llmBuffer = ''
+    // 记住暂存/解析出的 document_id 供 onDone 用（不读异步的 taskMapRef，见 runPrd 同款注释）
+    let stagedDocId: number | null = null
     const renderProgress = () =>
       stages.join('\n') + (llmBuffer ? `\n\n\`\`\`\n${llmBuffer}\n\`\`\`` : '')
 
@@ -831,35 +943,37 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
         patchSession(startSid, { uploadProgress: renderProgress() })
       },
       onResult: (result) => {
-        // cache_hit 路径仍会发 result（后端已缓存澄清结果，跳过预览直接进澄清回答阶段）。
-        // 非 cache_hit 路径不再发 result——见 onKnowledgePreview。
+        // 兼容保留：旧「上传即澄清」路径才发 result。新流程上传只暂存、走 onStaged。
+        stagedDocId = result.document_id ?? null
         patchSession(startSid, {
           uploadResult: result,
           confirmedModuleName: null,
           confirmedCasePrefix: null,
           clarificationRounds: [],
-          currentQuestions: result.clarification.questions,
-          currentSummary: result.clarification.summary,
+          currentQuestions: result.clarification?.questions ?? null,
+          currentSummary: result.clarification?.summary ?? '',
           currentRound: 1,
           followupActive: false,
           followupBuffer: '',
           knowledgePreview: null,
         })
       },
-      onKnowledgePreview: (preview) => {
-        // 非 cache_hit 路径：文档已 persist，等用户勾选知识库条目后再调 streamInitialClarification。
+      onStaged: (staged) => {
+        // 新流程：文档已暂存（解析入库、未跑任何大模型）。落一个 uploadResult 空壳做 chip
+        // 哨兵；不设 knowledgePreview / 不弹任何面板。用户点「开始生成」才进入下游流程。
+        stagedDocId = staged.document_id
         const fakeUpload: UploadResult = {
-          document_id: preview.document_id,
-          filename: preview.filename,
-          stats: preview.stats,
+          document_id: staged.document_id,
+          filename: staged.filename,
+          stats: staged.stats,
           clarification: {
             summary: '',
-            module_detected: preview.module_name || '',
+            module_detected: '',
             questions: [],
             ready_to_generate: false,
           },
         }
-        patchSession(startSid, prev => ({
+        patchSession(startSid, {
           uploadResult: fakeUpload,
           confirmedModuleName: null,
           confirmedCasePrefix: null,
@@ -869,31 +983,9 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
           currentRound: 1,
           followupActive: false,
           followupBuffer: '',
-          knowledgePreview: {
-            phase: 'clarify',
-            documentId: preview.document_id,
-            mindmapDocumentId: prev.uploadMindmap?.documentId ?? null,
-            moduleName: preview.module_name || null,
-            casePrefix: null,
-            loading: false,
-            hits: preview.hits,
-          },
-        }))
-      },
-      onKnowledgeDrafts: (payload) => {
-        if (payload.drafts.length === 0) return  // 没抽到东西，跳过审核闸门继续流程
-        patchSession(startSid, {
-          prdDraftReview: {
-            documentId: payload.document_id,
-            role: 'prd',
-            filename: file.name,
-            moduleName: payload.module_name,
-            drafts: payload.drafts,
-            submitting: false,
-          },
+          knowledgePreview: null,
         })
       },
-      onModuleAutoClassified: (payload) => handleModuleAutoClassified(startSid, payload),
       onAssistantMessage: (msg) => {
         patchSession(startSid, prev => ({ messages: [...prev.messages, msg] }))
       },
@@ -907,12 +999,20 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
         setCancel(startSid, null)
       },
       onDone: () => {
+        // 上传只暂存：不再自动触发知识抽取 / 模块分类 / 澄清。等用户点「开始生成」。
         patchSession(startSid, { uploading: false, uploadStage: null, uploadProgress: '' })
         setCancel(startSid, null)
+        // 脑图模式例外：上传的 PRD 暂存完成后，直接进入澄清（知识库命中 + 多轮），
+        // 澄清就绪后再露出「生成测试脑图」卡。用例模式仍走「开始生成」闸门，不受影响。
+        // mode 用同步 sessionsRef 读；docId 用闭包变量（不读异步的 taskMapRef）。
+        const mode = sessionsRef.current.find(s => s.id === startSid)?.mode ?? 'cases'
+        if (mode === 'mindmap' && stagedDocId != null) {
+          startMindmapClarificationRef.current?.(startSid, stagedDocId)
+        }
       },
     })
     setCancel(startSid, abort)
-  }, [activeSessionId, sessions, patchSession, setCancel, handleModuleAutoClassified])
+  }, [activeSessionId, sessions, patchSession, setCancel])
 
   // ── Mindmap upload ───────────────────────────────────────────────────────
   // 与 handleFileSelect 类似，但落到 uploadMindmap 这个并行 slot —— PRD upload 状态不被清掉。
@@ -975,8 +1075,7 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
         patchSession(startSid, { uploadProgress: renderProgress() })
       },
       onResult: (result) => {
-        // 脑图通常没有缓存的澄清，但保留兼容路径：result 到达后落到 uploadMindmap，
-        // 同时如果带了 clarification（cache_hit 路径），也进入澄清回答态
+        // 兼容保留：旧路径 result；新流程脑图上传走 onStaged。
         const mindmapId = result.mindmap_document_id ?? result.document_id
         if (mindmapId == null) return
         patchSession(startSid, prev => ({
@@ -993,16 +1092,16 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
                 currentRound: 1,
               }
             : {}),
-          // 保留 uploadResult / 其它 PRD 态
           ...(prev.uploadResult ? {} : {}),
         }))
       },
-      onKnowledgePreview: (preview) => {
-        patchSession(startSid, prev => ({
+      onStaged: (staged) => {
+        // 新流程：脑图已暂存。落 uploadMindmap 槽位，不弹面板；用户点「开始生成」再进入下游。
+        patchSession(startSid, {
           uploadMindmap: {
-            documentId: preview.document_id,
-            filename: preview.filename,
-            stats: preview.stats,
+            documentId: staged.document_id,
+            filename: staged.filename,
+            stats: staged.stats,
           },
           confirmedModuleName: null,
           confirmedCasePrefix: null,
@@ -1012,31 +1111,9 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
           currentRound: 1,
           followupActive: false,
           followupBuffer: '',
-          knowledgePreview: {
-            phase: 'clarify',
-            documentId: prev.uploadResult?.document_id ?? null,
-            mindmapDocumentId: preview.document_id,
-            moduleName: preview.module_name || prev.uploadResult?.clarification.module_detected || null,
-            casePrefix: null,
-            loading: false,
-            hits: preview.hits,
-          },
-        }))
-      },
-      onKnowledgeDrafts: (payload) => {
-        if (payload.drafts.length === 0) return
-        patchSession(startSid, {
-          mindmapDraftReview: {
-            documentId: payload.document_id,
-            role: 'mindmap',
-            filename: file.name,
-            moduleName: payload.module_name,
-            drafts: payload.drafts,
-            submitting: false,
-          },
+          knowledgePreview: null,
         })
       },
-      onModuleAutoClassified: (payload) => handleModuleAutoClassified(startSid, payload),
       onAssistantMessage: (msg) => {
         patchSession(startSid, prev => ({ messages: [...prev.messages, msg] }))
       },
@@ -1055,7 +1132,7 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
       },
     })
     setCancel(startSid, abort)
-  }, [activeSessionId, sessions, patchSession, setCancel, handleModuleAutoClassified])
+  }, [activeSessionId, sessions, patchSession, setCancel])
 
   // ── Mindmap paste ────────────────────────────────────────────────────────
   // 粘贴的 Markdown 大纲封装成虚拟 File，复用 handleMindmapSelect 走同一条上传链路（后端零改动）。
@@ -1113,6 +1190,9 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
       // 是否已从后端收到过实质内容（result / 知识预览 / 草稿）。用于判断导入失败时
       // 该会话是不是"从没成过的空壳"——是则删掉，避免堆积孤儿会话。
       let gotContent = false
+      // 记住暂存的 PRD document_id。onDone 里不能读 taskMapRef（setTaskMap 异步批处理，
+      // onStaged 刚 patch 的值此刻可能还没进 ref），用闭包变量才可靠。
+      let stagedDocId: number | null = null
       const renderProgress = () =>
         stages.join('\n') + (llmBuffer ? `\n\n\`\`\`\n${llmBuffer}\n\`\`\`` : '')
 
@@ -1145,15 +1225,14 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
         },
         onResult: (result) => {
           gotContent = true
-          // cache_hit 路径仍会发 result（澄清已缓存）。但若稍后还要跑脑图，澄清入参会变，
-          // 这里先把 result 落到 uploadResult 让用户看到 PRD 已就绪；脑图阶段会重置澄清态。
+          // 兼容保留：旧路径 result；新流程飞书 PRD 走 onStaged。
           patchSession(startSid, prev => ({
             uploadResult: result,
             confirmedModuleName: null,
             confirmedCasePrefix: null,
             clarificationRounds: [],
-            currentQuestions: mindmapUrl ? null : result.clarification.questions,
-            currentSummary: mindmapUrl ? '' : result.clarification.summary,
+            currentQuestions: mindmapUrl ? null : (result.clarification?.questions ?? null),
+            currentSummary: mindmapUrl ? '' : (result.clarification?.summary ?? ''),
             currentRound: 1,
             followupActive: false,
             followupBuffer: '',
@@ -1168,20 +1247,22 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
               .catch(err => console.error('Rename after lark import failed:', err))
           }
         },
-        onKnowledgePreview: (preview) => {
+        onStaged: (staged) => {
           gotContent = true
+          stagedDocId = staged.document_id
+          // 新流程：飞书 PRD 已暂存。落 uploadResult 空壳做 chip 哨兵，不弹面板。
           const fakeUpload: UploadResult = {
-            document_id: preview.document_id,
-            filename: preview.filename,
-            stats: preview.stats,
+            document_id: staged.document_id,
+            filename: staged.filename,
+            stats: staged.stats,
             clarification: {
               summary: '',
-              module_detected: preview.module_name || '',
+              module_detected: '',
               questions: [],
               ready_to_generate: false,
             },
           }
-          patchSession(startSid, prev => ({
+          patchSession(startSid, {
             uploadResult: fakeUpload,
             confirmedModuleName: null,
             confirmedCasePrefix: null,
@@ -1191,38 +1272,16 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
             currentRound: 1,
             followupActive: false,
             followupBuffer: '',
-            // 脑图阶段紧接着会再发一次 knowledge_preview 把这个面板覆盖；只跑 PRD 时就是终态
-            knowledgePreview: {
-              phase: 'clarify',
-              documentId: preview.document_id,
-              mindmapDocumentId: prev.uploadMindmap?.documentId ?? null,
-              moduleName: preview.module_name || null,
-              casePrefix: null,
-              loading: false,
-              hits: preview.hits,
-            },
-          }))
+            knowledgePreview: null,
+          })
           const cur = sessions.find(x => x.id === startSid)
-          if (cur && (cur.title === fallbackTitle || cur.title === '新会话') && preview.filename) {
-            renameSession(startSid, preview.filename.slice(0, 60))
+          if (cur && (cur.title === fallbackTitle || cur.title === '新会话') && staged.filename) {
+            renameSession(startSid, staged.filename.slice(0, 60))
               .then(updated => {
                 setSessions(prev => prev.map(s => (s.id === startSid ? { ...s, title: updated.title } : s)))
               })
               .catch(err => console.error('Rename after lark import failed:', err))
           }
-        },
-        onKnowledgeDrafts: (payload) => {
-          if (payload.drafts.length === 0) return
-          patchSession(startSid, {
-            prdDraftReview: {
-              documentId: payload.document_id,
-              role: 'prd',
-              filename: null,  // 飞书路径没有原始文件名，用 module/role 信息呈现
-              moduleName: payload.module_name,
-              drafts: payload.drafts,
-              submitting: false,
-            },
-          })
         },
         onModuleAutoClassified: (payload) => handleModuleAutoClassified(startSid, payload),
         onAssistantMessage: (msg) => {
@@ -1258,8 +1317,15 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
           resolve()
         },
         onDone: () => {
+          // 新流程：飞书导入只暂存，不自动抽取；用户点「开始生成」再进入下游。
           patchSession(startSid, { uploading: false, uploadStage: null, uploadProgress: '' })
           setCancel(startSid, null)
+          // 脑图模式（mindmapOnly 对话框只收 PRD 链接）：暂存完成即进入澄清。
+          // mode 用同步的 sessionsRef 读；docId 用闭包变量（不读异步的 taskMapRef）。
+          const mode = sessionsRef.current.find(s => s.id === startSid)?.mode ?? 'cases'
+          if (mode === 'mindmap' && stagedDocId != null) {
+            startMindmapClarificationRef.current?.(startSid, stagedDocId)
+          }
           resolve()
         },
       })
@@ -1311,12 +1377,13 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
             },
           })
         },
-        onKnowledgePreview: (preview) => {
-          patchSession(startSid, prev => ({
+        onStaged: (staged) => {
+          // 新流程：飞书脑图已暂存。落 uploadMindmap 槽位，不弹面板。
+          patchSession(startSid, {
             uploadMindmap: {
-              documentId: preview.document_id,
-              filename: preview.filename,
-              stats: preview.stats,
+              documentId: staged.document_id,
+              filename: staged.filename,
+              stats: staged.stats,
             },
             confirmedModuleName: null,
             confirmedCasePrefix: null,
@@ -1326,40 +1393,19 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
             currentRound: 1,
             followupActive: false,
             followupBuffer: '',
-            knowledgePreview: {
-              phase: 'clarify',
-              documentId: prev.uploadResult?.document_id ?? null,
-              mindmapDocumentId: preview.document_id,
-              moduleName: preview.module_name || prev.uploadResult?.clarification.module_detected || null,
-              casePrefix: null,
-              loading: false,
-              hits: preview.hits,
-            },
-          }))
+            knowledgePreview: null,
+          })
           // 仅脑图模式（无 PRD）时用脑图 title 命名会话
           if (!prdUrl) {
             const cur = sessions.find(x => x.id === startSid)
-            if (cur && (cur.title === fallbackTitle || cur.title === '新会话') && preview.filename) {
-              renameSession(startSid, preview.filename.slice(0, 60))
+            if (cur && (cur.title === fallbackTitle || cur.title === '新会话') && staged.filename) {
+              renameSession(startSid, staged.filename.slice(0, 60))
                 .then(updated => {
                   setSessions(prev => prev.map(s => (s.id === startSid ? { ...s, title: updated.title } : s)))
                 })
                 .catch(err => console.error('Rename after lark mindmap import failed:', err))
             }
           }
-        },
-        onKnowledgeDrafts: (payload) => {
-          if (payload.drafts.length === 0) return
-          patchSession(startSid, {
-            mindmapDraftReview: {
-              documentId: payload.document_id,
-              role: 'mindmap',
-              filename: null,
-              moduleName: payload.module_name,
-              drafts: payload.drafts,
-              submitting: false,
-            },
-          })
         },
         onModuleAutoClassified: (payload) => handleModuleAutoClassified(startSid, payload),
         onAssistantMessage: (msg) => {
@@ -1380,6 +1426,7 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
           resolve()
         },
         onDone: () => {
+          // 新流程：飞书脑图导入只暂存，不自动抽取；用户点「开始生成」再进入下游。
           patchSession(startSid, { uploading: false, uploadStage: null, uploadProgress: '' })
           setCancel(startSid, null)
           resolve()
@@ -1508,6 +1555,48 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
   // 把最新版 runGenerate 挂到 ref，让 probe useEffect 能调用它而不用进依赖项
   runGenerateRef.current = runGenerate
 
+  // 从当前会话的 PRD 文档生成测试脑图并写入飞书。独立于用例生成，随时可点。
+  const runGenerateMindmap = useCallback(async (sid: number, documentId: number) => {
+    patchSession(sid, { mindmapGenerating: true, mindmapResult: null })
+    // 把多轮澄清答案拍平成 {问题文本: 答案}，随生成请求注入（与 runGenerate 同口径，见上方）。
+    const cur = taskMapRef.current[sid]
+    const flatAnswers: Record<string, string> = {}
+    ;(cur?.clarificationRounds ?? []).forEach(rnd => {
+      rnd.questions.forEach(q => {
+        const a = rnd.answers[String(q.id)]
+        if (a) flatAnswers[q.question] = a
+      })
+    })
+    try {
+      const res = await generateMindmap(documentId, {
+        sessionId: sid,
+        moduleName: (cur?.confirmedModuleName ?? active.confirmedModuleName) ?? undefined,
+        moduleId: (cur?.confirmedModuleId ?? active.confirmedModuleId) ?? undefined,
+        clarifications: Object.keys(flatAnswers).length > 0 ? flatAnswers : undefined,
+      })
+      patchSession(sid, prev => ({
+        mindmapResult: { url: res.url, title: res.title },
+        // 后端带 session_id 时会落一条 assistant 气泡（含飞书链接），append 到聊天流
+        messages: res.assistant_message ? [...prev.messages, res.assistant_message] : prev.messages,
+      }))
+    } catch (err) {
+      console.error('Generate mindmap error:', err)
+      const detail = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail
+      const content = detail ? `生成测试脑图失败：${detail}` : '生成测试脑图失败，请稍后重试。'
+      // 失败也给用户一条可见反馈（本地气泡，不落库）
+      patchSession(sid, prev => ({
+        messages: [...prev.messages, {
+          id: -Date.now(),
+          role: 'assistant',
+          content,
+          created_at: new Date().toISOString(),
+        } as IChatMessage],
+      }))
+    } finally {
+      patchSession(sid, { mindmapGenerating: false })
+    }
+  }, [patchSession, active.confirmedModuleName, active.confirmedModuleId])
+
   // 切到"生成前的知识库确认"阶段：先把面板挂出来（loading=true），
   // 再异步去后端拉 preview。失败时直接退化为"无知识注入"流程，给用户开始生成的入口。
   // 注意这是 phase='generate'；upload SSE 的 onKnowledgePreview 才是 phase='clarify'。
@@ -1581,6 +1670,8 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
           patchSession(sid, prev => ({ followupBuffer: prev.followupBuffer + text }))
         },
         onResult: (result) => {
+          const qs = result.clarification?.questions ?? []
+          const readyNow = result.clarification?.ready_to_generate || qs.length === 0
           // 替换 fakeUpload / 现有 uploadResult 为 Clarifier 跑出的真实 result。
           // 仅 PRD 模式：result 带 document_id + clarification → 落到 uploadResult；
           // 仅脑图模式：result 不带 PRD doc，但带 mindmap_document_id + clarification —— 仍落 uploadResult
@@ -1595,12 +1686,26 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
                   filename: prev.uploadMindmap?.filename ?? result.filename,
                   stats: prev.uploadMindmap?.stats ?? result.stats,
                 }),
-            currentQuestions: result.clarification?.questions ?? null,
+            currentQuestions: readyNow ? null : qs,
             currentSummary: result.clarification?.summary ?? '',
             currentRound: 1,
             followupActive: false,
             followupBuffer: '',
           }))
+
+          // 首轮澄清即"无遗留疑点/可直接生成"：与追问路径（handleClarificationConfirm）
+          // 保持一致——不再停在空的澄清面板（那会渲染不出、导致流程死在这里），而是切到
+          // 生成阶段的知识预览，让用户确认注入知识后生成用例。
+          if (readyNow) {
+            const cur = taskMapRef.current[sid]
+            const prdDocId = result.document_id ?? (cur?.uploadResult?.document_id ?? documentId)
+            const mmDocId = mindmapDocumentId ?? (cur?.uploadMindmap?.documentId ?? null)
+            const moduleName =
+              cur?.confirmedModuleName ?? result.clarification?.module_detected ?? ''
+            const casePrefix =
+              cur?.confirmedCasePrefix ?? result.clarification?.case_prefix_suggestion ?? ''
+            void startKnowledgePreview(sid, prdDocId, mmDocId, cur?.clarificationRounds ?? [], moduleName, casePrefix)
+          }
         },
         onAssistantMessage: (msg) => {
           patchSession(sid, prev => ({ messages: [...prev.messages, msg] }))
@@ -1617,7 +1722,50 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
       },
     )
     setCancel(sid, abort)
-  }, [patchSession, setCancel])
+  }, [patchSession, setCancel, startKnowledgePreview])
+
+  // 「开始生成」闸门：把本会话已暂存的 PRD / 脑图推进到下游流程。
+  // 后端 /pipeline/start/stream 会跑模块自动分类 + 知识检索预览，发 module_auto_classified /
+  // knowledge_preview 帧（复用上传阶段曾用的处理逻辑）；完成后再触发一次「PRD + 脑图」合并
+  // 知识抽取（脑图优先），随后弹模块确认卡 / 知识审核 / 澄清面板。
+  const handlePipelineStart = useCallback((sid: number) => {
+    patchSession(sid, { pipelineStarting: true })
+    const abort = streamPipelineStart(sid, {
+      onStage: () => { /* 进度以 loading 呈现即可 */ },
+      onToken: () => { /* pipeline/start 不产出正文 token */ },
+      onResult: () => { /* pipeline/start 不发 result */ },
+      onModuleAutoClassified: (payload) => handleModuleAutoClassified(sid, payload),
+      onKnowledgePreview: (preview) => {
+        patchSession(sid, prev => ({
+          knowledgePreview: {
+            phase: 'clarify',
+            documentId: preview.document_id ?? prev.uploadResult?.document_id ?? null,
+            mindmapDocumentId: preview.mindmap_document_id ?? prev.uploadMindmap?.documentId ?? null,
+            moduleName: preview.module_name || null,
+            casePrefix: null,
+            loading: false,
+            hits: preview.hits,
+          },
+        }))
+      },
+      onAssistantMessage: (msg) => {
+        patchSession(sid, prev => ({ messages: [...prev.messages, msg] }))
+      },
+      onError: (msg) => {
+        console.error('Pipeline start error:', msg)
+        patchSession(sid, { pipelineStarting: false })
+        setCancel(sid, null)
+      },
+      onDone: () => {
+        patchSession(sid, { pipelineStarting: false })
+        setCancel(sid, null)
+        // 模块分类 / 知识预览已就绪 → 触发一次「PRD + 脑图」合并知识抽取（脑图优先）。
+        // 抽取完成后弹草稿审核面板；草稿审核与模块确认卡都在知识预览面板之前的闸门里。
+        void triggerCombinedExtraction(sid)
+      },
+    })
+    setCancel(sid, abort)
+  }, [patchSession, setCancel, handleModuleAutoClassified, triggerCombinedExtraction])
 
   const handleClarificationConfirm = useCallback(async (
     answers: Record<string, string>,
@@ -1708,7 +1856,154 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
     setCancel(sid, abort)
   }, [activeSessionId, taskMap, patchSession, startKnowledgePreview, setCancel])
 
-  // 草稿审核：用户在 KnowledgeDraftReviewPanel 上点"入库 N 条"或"全部丢弃"。
+  // ── 脑图模式澄清 ───────────────────────────────────────────────────────────
+  // 与用例模式共用后端澄清端点（/clarify/initial|followup/stream），它本就支持知识库命中注入
+  // 与多轮追问。与用例版的唯一区别：澄清就绪后不进知识预览/生成用例，而是标记
+  // mindmapReadyToGenerate 露出「生成测试脑图」卡。脑图模式上传的是 PRD → documentId=PRD id。
+
+  // 脑图上传完成后自动触发首轮澄清（复用 followupActive amber loader 作"澄清中"可视态）。
+  const startMindmapClarification = useCallback((sid: number, documentId: number) => {
+    patchSession(sid, {
+      followupActive: true,
+      followupBuffer: '',
+      currentQuestions: null,
+      mindmapReadyToGenerate: false,
+      clarificationRounds: [],
+      currentRound: 1,
+    })
+    const abort = streamInitialClarification(
+      { sessionId: sid, documentId, mindmapDocumentId: null, knowledgeIds: null },
+      {
+        onStage: () => { /* surfaced via followupBuffer */ },
+        onToken: (text) => {
+          patchSession(sid, prev => ({ followupBuffer: prev.followupBuffer + text }))
+        },
+        onResult: (result) => {
+          const qs = result.clarification?.questions ?? []
+          const readyNow = result.clarification?.ready_to_generate || qs.length === 0
+          const detectedModule = result.clarification?.module_detected || ''
+          patchSession(sid, prev => ({
+            // 把 clarifier 识别到的模块名/摘要回填到 uploadResult 壳，供澄清面板做 suggestedModule
+            uploadResult: prev.uploadResult
+              ? { ...prev.uploadResult, clarification: {
+                  ...prev.uploadResult.clarification,
+                  module_detected: detectedModule,
+                  summary: result.clarification?.summary ?? '',
+                  questions: qs,
+                  ready_to_generate: !!readyNow,
+                } }
+              : prev.uploadResult,
+            currentQuestions: readyNow ? null : qs,
+            currentSummary: result.clarification?.summary ?? '',
+            currentRound: 1,
+            followupActive: false,
+            followupBuffer: '',
+            // 首轮即无疑点 → 直接就绪，露出生成卡；否则等用户答完澄清面板
+            mindmapReadyToGenerate: readyNow,
+          }))
+        },
+        onAssistantMessage: (msg) => {
+          patchSession(sid, prev => ({ messages: [...prev.messages, msg] }))
+        },
+        onError: (msg) => {
+          console.error('Mindmap initial clarification error:', msg)
+          // 澄清失败不该卡死流程：退化为"跳过澄清，允许直接生成"
+          patchSession(sid, { followupActive: false, followupBuffer: '', mindmapReadyToGenerate: true })
+          setCancel(sid, null)
+        },
+        onDone: () => {
+          patchSession(sid, { followupActive: false })
+          setCancel(sid, null)
+        },
+      },
+    )
+    setCancel(sid, abort)
+  }, [patchSession, setCancel])
+
+  // 桥接 ref：让前面定义的上传 onDone 能触发脑图首轮澄清。
+  startMindmapClarificationRef.current = startMindmapClarification
+
+  // 脑图澄清面板确认：并入本轮答案，未达上限且模型仍有追问则续问；否则标记就绪。
+  const handleMindmapClarificationConfirm = useCallback((
+    answers: Record<string, string>,
+    moduleName: string,
+    _casePrefix: string,  // 脑图不用用例编号前缀
+  ) => {
+    if (activeSessionId == null) return
+    const sid = activeSessionId
+    const cur = taskMapRef.current[sid]
+    if (!cur || !cur.currentQuestions) return
+    const prdDocId = cur.uploadResult?.document_id ?? null
+    if (prdDocId == null) return
+
+    const lockedModule = cur.confirmedModuleName ?? moduleName
+    const newRound: ClarificationRoundHistory = {
+      questions: cur.currentQuestions,
+      answers: Object.fromEntries(
+        cur.currentQuestions.map(q => [String(q.id), answers[String(q.id)] || '']),
+      ),
+    }
+    const updatedRounds = [...cur.clarificationRounds, newRound]
+
+    patchSession(sid, {
+      clarificationRounds: updatedRounds,
+      confirmedModuleName: lockedModule,
+    })
+
+    // 达轮次上限：不再追问，直接就绪允许生成
+    if (updatedRounds.length >= MAX_ROUNDS) {
+      patchSession(sid, { currentQuestions: null, mindmapReadyToGenerate: true })
+      return
+    }
+
+    patchSession(sid, { followupActive: true, followupBuffer: '', currentQuestions: null })
+
+    const abort = streamFollowupClarification(
+      {
+        sessionId: sid,
+        documentId: prdDocId,
+        mindmapDocumentId: null,
+        moduleName: lockedModule,
+        casePrefix: '',  // 脑图无前缀
+        rounds: updatedRounds,
+      },
+      {
+        onStage: () => { /* surfaced via followupBuffer */ },
+        onToken: (text) => {
+          patchSession(sid, prev => ({ followupBuffer: prev.followupBuffer + text }))
+        },
+        onResult: (res) => {
+          const newQs = res.clarification.questions || []
+          if (res.clarification.ready_to_generate || newQs.length === 0) {
+            patchSession(sid, { currentQuestions: null, followupActive: false, mindmapReadyToGenerate: true })
+          } else {
+            patchSession(sid, {
+              currentQuestions: newQs,
+              currentSummary: res.clarification.summary || '',
+              currentRound: res.round,
+              followupActive: false,
+            })
+          }
+        },
+        onAssistantMessage: (msg) => {
+          patchSession(sid, prev => ({ messages: [...prev.messages, msg] }))
+        },
+        onError: (msg) => {
+          console.error('Mindmap follow-up error:', msg)
+          setCancel(sid, null)
+          // 追问出错也允许生成，避免静默卡住
+          patchSession(sid, { followupActive: false, currentQuestions: null, mindmapReadyToGenerate: true })
+        },
+        onDone: () => {
+          patchSession(sid, { followupActive: false })
+          setCancel(sid, null)
+        },
+      },
+    )
+    setCancel(sid, abort)
+  }, [activeSessionId, patchSession, setCancel])
+
+
   // role 区分 PRD / 脑图——决定动哪个 slot；acceptedIndices=null 等同"全部入库"，[] 等同"全部丢弃"。
   // 成功后把对应 slot 置 null；不主动推进下一步——澄清入口由 JSX gating 自然解锁。
   // acceptedDrafts=null → 全部丢弃；非空数组 → 按编辑后的内容入库（可能仅子集，可能 content/type 已被改写）
@@ -1766,6 +2061,9 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
         : `第 ${active.clarificationRounds.length + 1} 轮澄清判断`
     }
     if (active.uploading) return '上传与解析文档'
+    if (active.mindmapGenerating) return '生成测试脑图'
+    if (active.pipelineStarting) return '分析模块与检索知识库'
+    if (active.extractingDrafts) return '抽取产品知识'
     if (active.streaming) return '对话生成'
     if (active.prdDraftReview?.submitting || active.mindmapDraftReview?.submitting) return '提交知识草稿'
     if (active.knowledgePreview?.loading) return '加载知识库预览'
@@ -1827,7 +2125,7 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
           activeId={activeSessionId}
           busyIds={busyIds}
           onSelect={handleSelectSession}
-          onNew={handleNewSession}
+          onNew={(mode) => void handleCreateSession(mode)}
           onRename={async (id, title) => {
             const updated = await renameSession(id, title)
             setSessions(prev => prev.map(s => (s.id === id ? { ...s, title: updated.title } : s)))
@@ -1840,9 +2138,71 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
         <div className="flex-1 overflow-y-auto px-6 py-4 space-y-4">
           {!activeSessionId && (
             <div className="flex flex-col items-center justify-center h-full text-center text-gray-400">
-              <FileText size={48} className="mb-4 opacity-30" />
-              <p className="text-lg font-medium mb-1">TestCraft AI</p>
-              <p className="text-sm">点击「新会话」开始，或上传需求文档生成测试用例</p>
+              <FileText size={44} className="mb-4 opacity-30" />
+              <p className="text-lg font-medium mb-1 text-gray-600">TestCraft AI</p>
+              <p className="text-sm">从左侧选择「生成测试用例」或「生成测试脑图」开始</p>
+            </div>
+          )}
+
+          {/* 步骤条：常驻在消息区顶部，让用户随时知道流程走到哪一步 */}
+          {activeSessionId != null && (
+            <div className="sticky top-0 z-10 -mx-6 px-6 py-2.5 bg-gray-50/95 backdrop-blur border-b border-gray-100">
+              <FlowSteps mode={active.mode} currentStep={deriveFlowStep(active)} />
+            </div>
+          )}
+
+          {/* 「开始」引导卡：会话已建、但还没上传任何资料、也没有任何产出时显示第一步入口。
+              按钮直接可操作（触发隐藏 input / 飞书弹窗），把"提供文档"这一步直接嵌进引导流。 */}
+          {activeSessionId != null && !active.uploading && !active.uploadResult && !active.uploadMindmap
+            && active.testCases.length === 0 && !active.mindmapResult && active.messages.length === 0 && (
+            <div className={`rounded-xl border p-4 ${active.mode === 'mindmap' ? 'bg-indigo-50/60 border-indigo-200' : 'bg-blue-50/60 border-blue-200'}`}>
+              <div className="flex items-center gap-2 mb-1.5">
+                {active.mode === 'mindmap'
+                  ? <Brain size={16} className="text-indigo-600" />
+                  : <FileText size={16} className="text-blue-600" />}
+                <span className="text-sm font-medium text-gray-800">
+                  {active.mode === 'mindmap' ? '第一步：上传需求文档' : '第一步：上传资料'}
+                </span>
+              </div>
+              <p className="text-xs text-gray-600 leading-relaxed mb-3">
+                {active.mode === 'mindmap'
+                  ? '上传需求文档（本地 .docx/.pdf 或飞书链接），系统会先结合知识库澄清疑点，确认后生成测试脑图并存入飞书。'
+                  : '上传需求文档和/或测试脑图（本地文件或飞书链接，可只传其一），上传完成后按引导继续。'}
+              </p>
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => guideFileRef.current?.click()}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-sm text-white bg-blue-600 rounded-full hover:bg-blue-700 transition-colors"
+                >
+                  <Upload size={15} /> 上传需求文档
+                </button>
+                {active.mode !== 'mindmap' && (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => guideMindmapRef.current?.click()}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 text-sm text-gray-700 bg-white border border-gray-200 rounded-full hover:border-emerald-300 hover:text-emerald-600 transition-colors"
+                    >
+                      <Network size={15} /> 上传测试脑图
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setPasteDialogOpen(true)}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 text-sm text-gray-700 bg-white border border-gray-200 rounded-full hover:border-emerald-300 hover:text-emerald-600 transition-colors"
+                    >
+                      <Pencil size={15} /> 粘贴脑图大纲
+                    </button>
+                  </>
+                )}
+                <button
+                  type="button"
+                  onClick={() => setLarkDialogOpen(true)}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-sm text-gray-700 bg-white border border-gray-200 rounded-full hover:border-amber-300 hover:text-amber-600 transition-colors"
+                >
+                  <LinkIcon size={15} /> 飞书链接
+                </button>
+              </div>
             </div>
           )}
 
@@ -1903,7 +2263,36 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
             </div>
           )}
 
-          {(active.uploadResult || active.uploadMindmap) && active.currentQuestions && active.currentQuestions.length > 0 && !active.generating && !active.followupActive && !active.prdDraftReview && !active.mindmapDraftReview && !active.moduleDecision && (
+          {/* 「开始生成」闸门：上传只暂存文档，用户备齐资料后点它才进入下游流程
+              （模块归类 → 知识审核 → 澄清 → 生成用例）。只在"有暂存文档、且下游流程尚未启动"时显示。 */}
+          {active.mode !== 'mindmap' && (active.uploadResult || active.uploadMindmap)
+            && !active.uploading && !active.generating && !active.pipelineStarting
+            && !active.extractingDrafts
+            && !active.moduleDecision && !active.prdDraftReview && !active.mindmapDraftReview
+            && !active.knowledgePreview
+            && !(active.currentQuestions && active.currentQuestions.length > 0)
+            && !active.followupActive && !active.pendingGenerate
+            && active.testCases.length === 0 && (
+            <div className="rounded-xl border border-blue-200 bg-blue-50/60 p-4">
+              <p className="text-sm font-medium text-gray-800 mb-1">资料已就绪</p>
+              <p className="text-xs text-gray-600 leading-relaxed mb-3">
+                已暂存
+                {active.uploadResult?.filename ? ` PRD《${active.uploadResult.filename}》` : ''}
+                {active.uploadResult && active.uploadMindmap ? ' 与' : ''}
+                {active.uploadMindmap ? ` 测试脑图《${active.uploadMindmap.filename}》` : ''}
+                。可继续上传其它资料，准备好后点「开始生成」进入模块归类、知识审核与澄清流程。
+              </p>
+              <button
+                type="button"
+                onClick={() => { if (activeSessionId != null) handlePipelineStart(activeSessionId) }}
+                className="inline-flex items-center gap-1.5 px-4 py-2 text-sm text-white bg-blue-600 rounded-full hover:bg-blue-700 transition-colors"
+              >
+                开始生成
+              </button>
+            </div>
+          )}
+
+          {active.mode !== 'mindmap' && (active.uploadResult || active.uploadMindmap) && active.currentQuestions && active.currentQuestions.length > 0 && !active.generating && !active.followupActive && !active.extractingDrafts && !active.prdDraftReview && !active.mindmapDraftReview && !active.moduleDecision && (
             <ClarificationPanel
               questions={active.currentQuestions}
               summary={active.currentSummary || active.uploadResult?.clarification?.summary || ''}
@@ -1924,7 +2313,7 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
 
           {/* 第 1 步：模块确认卡。LLM 判定文档归属后（含高置信自动命中）一律让用户拍板。
               未处理时阻塞下方知识草稿审核与知识预览，保证「模块 → 知识草稿 → 开始澄清」的顺序。 */}
-          {active.moduleDecision && activeSessionId != null && (
+          {active.mode !== 'mindmap' && active.moduleDecision && activeSessionId != null && (
             <ModuleConfirmPanel
               modules={modules}
               suggestedModuleId={active.moduleDecision.suggestedModuleId}
@@ -1946,10 +2335,32 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
 
           {/* 第 2 步：知识草稿审核闸门——上传后 LLM 抽取出的产品规则/约束/术语先让用户勾选要入库的条目。
               两个 slot 独立呈现；moduleDecision 未处理时不渲染（先走模块确认）。 */}
-          {active.prdDraftReview && !active.moduleDecision && (
+          {/* 合并抽取进行中：显示 loader，占住审核面板位置，抽完再落草稿/进预览 */}
+          {active.pipelineStarting && (
+            <div className="bg-blue-50/60 border border-blue-200 rounded-xl p-3">
+              <div className="flex items-center gap-2 text-sm text-blue-700">
+                <Loader2 size={14} className="animate-spin" />
+                正在分析文档归属模块并检索项目知识库…
+              </div>
+            </div>
+          )}
+
+          {active.extractingDrafts && !active.moduleDecision && !active.prdDraftReview && !active.mindmapDraftReview && (
+            <div className="bg-emerald-50/60 border border-emerald-200 rounded-xl p-3">
+              <div className="flex items-center gap-2 text-sm text-emerald-700">
+                <Loader2 size={14} className="animate-spin" />
+                {active.uploadResult && active.uploadMindmap
+                  ? '正在合并需求文档与脑图，抽取可沉淀的产品知识（冲突以脑图为准）…'
+                  : '正在抽取可沉淀的产品知识…'}
+              </div>
+            </div>
+          )}
+
+          {active.mode !== 'mindmap' && active.prdDraftReview && !active.moduleDecision && (
             <KnowledgeDraftReviewPanel
               documentId={active.prdDraftReview.documentId}
               role="prd"
+              combined={!!active.uploadMindmap}
               filename={active.prdDraftReview.filename}
               moduleName={active.prdDraftReview.moduleName}
               modules={modules}
@@ -1960,7 +2371,7 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
               onDiscard={() => settleDraftReview('prd', null)}
             />
           )}
-          {active.mindmapDraftReview && !active.moduleDecision && (
+          {active.mode !== 'mindmap' && active.mindmapDraftReview && !active.moduleDecision && (
             <KnowledgeDraftReviewPanel
               documentId={active.mindmapDraftReview.documentId}
               role="mindmap"
@@ -1991,11 +2402,69 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
             </div>
           )}
 
+          {/* 脑图模式澄清面板：与用例模式共用组件，隐藏用例编号前缀、终点是生成脑图。 */}
+          {active.mode === 'mindmap' && active.uploadResult && active.currentQuestions
+            && active.currentQuestions.length > 0 && !active.followupActive
+            && !active.mindmapGenerating && (
+            <ClarificationPanel
+              questions={active.currentQuestions}
+              summary={active.currentSummary}
+              suggestedModule={active.confirmedModuleName || active.uploadResult?.clarification?.module_detected || ''}
+              hideCasePrefix
+              round={active.currentRound}
+              maxRounds={MAX_ROUNDS}
+              lockedModuleName={active.confirmedModuleName ?? undefined}
+              confirmLabel={
+                active.currentRound >= MAX_ROUNDS
+                  ? '提交回答并生成测试脑图'
+                  : '提交回答，让大模型判断是否还需要继续澄清'
+              }
+              onConfirm={handleMindmapClarificationConfirm}
+            />
+          )}
+
+          {/* 脑图模式主操作卡：澄清就绪后出现，点按钮生成脑图并存飞书。仅脑图模式显示。 */}
+          {active.mode === 'mindmap' && active.uploadResult?.document_id != null
+            && active.mindmapReadyToGenerate && (
+            <div className="bg-indigo-50/60 border border-indigo-200 rounded-xl p-4 space-y-2">
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex items-center gap-2 text-sm text-indigo-900">
+                  <Brain size={16} className="text-indigo-600" />
+                  <span>
+                    {active.mindmapResult
+                      ? '测试脑图已生成并存入飞书'
+                      : `已完成澄清${active.uploadResult.filename ? `《${active.uploadResult.filename}》` : ''}，点击生成测试脑图`}
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => void runGenerateMindmap(activeSessionId!, active.uploadResult!.document_id!)}
+                  disabled={active.mindmapGenerating}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-indigo-600 rounded-full hover:bg-indigo-700 disabled:opacity-50 whitespace-nowrap"
+                >
+                  {active.mindmapGenerating
+                    ? <><Loader2 size={13} className="animate-spin" /> 生成中…</>
+                    : <><Brain size={13} /> {active.mindmapResult ? '重新生成' : '生成测试脑图'}</>}
+                </button>
+              </div>
+              {active.mindmapResult && (
+                <a
+                  href={active.mindmapResult.url}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="inline-flex items-center gap-1 text-xs font-medium text-indigo-700 hover:text-indigo-900 underline"
+                >
+                  {active.mindmapResult.title} <ExternalLink size={12} />
+                </a>
+              )}
+            </div>
+          )}
+
           {/* 上传 SSE 里 knowledge_preview 帧先于产品知识抽取（knowledge_extract 阶段）到达，
               但抽取仍在跑（uploading 尚未 done）。此时不渲染预览面板，避免"开始澄清"按钮
               抢在抽取完成/草稿审核之前出现。抽取完成后 onDone 置 uploading=false，面板才亮。
               phase='generate' 的预览由 startKnowledgePreview 触发（uploading 早已 false），不受影响。 */}
-          {active.knowledgePreview && !active.uploading && !active.generating && !active.prdDraftReview && !active.mindmapDraftReview && !active.moduleDecision && (
+          {active.mode !== 'mindmap' && active.knowledgePreview && !active.uploading && !active.extractingDrafts && !active.generating && !active.prdDraftReview && !active.mindmapDraftReview && !active.moduleDecision && (
             <KnowledgePreviewPanel
               loading={active.knowledgePreview.loading}
               hits={active.knowledgePreview.hits}
@@ -2016,7 +2485,7 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
             />
           )}
 
-          {(active.generating || (active.pendingGenerate && active.testCases.length === 0)) && (
+          {active.mode !== 'mindmap' && (active.generating || (active.pendingGenerate && active.testCases.length === 0)) && (
             <div className="bg-blue-50/70 border border-blue-200 rounded-xl p-4 flex items-center gap-3">
               <Loader2 size={18} className="animate-spin text-blue-600" />
               <div className="text-sm text-blue-800">
@@ -2025,7 +2494,7 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
             </div>
           )}
 
-          {active.testCases.length > 0 && (
+          {active.mode !== 'mindmap' && active.testCases.length > 0 && (
             <TestCaseTable
               cases={active.testCases}
               onExport={handleExport}
@@ -2089,19 +2558,47 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
             onChange={setInput}
             onSend={handleSend}
             onFileSelect={handleFileSelect}
-            onMindmapSelect={handleMindmapSelect}
-            onMindmapPaste={() => setPasteDialogOpen(true)}
+            onMindmapSelect={active.mode === 'mindmap' ? undefined : handleMindmapSelect}
+            onMindmapPaste={active.mode === 'mindmap' ? undefined : () => setPasteDialogOpen(true)}
             onLarkImport={() => setLarkDialogOpen(true)}
+            placeholder={active.mode === 'mindmap'
+              ? '上传需求文档后即可生成测试脑图…（也可输入消息）'
+              : undefined}
             disabled={active.streaming || active.uploading || active.generating || active.followupActive || active.knowledgePreview != null || active.prdDraftReview != null || active.mindmapDraftReview != null}
           />
         </div>
       </main>
+
+      {/* 引导卡上传按钮的隐藏 input（与 MessageInput 内的等价，供第一步引导流直接触发） */}
+      <input
+        ref={guideFileRef}
+        type="file"
+        accept=".docx,.pdf"
+        className="hidden"
+        onChange={e => {
+          const f = e.target.files?.[0]
+          if (f) void handleFileSelect(f)
+          e.target.value = ''
+        }}
+      />
+      <input
+        ref={guideMindmapRef}
+        type="file"
+        accept=".md,.markdown,text/markdown"
+        className="hidden"
+        onChange={e => {
+          const f = e.target.files?.[0]
+          if (f) void handleMindmapSelect(f)
+          e.target.value = ''
+        }}
+      />
 
       <LarkUrlDialog
         open={larkDialogOpen}
         onClose={() => setLarkDialogOpen(false)}
         onSubmit={handleLarkImport}
         loading={active.uploading}
+        mindmapOnly={active.mode === 'mindmap'}
       />
 
       <MindmapPasteDialog

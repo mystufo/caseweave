@@ -4,20 +4,18 @@ import {
   fetchProjectKnowledge, updateKnowledge, deleteKnowledge,
   fetchModuleRelations, createModuleRelation, deleteModuleRelation,
   fetchKnowledgeStats,
-  fetchEvolutionSummary,
   fetchSkills, fetchSkillDetail, createSkill, updateSkill, deleteSkill, regenerateSkill,
-  fetchRecentFeedback,
   fetchDocuments, fetchDocumentDetail, updateDocumentModule,
   type KnowledgeHit, type ModuleSummary, type ModuleRelation, type ModuleRelationType,
-  type KnowledgeStats, type EvolutionSummary,
-  type SkillSummary, type RecentFeedbackItem,
+  type KnowledgeStats,
+  type SkillSummary,
   type DocumentSummary, type DocumentDetail,
 } from '../api/client'
 import TabBar, { type ViewKey } from '../components/TabBar'
 import PromptManagerDrawer from '../components/PromptManagerDrawer'
 import {
   Search, RefreshCw, Loader2, Edit2, Check, X, Trash2, BookOpen, Plus, Network,
-  BarChart3, Sparkles, FileText, Brain, Wand2, History, FileCog,
+  BarChart3, Sparkles, FileText, Brain, Wand2, FileCog,
   Eye, ExternalLink, Save, Layers,
 } from 'lucide-react'
 
@@ -46,6 +44,22 @@ const TYPE_BADGE: Record<string, string> = {
 
 const ALL = -1  // 模块过滤的"全部"哨兵——后端 module_id 用 null 表示不过滤
 const ORPHAN = -2  // 项目级（module_id = NULL）的条目
+
+// 知识来源 → 中文标签 + 徽章配色。负反馈来源单独高亮，便于和文档来源区分。
+const SOURCE_LABEL: Record<string, string> = {
+  document: '文档',
+  user_feedback: '负反馈',
+  bug_analysis: 'Bug 分析',
+  web_exploration: '探索',
+  prompt_test: 'Prompt 测试',
+}
+const SOURCE_BADGE: Record<string, string> = {
+  document: 'bg-sky-50 text-sky-700 border-sky-200',
+  user_feedback: 'bg-rose-100 text-rose-700 border-rose-200',
+  bug_analysis: 'bg-orange-50 text-orange-700 border-orange-200',
+  web_exploration: 'bg-teal-50 text-teal-700 border-teal-200',
+  prompt_test: 'bg-violet-50 text-violet-700 border-violet-200',
+}
 
 type EditDraft = { content: string; confidence: number; moduleId: number | null }
 
@@ -771,16 +785,6 @@ export default function KnowledgePage({ view, onChangeView }: PageProps) {
     }
   }, [])
 
-  // 反馈进化总览（进化闭环第二步）：三出口 待消费/已消费 + intent 分布
-  const [evolution, setEvolution] = useState<EvolutionSummary | null>(null)
-  const reloadEvolution = useCallback(async () => {
-    try {
-      setEvolution(await fetchEvolutionSummary())
-    } catch (err) {
-      console.error('Evolution summary failed:', err)
-    }
-  }, [])
-
   // Phase 4: Skills 抽屉
   const [skillsDialogOpen, setSkillsDialogOpen] = useState(false)
   const [skills, setSkills] = useState<SkillSummary[]>([])
@@ -795,25 +799,6 @@ export default function KnowledgePage({ view, onChangeView }: PageProps) {
   const [deletingSkillId, setDeletingSkillId] = useState<number | null>(null)
   const [regenLoading, setRegenLoading] = useState(false)
   const [regenMessage, setRegenMessage] = useState<string | null>(null)
-
-  // Phase 4: 最近修改沉淀
-  const [recentFeedback, setRecentFeedback] = useState<RecentFeedbackItem[]>([])
-  const [recentFeedbackLoading, setRecentFeedbackLoading] = useState(false)
-  const reloadRecentFeedback = useCallback(async (moduleId: number | null) => {
-    setRecentFeedbackLoading(true)
-    try {
-      const items = await fetchRecentFeedback({
-        moduleId: moduleId ?? undefined,
-        limit: 8,
-      })
-      setRecentFeedback(items)
-    } catch (err) {
-      console.error('recent feedback failed:', err)
-      setRecentFeedback([])
-    } finally {
-      setRecentFeedbackLoading(false)
-    }
-  }, [])
 
   const moduleNameById = useMemo(() => {
     const m = new Map<number, string>()
@@ -866,19 +851,11 @@ export default function KnowledgePage({ view, onChangeView }: PageProps) {
   useEffect(() => {
     fetchModules().then(setModules).catch(err => console.error('Modules load:', err))
     void reloadStats()
-    void reloadEvolution()
-  }, [reloadStats, reloadEvolution])
+  }, [reloadStats])
 
   useEffect(() => {
     void reload()
   }, [reload])
-
-  // 切换模块时重新拉"最近修改沉淀"卡
-  useEffect(() => {
-    const realModuleId =
-      activeModule === ALL || activeModule === ORPHAN ? null : activeModule
-    void reloadRecentFeedback(realModuleId)
-  }, [activeModule, reloadRecentFeedback])
 
   // App.tsx 用 hidden/block 切 tab，各页面始终挂载 → 首次挂载后的"进页面拉数据" effect 不再重跑。
   // 所以每次 view 切到 'knowledge' 时主动刷新一遍（生成用例会异步沉淀新知识，需实时反映）。
@@ -887,11 +864,7 @@ export default function KnowledgePage({ view, onChangeView }: PageProps) {
   refreshOnActivateRef.current = () => {
     void reload()
     void reloadStats()
-    void reloadEvolution()
     fetchModules().then(setModules).catch(err => console.error('Modules load:', err))
-    const realModuleId =
-      activeModule === ALL || activeModule === ORPHAN ? null : activeModule
-    void reloadRecentFeedback(realModuleId)
   }
   const prevViewRef = useRef<ViewKey>(view)
   useEffect(() => {
@@ -1047,6 +1020,8 @@ export default function KnowledgePage({ view, onChangeView }: PageProps) {
   }
 
   const startNewSkill = () => {
+    // Skill 只支持模块级：项目级通用经验应写进 generator 系统提示词，否则存了也不会被注入
+    if (!activeRealModule) return
     setSkillForm({ name: '', content: '' })
   }
 
@@ -1401,100 +1376,6 @@ export default function KnowledgePage({ view, onChangeView }: PageProps) {
           </div>
         )}
 
-        {evolution && evolution.triaged_total > 0 && (
-          <div className="px-6 py-3 border-b border-gray-200 bg-gradient-to-r from-indigo-50/60 to-violet-50/40">
-            <div className="flex items-start gap-4 flex-wrap">
-              <div className="flex items-center gap-2 text-xs font-semibold text-indigo-800/90">
-                <Sparkles size={14} />
-                反馈进化
-                <span className="font-normal text-[11px] text-indigo-400">
-                  负反馈已分诊 {evolution.triaged_total} 条，流向三个进化出口
-                </span>
-              </div>
-              <div className="flex flex-wrap gap-3">
-                {(['knowledge', 'skill', 'prompt'] as const).map(kind => {
-                  const o = evolution.outputs[kind]
-                  const label = kind === 'knowledge' ? '知识库' : kind === 'skill' ? 'Skill' : '系统提示词'
-                  return (
-                    <div
-                      key={kind}
-                      className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-white border border-indigo-100 text-xs"
-                      title={`分诊到「${label}」的负反馈：${o.pending} 条待消费 / ${o.consumed} 条已消费`}
-                    >
-                      <span className="font-medium text-gray-700">{label}</span>
-                      <span className="text-amber-600">待消化 {o.pending}</span>
-                      <span className="text-gray-300">·</span>
-                      <span className="text-emerald-600">已消化 {o.consumed}</span>
-                    </div>
-                  )
-                })}
-              </div>
-              <div className="flex-1" />
-              <button
-                type="button"
-                onClick={() => void reloadEvolution()}
-                className="p-1 text-gray-400 hover:text-gray-700"
-                title="刷新反馈进化总览"
-              >
-                <RefreshCw size={12} />
-              </button>
-            </div>
-            {Object.keys(evolution.intent_distribution).length > 0 && (
-              <div className="mt-2 flex flex-wrap items-center gap-1.5">
-                <span className="text-[11px] text-indigo-800/70">意图分布：</span>
-                {Object.entries(evolution.intent_distribution)
-                  .sort((a, b) => b[1] - a[1])
-                  .map(([intent, count]) => (
-                    <span
-                      key={intent}
-                      className="px-1.5 py-0.5 text-[11px] rounded border bg-white text-indigo-800/80 border-indigo-200"
-                    >
-                      {intent} · {count}
-                    </span>
-                  ))}
-              </div>
-            )}
-          </div>
-        )}
-
-        {(recentFeedbackLoading || recentFeedback.length > 0) && (
-          <div className="px-6 py-2 border-b border-gray-200 bg-indigo-50/30">
-            <div className="flex items-center gap-2 text-xs font-semibold text-indigo-800/90 mb-1.5">
-              <History size={12} />
-              最近修改沉淀
-              <span className="text-[11px] font-normal text-indigo-700/60">
-                {activeRealModule ? `（仅显示「${activeRealModule.name}」）` : '（全部模块）'}
-              </span>
-              {recentFeedbackLoading && <Loader2 size={12} className="animate-spin text-indigo-400" />}
-            </div>
-            {recentFeedback.length > 0 && (
-              <div className="flex flex-wrap gap-1.5">
-                {recentFeedback.map(fb => (
-                  <div
-                    key={fb.id}
-                    className="inline-flex items-start gap-1.5 max-w-md px-2 py-1 bg-white border border-indigo-100 rounded text-[11px]"
-                    title={fb.summary || undefined}
-                  >
-                    {fb.intent && (
-                      <span className="px-1 py-0.5 bg-indigo-100 text-indigo-700 border border-indigo-200 rounded text-[10px] whitespace-nowrap">
-                        {fb.intent}
-                      </span>
-                    )}
-                    <span className="text-gray-700 truncate">
-                      {fb.test_case_name}
-                    </span>
-                    {fb.extracted_rule_count > 0 && (
-                      <span className="text-emerald-600 whitespace-nowrap" title="本次修改沉淀的规则条数">
-                        +{fb.extracted_rule_count} 条规则
-                      </span>
-                    )}
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        )}
-
         <div className="flex-1 overflow-y-auto px-6 py-4 space-y-2">
           {errorMsg && (
             <div className="px-3 py-2 rounded bg-red-50 border border-red-200 text-sm text-red-700">
@@ -1572,7 +1453,12 @@ export default function KnowledgePage({ view, onChangeView }: PageProps) {
                         {typeLabel}
                       </span>
                       <span className="text-gray-500">模块：{moduleName}</span>
-                      <span className="text-gray-400">来源：{item.source}</span>
+                      <span
+                        className={`px-1.5 py-0.5 rounded border font-medium ${SOURCE_BADGE[item.source] || 'bg-gray-100 text-gray-600 border-gray-200'}`}
+                        title={`知识来源：${SOURCE_LABEL[item.source] || item.source}`}
+                      >
+                        {SOURCE_LABEL[item.source] || item.source}
+                      </span>
                       <span className="text-gray-400">v{item.version}</span>
                       <span className="text-gray-400">{formatDate(item.created_at)}</span>
                       {item.distance != null && (
@@ -1873,6 +1759,12 @@ export default function KnowledgePage({ view, onChangeView }: PageProps) {
             <div className="text-xs text-gray-500 mb-3">
               Skill 是从该模块历史用例修改中沉淀的「测试设计要点」（Markdown），
               用例生成时会作为最高优先级的提示词上下文注入。
+              {!activeRealModule && (
+                <span className="block mt-1 text-amber-600">
+                  Skill 仅支持模块级。项目级通用测试设计经验请写进「系统提示词」的 generator，
+                  在此新建项目级 Skill 不会被生成时注入。
+                </span>
+              )}
             </div>
 
             {/* 操作按钮 */}
@@ -1880,7 +1772,13 @@ export default function KnowledgePage({ view, onChangeView }: PageProps) {
               <button
                 type="button"
                 onClick={startNewSkill}
-                className="inline-flex items-center gap-1 px-2 py-1 text-xs bg-indigo-600 text-white rounded hover:bg-indigo-700"
+                disabled={!activeRealModule}
+                title={
+                  activeRealModule
+                    ? '为当前模块手写一条测试设计经验'
+                    : '项目级通用经验请写进 generator 系统提示词；Skill 仅支持模块级'
+                }
+                className="inline-flex items-center gap-1 px-2 py-1 text-xs bg-indigo-600 text-white rounded hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 <Plus size={12} />
                 新建 Skill
@@ -1974,7 +1872,9 @@ export default function KnowledgePage({ view, onChangeView }: PageProps) {
                 </div>
               ) : visibleSkills.length === 0 ? (
                 <div className="text-center py-8 text-sm text-gray-400">
-                  当前模块暂无 Skill。可点击「新建 Skill」手写一条，或选定模块后点「自动归纳」。
+                  {activeRealModule
+                    ? '当前模块暂无 Skill。可点击「新建 Skill」手写一条，或点「自动归纳」由系统归纳。'
+                    : '项目级不支持 Skill。请在左侧选择具体模块后新建/归纳；通用经验请写进 generator 系统提示词。'}
                 </div>
               ) : (
                 <ul className="divide-y divide-gray-100">

@@ -1,6 +1,6 @@
 ================================================================================
 TestCraft AI — 开发进度记录
-更新时间：2026-07-06
+更新时间：2026-07-13
 ================================================================================
 
 ■ Phase 1 — 基础骨架                                              [✅ 已完成]
@@ -267,6 +267,336 @@ TestCraft AI — 开发进度记录
 ================================================================================
 变更 / 修复记录（倒序，最新在上）
 ================================================================================
+■ 2026-07-21 — 修复：LLM 调用无超时导致界面卡在「正在抽取产品知识…」
+  背景：从 PRD 抽知识时前端 loader 靠 extractCombinedDrafts 返回/抛错才解除，但整条 LLM
+        调用链无任何超时——llm_factory.build_chat_model 建 client 时未传 timeout/max_retries，
+        axios 实例也没 timeout。provider 卡住时请求永久挂起，后端 _extract_combined_and_stash
+        的 try/except 也不会触发（没抛错），extractingDrafts 一直为 true，界面卡死。
+  改动：
+    ├─ config.py：新增 llm_timeout_seconds（默认 120s）、llm_max_retries（默认 1）。
+    ├─ agents/llm_factory.py：ChatAnthropic / ChatOpenAI 均传入 timeout + max_retries；
+    │   慢/挂起的调用会在 timeout*(1+retries) 内抛错，调用方 fail-open 分支即可兜底清 loader。
+    └─ frontend/src/api/client.ts：extractCombinedDrafts 加 300s 请求超时兜底（> 后端最坏
+        ~240s），网络/后端偶发挂起时前端 catch 分支也能清掉 loader，不再永久打转。
+  验证：backend 语法检查通过并实建 client 确认 timeout=120/max_retries=1 生效；前端 tsc 通过。
+  补充（同日）：加超时观测日志 + .env 配置项。
+    ├─ .env.example：新增 LLM_TIMEOUT_SECONDS=120 / LLM_MAX_RETRIES=1 及说明（最坏耗时=超时×(1+重试)）。
+    ├─ agents/knowledge_extractor.py & knowledge_dedup.py：LLM 调用开始日志带 timeout/max_retries；
+    │   失败日志带耗时(ms)+异常类型+「可调大 LLM_TIMEOUT_SECONDS」提示，便于区分超时与其它错误。
+    └─ api/routes_upload.py：_extract_combined_and_stash 记录端到端耗时（成功/失败都打 ms + 异常类型）。
+
+■ 2026-07-21 — 知识抽取：加入「不要抽取」排除清单，过滤低价值内容
+  背景：从 PRD 抽产品知识时收进了一些没沉淀价值的内容：① 未定稿/不确定的内容（如「二期
+        再支持 XX」「文案待确认」）；② 琐碎的表现层细节（如「时间戳统一为 MM/DD/YYYY」）。
+        这些既不是未来用例能引用的规则，又会污染知识库、增加审核负担。
+  改动：
+    └─ agents/knowledge_extractor.py：SYSTEM_PROMPT 新增「不要抽取」5 条排除项——
+        ① 不确定/未定稿（二期/后续、待定、TBD/TODO 等）；② 表现层细节（时间戳格式、颜色、
+        字号、间距等纯样式）；③ 文案原文（除非含明确取值/校验规则）；④ 非规则性内容
+        （背景/目标/版本排期/人员分工/埋点字段等）；⑤ 主观模糊/纯猜测描述。并把抽取要点第 4 条
+        改为统一判断标准「能否成为未来某条测试用例的判定依据，不能则不抽」。仅改提示词，
+        不动解析/去重/fail-open 逻辑。
+  验证：knowledge_extractor.py 语法检查通过。
+
+■ 2026-07-20 — 知识草稿审核：每条命中记录独立三选 + 收紧相似判定标准
+  背景：从 PRD 抽知识草稿时命中多条已有条目的两个问题：① 审核面板只给一条草稿一个
+        总的「保留新的/保留旧的/两个都保留」单选，无法对同一草稿命中的不同旧条目分别
+        处理（例：冲突项「135 积分」应替换为新的「100 积分」，而相似项「新用户画像调研
+        任务奖励 100 积分」是另一个任务、应两个都保留）。② LLM 把「同一对象但不同维度」
+        （如奖励积分 vs 完成后 toast 文案 vs 点击交互跳转）误判为 similar 展示出来——向量
+        距离无法区分（同任务名距离都很近），根因是 similar 口径过宽。
+  改动：
+    后端
+    └─ agents/knowledge_dedup.py：收紧 SYSTEM_PROMPT 与模块 docstring——判定核心从「能否
+        同时为真」改为「先看是否同一对象的同一属性/维度，再看取值是否矛盾」；similar 限定为
+        「同一对象同一属性/维度」，unrelated 明确覆盖「同一对象但不同属性/维度」，并补充贴合
+        本例的反例（奖励 vs toast 文案 vs 点击交互、不同任务各自的奖励）。仅改提示词，不动
+        classify_relations 逻辑/阈值/fail-open；unrelated 近邻在 routes_upload 本就被忽略。
+    前端
+    └─ components/KnowledgeDraftReviewPanel.tsx：三选一决策从「每草稿一组」改为「每条命中的
+        已有条目一组」（保留新的=替换此旧条目 / 保留此旧条目 / 两个都保留），resolutions 状态
+        改为 (草稿索引→旧条目 id→决策) 二维结构。supersedes_entry_ids 只带选了「保留新的」的
+        那部分 entry_id；willStore 规则：只要有任一命中记录选了非「保留旧的」该草稿即入库
+        （仅当全部命中记录都选「保留旧的」才整体弃稿）。后端接口/类型无需改动。
+  验证：前端 tsc 通过；knowledge_dedup.py 语法检查通过。
+
+■ 2026-07-17 — 知识抽取：去掉 12 条上限 + 重复/相似/冲突三档判定与人工决策
+  背景：① 每次从文档抽知识最多只保留 12 条（prompt 指示 + 代码 out[:12] 双重限制），
+        遗漏内容。② 原有「潜在冲突」只靠向量距离粗判，分不清「相似（可共存）」与
+        「冲突（取值矛盾，不能同时为真）」，且完全重复的条目照样进草稿、只在入库时被
+        静默丢弃，用户也没有可操作的「保留哪个」动作（只能自己去知识库页删旧条目）。
+  改动：
+    后端
+    ├─ agents/knowledge_extractor.py：删掉「一份文档最多 12 条」prompt 指示与 out[:12]
+    │   截断；抽多少由内容决定（去重逻辑保留）。
+    ├─ agents/knowledge_dedup.py（新增）：classify_relations() —— 把草稿 + 库内近邻一次性
+    │   交给 LLM 语义分档 duplicate/similar/conflict/unrelated，附一句判定理由。判定核心是
+    │   「两条内容能否同时为真」。fail-open：失败返回空 dict，调用方退化为按 similar 展示。
+    ├─ knowledge/store.py：find_similar_entries 窗口放宽（min_distance 0.05→0.0 让完全重复
+    │   也进候选交给 LLM 判定；max_distance 0.25→0.30；top_k 3→5）。
+    ├─ api/routes_upload.py：_drafts_to_dicts_with_conflicts 重写——逐条粗筛近邻 → 汇总调
+    │   classify_relations → 命中 duplicate 的草稿整条丢弃（不进 pending_knowledge）；
+    │   其余按 conflict>similar>new 定性，conflicts 带 relation+reason。LLM 整体失败时有
+    │   近邻的草稿按 similar 展示（绝不因判定失败丢数据）。
+    └─ api/routes_knowledge.py：AcceptedDraftIn 加 supersedes_entry_ids；
+        confirm_pending_knowledge 入库前校验归属并硬删被替代的旧条目，返回 superseded 数。
+    前端
+    ├─ api/client.ts：KnowledgeConflictHint 加 relation/reason；KnowledgeDraft 加
+    │   relation_status 与 supersedes_entry_ids。
+    └─ components/KnowledgeDraftReviewPanel.tsx：相似/冲突草稿改为三选一决策（保留新的=替换
+        旧条目 / 保留旧的=放弃新草稿 / 两个都保留，默认最保守的「都保留」），展示库内对照条目
+        与 LLM 判定理由；普通无冲突草稿仍走勾选。完全重复条目不再出现在面板。
+  验证：前端 tsc 通过；knowledge_dedup._parse 与三档组装逻辑用独立脚本做了单元验证（含
+        code-fence 容错、非法字段过滤、LLM 失败退化、重复丢弃、conflict>similar 优先级）。
+        完整端到端需本地后端 venv + LLM_API_KEY（当前环境未装依赖，未跑）。
+
+■ 2026-07-16 — 测试脑图 prompt 改版：从「按测试分类罗列」改为「按功能逻辑重建」
+  背景：用户试用脑图生成，反馈产物只是把 PRD 内容机械罗列，缺少逻辑关系与依赖。对比
+        用户手写脑图后确认：机器版以「正向/反向/边界/权限/兼容/关联」测试分类为主干、
+        每类下平铺测试点，同一功能被拆散到多个类别、丰富的交互流程被压平成一行，读者
+        无法围绕一个功能形成完整心智模型；手写版则以「功能结构 + 交互逻辑」为主干，从
+        入口/触发点顺着操作流逐层下钻（入口→弹窗→界面元素→CTA 状态→未完成态点击→
+        多步调研向导逐步校验→关闭确认），并保留确切文案/数值/阈值。
+  改动（仅改 prompt 默认文本与描述，代码流程零改动）：
+    ├─ agents/mindmap_generator.py：重写 SYSTEM_PROMPT。核心变更——
+    │   ① 组织原则从「测试分类为主干」改为「功能结构+交互逻辑为主干」，明确 ❌先分测试
+    │      大类再平铺 / ✅从入口触发逐层下钻镜像产品层级；
+    │   ② 规定父子关系承载四类语义：包含 / 触发跳转 / 前置条件→结果 / 状态→分支；
+    │   ③ 列出必须显式表达的逻辑关系：触发跳转、前置校验、状态流转、条件分支与适用范围、
+    │      联动依赖；④ 要求保留 PRD 具象锚点（文案/数值/阈值/时间点）；
+    │   ⑤ 测试覆盖（正常/异常/边界/校验）就近挂到功能节点下，跨功能项才收进末尾「全局与
+    │      跨功能」分支；⑥ 输出格式改为单 `#` 根 + 多级 `-` 缩进列表（不再用 `##` 切测试
+    │      分类），并换上「按功能逻辑组织」的示例。同步更新模块 docstring。
+    └─ prompts/registry.py：更新 mindmap_generator 的 description，反映新组织原则。
+  说明：SYSTEM_PROMPT 是该 key 的「原始建议版本」默认值；若某项目已在网页端另存并激活了
+        自定义脑图 prompt 版本，运行时仍以其激活版本为准，此次默认值更新不影响该项目。
+
+■ 2026-07-16 — 脑图生成加入「知识库命中 + 多轮澄清」阶段
+  背景：脑图模式此前是「上传需求文档 → 直接生成脑图 → 存飞书」三步，无澄清。用户要求
+        脑图生成前也检测知识库命中的相关条目并注入，并支持多轮澄清；不要模块确认卡/知识
+        草稿审核这些用例模式的重环节。
+  关键复用：后端澄清端点 /clarify/initial|followup/stream 本就支持「知识命中注入 + 多轮
+        追问 + PRD 输入」（用例模式在用）。脑图模式上传的就是 PRD，传 PRD document_id、
+        knowledge_ids=null 即自动检索知识库并注入 clarifier。故后端澄清逻辑零改动。
+  改动：
+    ├─ agents/mindmap_generator.py：generate_mindmap 新增 clarification_answers 参数，
+    │   把澄清 Q&A 作为高优先级上下文注入 user_content（置于文档前，冲突时以澄清为准，
+    │   与 generator.py 口径一致）。
+    ├─ api/routes_mindmap.py：MindmapGenerateRequest 新增 clarifications；生成前用
+    │   search_relevant + summarize_for_prompt 取该模块知识命中（排除本文档自身抽取，
+    │   避免自反馈），连同 clarifications 一并传入 generate_mindmap。知识既进澄清也进生成。
+    ├─ 前端 client.ts：generateMindmap opts 增加 clarifications。
+    ├─ 前端 ClarificationPanel.tsx：新增 hideCasePrefix（脑图无用例编号前缀）——隐藏前缀
+    │   输入、就绪校验剔除前缀、按钮/标题文案切「生成测试脑图」；isFollowup 判定在
+    │   hideCasePrefix 下仅凭已锁定模块名。模块名输入保留（脑图根节点）。用例模式不传该
+    │   prop，行为不变。
+    ├─ 前端 ChatPage.tsx：脑图上传（本地走 handleFileSelect / 飞书走 handleLarkImport）
+    │   onDone 后，mode=mindmap 自动触发 startMindmapClarification（复用 streamInitial-
+    │   Clarification）；新增 handleMindmapClarificationConfirm 走 streamFollowupClarification
+    │   多轮，与用例版唯一区别是终点不进知识预览/生成用例，而是置 mindmapReadyToGenerate
+    │   露出生成卡；runGenerateMindmap 把 clarificationRounds 拍平成 {问题:答案} 注入生成。
+    │   新增 SessionState.mindmapReadyToGenerate；stateFromDTO 刷新恢复该标志。
+    └─ 前端 FlowSteps.tsx：脑图步骤条改为「上传需求文档 / 澄清 / 生成脑图 / 存入飞书」，
+        deriveFlowStep 脑图分支相应调整（result→4 / 就绪→2 / 上传完成或澄清中→1）。
+
+■ 2026-07-16 — 测试脑图 system prompt 纳入版本化管理（与用例生成一致）
+  背景：脑图生成（mindmap_generator）的 SYSTEM_PROMPT 一直硬编码，未登记到 prompt
+        registry，网页端「系统提示词管理」列表里看不到它、无法编辑/版本化/切换生效——
+        而用例生成早已支持。用户要求脑图 prompt 也能像用例生成一样在网页端改。
+  改动（仅后端，前端抽屉是通用渲染无需动）：
+    ├─ prompts/registry.py：新增 PromptSpec key='mindmap_generator'（purpose='mindmap'），
+    │   default_text 从 mindmap_generator.SYSTEM_PROMPT import（agent 不反向 import，无循环依赖）。
+    └─ api/routes_mindmap.py：generate 前 get_active_prompt_text(db, project_id,
+        'mindmap_generator')，注入 generate_mindmap(system_prompt=...)；无自定义版本时
+        自动回退代码默认常量。改进建议（suggestions）本期仍仅 generator，脑图只做人工版本化。
+
+■ 2026-07-16 — 修复飞书链接导入「文档正文为空」（lark-cli v2 输出结构变更）
+  现象：粘贴飞书链接生成用例时报「❌ 飞书导入失败：文档正文为空（可能仅含图片或图表…）」，
+        之前能正常用。根因是本机 lark-cli 升级后 `docs +fetch` 的 v1 接口已下线、
+        默认切到 v2：① 正文从 data.* 挪到嵌套的 data.document.content（旧代码只探 data
+        直下，取不到正文 → 误判为空）；② 默认 --doc-format 变成 DocxXML，且文档标题被
+        内嵌成 `<title>…</title>` 前缀，不再是独立字段。
+  修复（backend/app/tools/lark_fetcher.py）：
+    ├─ fetch 命令补 `--doc-format markdown`，拿干净 markdown 正文喂 LLM（不再是 XML）。
+    ├─ _extract_title_and_text 候选根再下潜一层（覆盖 data.document），正文字段补 "content"。
+    └─ 新增 _TITLE_TAG_RE，从正文剥离 `<title>…</title>` 前缀；响应无显式 title 时用它回填。
+  验证：对真实 docx 链接跑 fetch_lark_content，title/正文均正确返回。
+■ 2026-07-16 — 流程重构：上传只「暂存」，新增「开始生成」闸门
+  背景：旧流程一上传需求文档，就立刻触发整条 LLM 流水线（解析 → 模块自动分类 →
+        知识库检索预览 → 合并知识抽取 → 澄清）。但用户常常还要再补一份测试脑图，
+        补传时又会把分类/抽取重跑一遍，体验割裂、浪费大模型调用。改为：上传阶段只
+        收集/暂存资料（解析入库、得到字数与去重指纹，不调任何大模型），等资料备齐后
+        用户点「开始生成」按钮，再统一进入下游流程。
+  设计：把上传端点里"解析之后"的 LLM/检索步骤搬到新的「开始」端点；新增 staged 状态。
+        保留全部人工确认环节（模块确认卡 → 知识草稿审核 → 知识注入勾选 → 澄清问答），
+        只在其前面加一道「开始」闸门。暂存范围沿用现模型（最多 1 份 PRD + 1 份脑图，
+        复用 ClarificationState.document_id / mindmap_document_id 两槽位，不改表）。
+  后端（api/routes_upload.py）：
+    ├─ /upload/stream、/upload/mindmap/stream、/upload/lark/stream 三端点瘦身：
+    │   移除内联的 _auto_classify_module_if_needed / _compute_knowledge_preview /
+    │   knowledge_preview 帧；解析 + 入库 Document 后写 status="staged"，发新 staged 帧
+    │   {document_id, role, filename, module_id, stats}。缓存命中也只按暂存处理（复用
+    │   已解析的 Document 行、跳过重复 parse/抓取），不再直接跳到 awaiting_answers。
+    ├─ 新增 _build_staged_content()：暂存完成的系统气泡（区分 file/lark、prd/mindmap）。
+    └─ 新增 POST /api/pipeline/start/stream {session_id, module_id?}：读会话暂存的
+        PRD/脑图 → 模块自动分类（module_auto_classified 帧 + 气泡，分类文本优先脑图）
+        → 知识库检索预览（knowledge_preview 帧）→ status=awaiting_clarification。
+        顶层 try/except 兜底转 error+done 帧。真正的 Clarifier 仍由前端在
+        /clarify/initial/stream 触发（这一段未动）。
+  状态机：ClarificationState.status 新增 "staged"（注释同步）；String(40) 值扩展，无需迁移。
+  前端：
+    ├─ api/client.ts：UploadStreamCallbacks 增 onStaged + StagedPayload；三个 upload 流
+    │   + lark 流分发新增 staged 帧；新增 streamPipelineStart() 调 /api/pipeline/start/stream；
+    │   ClarificationStateDTO.status 增 'staged'。
+    └─ pages/ChatPage.tsx：SessionState 增 pipelineStarting；上传各 onDone 不再自动
+        triggerCombinedExtraction，改由「开始生成」的 onDone 触发；上传 onStaged 只落
+        uploadResult/uploadMindmap 槽位、不弹面板；新增 handlePipelineStart() 复用旧的
+        onModuleAutoClassified / knowledge_preview(phase:'clarify') 处理逻辑；JSX 在"已上传
+        chips"下方新增「开始生成」按钮区块（有暂存文档、下游流程未启动时显示）+ 启动 loader。
+  验证：curl 实测 上传 docx→仅 staged（无 module_classify/knowledge_lookup/LLM 帧），
+        DTO status=staged；点 pipeline/start→module_auto_classified+knowledge_preview，
+        status=awaiting_clarification；重复上传同 docx→cache_hit 仍 staged、跳过重复解析。
+
+■ 2026-07-15 — 新功能：从 PRD 生成测试脑图并存入飞书文档
+  背景：此前系统只能"消费"脑图（把用户上传的脑图当作 Generator 输入）；现支持反向——
+        上传 PRD 后一键提炼出结构化「测试脑图」，写入飞书云文档，供测试同学在飞书里评审、
+        二次编辑。存储形态选用"飞书文档大纲"（Markdown 多级标题+缩进列表，飞书内可一键
+        切换大纲/思维导图视图），复用本机已登录的 lark-cli，无需在后端维护 token。
+  后端：
+    ├─ agents/mindmap_generator.py：新 Agent，LLM 把 PRD 提炼成纯 Markdown 大纲脑图
+    │   （# 模块名 / ## 测试分类 / - 具体测试点），复用 build_chat_model + prompt dump，
+    │   max_tokens 复用 generator_max_tokens。
+    ├─ tools/lark_writer.py：与 lark_fetcher 对称的写入工具，create_lark_doc() 走
+    │   `lark-cli docs +create --doc-format markdown --content -`（正文经 stdin），
+    │   宽容解析 data.document.{document_id,url}，异常复用 lark_fetcher 异常族。
+    └─ api/routes_mindmap.py（已在 main.py 注册）：
+        POST /api/mindmap/generate  {document_id, session_id?, module_id?, module_name?}
+        流程：加载 PRD → generate_mindmap → create_lark_doc → 把脑图落成 role='mindmap'
+        的 Document（source_type=lark, source_url=飞书链接，可被后续用例生成复用）→
+        带 session_id 时追加 assistant 系统气泡（meta.kind=mindmap_generated，含飞书链接）。
+        无需改表 / 迁移（Document 现有 role/source_type/source_url 字段已够用）。
+  前端：
+    ├─ api/client.ts：generateMindmap(documentId, {sessionId?, moduleId?, moduleName?})
+    └─ ChatPage.tsx：入口见下方 07-15（续）「对话页顶层模式选择」重构，脑图流程已独立。
+
+■ 2026-07-15（续）— 重构：对话页顶层区分「生成测试用例 / 生成测试脑图」两种模式
+  背景：上一版把「生成测试脑图」做成对话流里一张常驻卡片，夹在用例生成流程旁边，会偶尔
+        冒出来、且依赖用例流程。用户要求在最外层先选做什么，两条流程彻底分开：生成用例可传
+        需求文档/脑图/两者；生成脑图只需需求文档、不跑澄清。上传都支持本地文件 + 飞书链接。
+  关键点：/upload/stream 本就停在澄清之前（澄清由前端另调 /clarify/initial/stream 触发），
+        所以脑图模式主要是前端门控 + 一个 Session.mode 落库，后端生成/写飞书逻辑不改。
+  后端：
+    ├─ models/session.py：Session 加 mode 列（cases/mindmap，server_default='cases'）。
+    ├─ alembic/versions/0006_session_mode.py：ADD COLUMN IF NOT EXISTS（老会话默认 cases）。
+    └─ api/routes_chat.py：SessionCreate 加 mode（非法回退 cases）；create/list/rename 返回带 mode。
+  前端：
+    ├─ api/client.ts：ChatSession.mode 类型；createSession(title, moduleId?, mode?) 传 mode。
+    ├─ ChatPage.tsx：SessionState.mode（emptyState 默认 cases，hydrate 时从 session.mode 填）；
+    │   空态改成两张模式卡（生成用例 / 生成脑图），「新会话」回到空态让用户先选模式；
+    │   脑图模式下不渲染 澄清/知识预览/模块确认/草稿审核/用例表/用例 loader，只出脑图操作卡；
+    │   脑图模式跳过合并知识抽取（省一次 LLM）；脑图卡从"用例模式常驻"改为"仅脑图模式"。
+    ├─ MessageInput：脑图模式只留「上传需求文档 + 飞书链接」，隐藏脑图上传/粘贴入口。
+    └─ LarkUrlDialog：新增 mindmapOnly，脑图模式只收需求文档链接。
+
+■ 2026-07-15（续2）— 模式入口改为侧边栏常驻双按钮 + 顶部步骤条引导流程
+  背景：上一版把模式选择做成"空态两张卡"，用户选完/会话有内容后卡片就消失，入口不常驻、
+        流程也没串起来。改为：入口常驻侧边栏，选完后按步骤条一步引导到底。
+  确认的三项决策：常驻入口=侧边栏双按钮；要可视化步骤条；会话级固定模式（想换就新建）。
+  前端（纯前端，后端零改动）：
+    ├─ SessionList.tsx：顶部「新会话」→ 换成「生成测试用例 / 生成测试脑图」两个常驻按钮
+    │   （onNew(mode)）；会话列表项按 s.mode 显示用例(FileText)/脑图(Brain)图标。
+    ├─ components/FlowSteps.tsx（新）：步骤条。用例 5 步（上传→确认模块→审核知识→澄清→生成）；
+    │   脑图 3 步（上传需求文档→生成脑图→存入飞书）。当前步高亮、已完成打勾。
+    └─ ChatPage.tsx：deriveFlowStep() 纯函数从现有字段推导当前步（不加新状态）；
+        侧边栏按钮接 handleCreateSession(mode)；空态改为轻量欢迎"从左侧选择…"；
+        会话内消息区顶部常驻 FlowSteps；未上传且无产出时显示「开始」引导卡（按 mode 文案）；
+        MessageInput placeholder 按 mode 提示。删除上一版空态两张卡。
+  续2补充（把"提供文档"这一步直接嵌进引导流，消除流程割裂）：
+    ├─ 「开始」引导卡内直接放可操作按钮（上传需求文档 / 上传脑图 / 粘贴 / 飞书链接），
+    │   通过 ChatPage 内的隐藏 input（guideFileRef/guideMindmapRef）复用 handleFileSelect/
+    │   handleMindmapSelect，不再让用户去底部工具栏找入口。
+    └─ 脑图操作卡文案改为"第二步：已就绪《文件名》，点击生成测试脑图"；已生成后按钮变「重新生成」。
+
+■ 2026-07-14 — Generator 增加"用例粒度"约束（修复用例被按步骤拆碎）
+  背景：生成结果里一个连续操作流程（如"用户画像调研弹窗"的第一步/第二步/第三步/提交）
+        被拆成十几条独立用例，每条只是流程的一步，不符合"一条用例=一个完整验证目标"的逻辑
+        （见 testcases_session_84.xlsx 的 TASK-CENTER-PROFILE-003~016）。
+  设计：在 generator SYSTEM_PROMPT 顶部新增"用例粒度（最重要的约束）"章节：
+        一条用例=一个可独立验证的完整目标；连续操作且指向同一最终判定点→合并为一条、
+        每步写进 steps 字段；仅当预期结果各自独立可判定时才拆分；附调研弹窗正反例；
+        "要求"章节再次念押。
+        另新增"执行步骤与预期结果的对应规则"：expected_result 可多条，每条以对应的
+        steps 步骤序号开头、一一对应；只对有观察点的步骤写预期；序号不得错位/凭空；
+        JSON 示例的 expected_result 改成带序号的多行格式。
+  ├─ backend/app/agents/generator.py：仅改 SYSTEM_PROMPT 常量（default 版），逻辑不变。
+  └─ ⚠️ 注意：prompt 已 DB 版本化、按项目隔离。若某项目 generator 有 is_active 的自定义版本，
+      本次 default 常量改动不会影响该项目运行时——需在网页端 Prompt 管理里把此粒度约束
+      补进其激活版本，或重新以 default 另存并激活。
+
+■ 2026-07-13 — PRD + 脑图 合并为单份知识抽取（脑图优先，前后端）
+  背景：同一会话同时上传需求文档(PRD)与测试脑图时，两条上传流各自独立跑一次知识抽取、
+        各弹一个草稿审核面板，用户要审两遍，且两份草稿重叠/冲突时无从取舍。
+  设计：合并成一次 LLM 抽取（脑图代表最终意图，冲突以脑图为准，与澄清/生成阶段约定一致），
+        产物 stash 到主文档（有 PRD 就是 PRD，否则脑图）并清空副文档，只出一个审核面板。
+  ├─ 后端 knowledge_extractor.extract_knowledge 加 mindmap_content 形参：两者都在时脑图
+  │   在前 + 注明"冲突以脑图为准"，仍是一次调用；仅一份时行为不变。
+  ├─ routes_upload：抽取从三条上传 SSE 流里移出（本地 PRD / 飞书 / 本地脑图不再发
+  │   knowledge_extract 阶段与 extracted_knowledge_drafts 帧；knowledge_preview 保留）。
+  │   新增 helper _extract_combined_and_stash + 端点 POST /api/documents/extract_combined_drafts。
+  │   重构出 _drafts_to_dicts_with_conflicts / _stash_pending 供新老抽取复用。
+  ├─ 决策：重构为"上传后单次抽取"；补传第二份时总是重新合并全量（覆盖旧草稿，含已审核过的）。
+  └─ 前端：client 加 extractCombinedDrafts、去掉三处 onKnowledgeDrafts SSE 分支；ChatPage 在
+      三条上传 onDone 触发合并抽取（飞书合并导入仅在脑图阶段后触发一次），用 per-session
+      递增 token 做 latest-wins 守卫；抽取期间显示 loader，草稿只落一个 slot、另一个清空；
+      审核面板标题在合并时体现"需求文档 + 脑图（冲突以脑图为准）"。刷新恢复无需改结构。
+
+■ 2026-07-12 — 「负反馈」页升级为「进化报告」+ 知识库瘦身（前端）
+  背景：紧接上一条，把分散在知识库页的进化信息集中到独立页面。
+  ├─ tab「负反馈」改名「进化报告」（图标 ThumbsDown→LineChart），ViewKey 仍为 feedback。
+  ├─ 「反馈进化」总览面板（三出口 待消费/已消费 + 意图分布）从知识库页迁入进化报告页，
+  │   数据源仍是 GET /api/feedback/evolution/summary（页面加载/切入时拉取）。
+  └─ 知识库页移除「反馈进化」与「最近修改沉淀」两块面板及其 state/effect/无用 import
+      （fetchEvolutionSummary / fetchRecentFeedback 在该页不再引用）。知识库回归纯粹的
+      知识条目管理；反馈进化相关信息统一在「进化报告」页查看。
+
+■ 2026-07-12 — 负反馈独立页面（每次归纳的相关记录，前后端）
+  背景：负反馈归纳出的规则（source=user_feedback）此前和文档来源的知识混在知识库
+        列表里，查看不便。用户要求把负反馈单独开一个页面，展示每次归纳的相关记录。
+  ├─ 后端 GET /api/feedback/negative：返回已分析的 edit + 带原因 dislike 反馈，
+  │   每条含 意图/摘要/改动字段/点踩原因/分诊出口/**本次归纳的规则全文** +
+  │   consumed_by（已被 knowledge/skill/prompt 哪些出口消费）。支持 module_id /
+  │   feedback_type / limit 过滤。（区别于 /feedback/recent：那只回 edit + 规则条数）
+  ├─ 前端新增独立页 pages/NegativeFeedbackPage.tsx（对应「进化报告」tab）：
+  │   左侧模块筛选 + 顶部类型过滤（全部/人工修改/点踩，带计数），卡片列表逐条
+  │   展示归纳记录，可展开看改动字段/点踩原因/规则全文，出口徽章标「待消化/已消化」。
+  └─ 知识库列表保留全部条目（含负反馈来源），但把 source 从裸码渲染改为中文标签 +
+      配色徽章（负反馈=玫红高亮），一眼区分文档来源与负反馈来源。
+
+■ 2026-07-10 — 用例浏览页补点赞/点踩 + Skill 明确为模块级（前端）
+  背景：验证负反馈进化时发现「用例管理」页（CasesPage，跨会话聚合）只有编辑，
+        没有点赞/点踩，负反馈无处提交；又发现「测试设计经验」抽屉在项目级也
+        能新建 Skill，但项目级 Skill（module_id=NULL）生成时永不注入 = 死数据。
+  ├─ CasesPage 操作列补 👍/👎：点踩沿用 TestCaseTable 交互——先原地展开「原因
+  │   （可选）」输入框，填了作强信号进分诊、可留空回车直接提交；点赞直接提交 like。
+  │   操作列宽 96→150，侧栏说明补一行。
+  └─ Skill 收敛为「仅模块级」（方案 B，只加 UI 闸门，不动后端契约）：
+      ├─ 项目级（未选具体模块）时「新建 Skill」按钮禁用 + 悬停提示「通用经验请
+      │   写进 generator 系统提示词」；startNewSkill 加 !activeRealModule 短路防绕过。
+      ├─ 抽屉说明在项目级多出琥珀提示，空状态文案按 项目级/模块级 分叉。
+      └─ 已存在的项目级 Skill 仍可查看/删除，仅禁止新建，无破坏性操作。
+  说明：后端 POST /api/skills 仍接受 module_id=NULL（直接调接口可绕过），UI 已封口。
+  重复归纳治理（同日修复）：自动归纳原先每次都取该模块全部 user_feedback 知识重跑、
+        整篇覆盖旧 Skill、version 空涨、浪费 LLM。现改为：
+        ├─ 短路：无待消费新反馈（consumed_feedback_ids 空）且已存在自动 Skill →
+        │   直接返回 {created:false, reason:"无新反馈，跳过重复归纳"}，不调 LLM。
+        ├─ 增量合并：有旧 Skill 时把其正文作为 existing_skill 传入 generate_skill_for_module，
+        │   prompt 要求在旧备忘单基础上并入新信号、保留仍有效旧要点、语义去重、输出完整合并稿，
+        │   不再整篇重写覆盖；LLM 判无新增可输出 __NO_SIGNAL__ 以保留旧稿不动。
+        └─ 增量模式放宽 MIN_SAMPLES 闸门（哪怕仅 1 条新反馈也值得并入旧经验）；
+            首次归纳仍需 ≥3 信号避免噪声成篇。
+        涉及 backend/app/agents/skill_generator.py、api/routes_knowledge.py。
+  验证：frontend tsc --noEmit 净；backend 两文件 ast 解析通过。
+
 ■ 2026-07-06 — 反馈进化总览面板（进化闭环第二步，前端）
   在知识库页头部「总览」下方加一条「反馈进化」横条（仅当已有分诊反馈时显示）：
   ├─ 三出口（知识库/Skill/系统提示词）各自的 待消化/已消化 计数
@@ -558,6 +888,7 @@ TestCraft AI — 开发进度记录
   POST   /api/clarify/initial/stream 首轮澄清（SSE，PRD/脑图至少一份）
   POST   /api/clarify/followup/stream 续答澄清（SSE）
   POST   /api/generate              生成测试用例（PRD + 脑图双输入）
+  POST   /api/mindmap/generate      从 PRD 生成测试脑图并存入飞书文档（返回飞书链接）
 
   — 用例 / 导出 —
   GET    /api/cases                 用例列表（跨会话浏览）
@@ -569,6 +900,7 @@ TestCraft AI — 开发进度记录
   — 反馈 —
   POST   /api/feedback              提交反馈（like / dislike / edit；edit 异步触发 diff 分析；dislike 可带 reason 进分诊）
   GET    /api/feedback/recent       最近 N 条已分析的 edit 反馈（intent + summary）
+  GET    /api/feedback/negative     负反馈归纳记录（edit+dislike，含规则全文 + 消费出口；「负反馈」页数据源）
   GET    /api/feedback/evolution/summary  反馈进化总览（三出口 待消费/已消费 计数 + intent 分布）
 
   — 模块 / 知识库 —
@@ -590,6 +922,7 @@ TestCraft AI — 开发进度记录
   DELETE /api/knowledge/{id}        删除知识条目
   GET    /api/documents/{id}/pending_knowledge          文档待审核知识草稿
   POST   /api/documents/{id}/confirm_pending_knowledge  确认草稿入库
+  POST   /api/documents/extract_combined_drafts         PRD+脑图合并知识抽取（脑图优先，上传后触发）
 
   — Skill（测试设计经验）—
   GET    /api/skills                技能列表

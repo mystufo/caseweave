@@ -22,6 +22,8 @@ def build_chat_model(*, max_tokens: int = 4096, temperature: float = 0.2) -> Bas
             "api_key": settings.llm_api_key,
             "max_tokens": max_tokens,
             "temperature": temperature,
+            "timeout": settings.llm_timeout_seconds,
+            "max_retries": settings.llm_max_retries,
         }
         if settings.llm_base_url:
             kwargs["base_url"] = settings.llm_base_url
@@ -34,6 +36,8 @@ def build_chat_model(*, max_tokens: int = 4096, temperature: float = 0.2) -> Bas
             "api_key": settings.llm_api_key,
             "max_tokens": max_tokens,
             "temperature": temperature,
+            "timeout": settings.llm_timeout_seconds,
+            "max_retries": settings.llm_max_retries,
         }
         if settings.llm_base_url:
             kwargs["base_url"] = settings.llm_base_url

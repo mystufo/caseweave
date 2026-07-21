@@ -35,6 +35,7 @@ from app.agents.clarifier import (
     stream_followup_clarification,
 )
 from app.agents.knowledge_extractor import extract_knowledge
+from app.agents.knowledge_dedup import classify_relations
 from app.agents.module_classifier import classify_module, ModuleSuggestion
 from app.knowledge.store import (
     store_entries, search_relevant, summarize_for_prompt, HitEntry,
@@ -361,6 +362,147 @@ async def _write_assistant_message(
         return _msg_payload(msg)
 
 
+async def _drafts_to_dicts_with_conflicts(
+    drafts_objs: list, *, project_id: int | None, module_id: int | None,
+) -> list[dict]:
+    """把 KnowledgeDraft 列表转成前端用的 dict，并判定每条与库内已有条目的关系。
+
+    流程：
+    1. 每条草稿用 find_similar_entries 粗筛出主题相近的候选旧条目（含完全重复项）。
+    2. 把有候选的草稿汇总，调 classify_relations 一次让 LLM 语义分档
+       （duplicate / similar / conflict / unrelated，附判定理由）。
+    3. 逐条定性：
+       - 命中任一 duplicate → **整条草稿丢弃**（完全重复不打扰用户），记 info 日志。
+       - 否则 relation_status = conflict（有冲突近邻）/ similar（有相似近邻）/ new。
+       - conflicts 只保留 similar / conflict 近邻，带上 relation + reason。
+
+    project_id 为 None 时跳过关系检测（老调用站点）。
+    fail-open：粗筛 DB 错误逐条吞掉；LLM 分类整体失败 → 所有有候选的草稿按 similar 展示
+    （绝不因判定失败而静默丢数据）。
+    """
+    # 无项目上下文：不做关系检测，直接透传（保持老行为）
+    if project_id is None:
+        return [
+            {
+                "knowledge_type": d.knowledge_type,
+                "content": d.content,
+                "source": d.source,
+                "confidence": float(d.confidence),
+                "relation_status": "new",
+                "conflicts": [],
+            }
+            for d in drafts_objs
+        ]
+
+    # ── Step 1：逐条粗筛候选近邻 ─────────────────────────────────────────────
+    # sims_by_idx[i] = [SimilarEntry, ...]（可能为空）
+    sims_by_idx: dict[int, list] = {}
+    for i, d in enumerate(drafts_objs):
+        try:
+            async with AsyncSessionLocal() as cdb:
+                sims_by_idx[i] = await find_similar_entries(
+                    cdb, project_id=project_id, module_id=module_id, content=d.content,
+                )
+        except Exception as exc:
+            logger.warning("similarity scan failed for draft #%d: %s", i, exc)
+            sims_by_idx[i] = []
+
+    # ── Step 2：把有候选的草稿交给 LLM 一次性分档 ───────────────────────────
+    pairs: list[dict] = []
+    for i, d in enumerate(drafts_objs):
+        sims = sims_by_idx.get(i) or []
+        if not sims:
+            continue
+        pairs.append({
+            "draft_index": i,
+            "draft_type": d.knowledge_type,
+            "draft_content": d.content,
+            "candidates": [{"entry_id": s.entry_id, "content": s.content} for s in sims],
+        })
+
+    # {draft_index: {entry_id: {"relation", "reason"}}}；LLM 失败时为空 dict → 退化
+    classified: dict[int, dict[int, dict[str, str]]] = {}
+    if pairs:
+        try:
+            classified = await classify_relations(pairs)
+        except Exception as exc:
+            logger.warning("relation classification failed (fallback to similar): %s", exc)
+            classified = {}
+
+    # ── Step 3：逐条定性组装 ────────────────────────────────────────────────
+    drafts_dicts: list[dict] = []
+    for i, d in enumerate(drafts_objs):
+        sims = sims_by_idx.get(i) or []
+        rel_map = classified.get(i, {})
+        llm_ok = i in classified  # 该草稿拿到了 LLM 判定结果
+
+        is_duplicate = False
+        conflicts: list[dict] = []
+        for s in sims:
+            verdict = rel_map.get(s.entry_id)
+            if verdict is not None:
+                relation = verdict["relation"]
+                reason = verdict["reason"]
+            elif llm_ok:
+                # LLM 判过这条草稿但没提这个候选 → 视为无关，跳过
+                continue
+            else:
+                # LLM 整体失败（该草稿无判定）→ 保守按 similar 展示，不丢数据
+                relation = "similar"
+                reason = ""
+
+            if relation == "duplicate":
+                is_duplicate = True
+                break  # 完全重复：整条草稿丢弃，无需再看其它候选
+            if relation in ("similar", "conflict"):
+                conflicts.append({
+                    "entry_id": s.entry_id,
+                    "knowledge_type": s.knowledge_type,
+                    "content": s.content,
+                    "confidence": s.confidence,
+                    "distance": round(s.distance, 4),
+                    "relation": relation,
+                    "reason": reason,
+                })
+            # unrelated → 忽略
+
+        if is_duplicate:
+            logger.info(
+                "drop duplicate draft (%s) %s", d.knowledge_type, d.content[:60],
+            )
+            continue
+
+        if any(c["relation"] == "conflict" for c in conflicts):
+            relation_status = "conflict"
+        elif conflicts:
+            relation_status = "similar"
+        else:
+            relation_status = "new"
+
+        drafts_dicts.append({
+            "knowledge_type": d.knowledge_type,
+            "content": d.content,
+            "source": d.source,
+            "confidence": float(d.confidence),
+            "relation_status": relation_status,
+            "conflicts": conflicts,
+        })
+    return drafts_dicts
+
+
+async def _stash_pending(document_id: int, drafts_dicts: list[dict]) -> None:
+    """把草稿 dict 列表写进 Document.pending_knowledge（即使是 [] 也写）。fail-open。"""
+    try:
+        async with AsyncSessionLocal() as db:
+            r = await db.execute(select(Document).where(Document.id == document_id))
+            doc = r.scalar_one_or_none()
+            if doc is not None:
+                doc.pending_knowledge = drafts_dicts
+                await db.commit()
+    except Exception as exc:
+        logger.warning("persist pending_knowledge failed: %s", exc)
+
+
 async def _extract_and_stash_pending(
     *, document_id: int, raw_text: str, module_name: str | None,
     project_id: int | None = None, module_id: int | None = None,
@@ -389,51 +531,98 @@ async def _extract_and_stash_pending(
         logger.warning("knowledge extraction failed (treated as empty): %s", exc)
         drafts_objs = []
 
-    drafts_dicts: list[dict] = []
-    # 给每条 draft 找近邻（潜在冲突）；DB 错误整体 fail-open 不影响主流程
-    for d in drafts_objs:
-        item: dict = {
-            "knowledge_type": d.knowledge_type,
-            "content": d.content,
-            "source": d.source,
-            "confidence": float(d.confidence),
-            "conflicts": [],
-        }
-        if project_id is not None:
-            try:
-                async with AsyncSessionLocal() as cdb:
-                    sims = await find_similar_entries(
-                        cdb, project_id=project_id, module_id=module_id,
-                        content=d.content,
-                    )
-                    item["conflicts"] = [
-                        {
-                            "entry_id": s.entry_id,
-                            "knowledge_type": s.knowledge_type,
-                            "content": s.content,
-                            "confidence": s.confidence,
-                            "distance": round(s.distance, 4),
-                        }
-                        for s in sims
-                    ]
-            except Exception as exc:
-                logger.warning("conflict scan failed for one draft: %s", exc)
-                item["conflicts"] = []
-        drafts_dicts.append(item)
+    drafts_dicts = await _drafts_to_dicts_with_conflicts(
+        drafts_objs, project_id=project_id, module_id=module_id,
+    )
+    await _stash_pending(document_id, drafts_dicts)
+    return drafts_dicts
 
-    # 写入 Document.pending_knowledge —— 即使是 [] 也写，避免前端无法区分
-    # "尚未抽取完" 与 "抽完了但啥也没出"
+
+async def _extract_combined_and_stash(session_id: int, project_id: int) -> dict:
+    """合并抽取：把本会话的 PRD 与测试脑图合成一次知识抽取（脑图优先），产物 stash 到
+    主文档（有 PRD 就是 PRD，否则脑图），并清空另一份文档的 pending_knowledge。
+
+    返回 {document_id, module_id, module_name, role, drafts}，shape 与旧
+    extracted_knowledge_drafts 帧一致，供前端直接落到审核面板。fail-open：
+    任何异常都返回空 drafts（前端按"无草稿"处理，继续走注入预览 / 澄清）。
+    """
+    empty = {"document_id": None, "module_id": None, "module_name": None, "role": "prd", "drafts": []}
+    t0 = time.perf_counter()
     try:
         async with AsyncSessionLocal() as db:
-            r = await db.execute(select(Document).where(Document.id == document_id))
-            doc = r.scalar_one_or_none()
-            if doc is not None:
-                doc.pending_knowledge = drafts_dicts
-                await db.commit()
-    except Exception as exc:
-        logger.warning("persist pending_knowledge failed: %s", exc)
+            st = (await db.execute(
+                select(ClarificationState).where(ClarificationState.session_id == session_id)
+            )).scalar_one_or_none()
+            if st is None:
+                return empty
+            prd_doc = None
+            mm_doc = None
+            if st.document_id is not None:
+                prd_doc = (await db.execute(
+                    select(Document).where(Document.id == st.document_id, Document.project_id == project_id)
+                )).scalar_one_or_none()
+            if st.mindmap_document_id is not None:
+                mm_doc = (await db.execute(
+                    select(Document).where(Document.id == st.mindmap_document_id, Document.project_id == project_id)
+                )).scalar_one_or_none()
 
-    return drafts_dicts
+            if prd_doc is None and mm_doc is None:
+                return empty
+
+            primary = prd_doc or mm_doc
+            other = mm_doc if prd_doc is not None else None  # 仅当 PRD 为主、脑图为副时才需清空副本
+            primary_role = "prd" if prd_doc is not None else "mindmap"
+            module_id = (prd_doc.module_id if prd_doc else None) or (mm_doc.module_id if mm_doc else None)
+            module_name: str | None = None
+            if module_id:
+                mod = (await db.execute(
+                    select(Module).where(Module.id == module_id, Module.project_id == project_id)
+                )).scalar_one_or_none()
+                module_name = mod.name if mod else None
+
+            prd_text = (prd_doc.raw_text or "") if prd_doc else ""
+            mm_text = (mm_doc.raw_text or "") if mm_doc else ""
+            primary_id = primary.id
+            other_id = other.id if other is not None else None
+
+        # LLM 合并抽取（一次调用）
+        try:
+            drafts_objs = await extract_knowledge(
+                truncate_for_llm(prd_text) if prd_text else "",
+                module_name=module_name,
+                mindmap_content=truncate_for_llm(mm_text) if mm_text else None,
+            )
+        except Exception as exc:
+            logger.warning("combined knowledge extraction failed (treated as empty): %s", exc)
+            drafts_objs = []
+
+        drafts_dicts = await _drafts_to_dicts_with_conflicts(
+            drafts_objs, project_id=project_id, module_id=module_id,
+        )
+        # 草稿写主文档；清空副文档（避免刷新恢复时又冒出第二个面板）
+        await _stash_pending(primary_id, drafts_dicts)
+        if other_id is not None:
+            await _stash_pending(other_id, [])
+
+        logger.info(
+            "combined extract | session=%d primary_doc=%d role=%s drafts=%d (prd=%s mindmap=%s) %.0fms",
+            session_id, primary_id, primary_role, len(drafts_dicts),
+            prd_doc is not None, mm_doc is not None,
+            (time.perf_counter() - t0) * 1000,
+        )
+        return {
+            "document_id": primary_id,
+            "module_id": module_id,
+            "module_name": module_name,
+            "role": primary_role,
+            "drafts": drafts_dicts,
+        }
+    except Exception as exc:
+        logger.warning(
+            "combined extract failed (session=%d) after %.0fms (%s): %s",
+            session_id, (time.perf_counter() - t0) * 1000, type(exc).__name__, exc,
+        )
+        return empty
 
 
 async def _extract_and_store_knowledge_bg(
@@ -589,6 +778,34 @@ def _build_upload_done_content(filename: str, stats: dict, clarification: dict, 
     return head + body
 
 
+def _build_staged_content(
+    filename: str, stats: dict | None, *, role: str = "prd",
+    source: str = "file", cached: bool = False,
+) -> str:
+    """文档「暂存」完成后的系统气泡。
+
+    新流程下，上传只把文档解析入库、不跑任何大模型；这条气泡告诉用户资料已就绪，
+    可继续补充其它资料，准备齐后点「开始生成」再进入模块归类 / 知识 / 澄清流程。
+    """
+    label = "测试脑图" if role == "mindmap" else "需求文档"
+    if cached:
+        verb = "命中缓存，复用" + ("测试脑图" if role == "mindmap" else "文档")
+    elif source == "lark":
+        verb = "已从飞书导入"
+    else:
+        verb = "已上传"
+    len_txt = ""
+    if stats:
+        if role == "mindmap":
+            len_txt = f"（{stats.get('chunks', 0)} 个节点 / {stats.get('raw_text_length', 0)} 字）"
+        else:
+            len_txt = f"（{stats.get('chunks', 0)} 段 / {stats.get('tables', 0)} 表 / {stats.get('raw_text_length', 0)} 字）"
+    return (
+        f"{verb}{label}《{filename}》{len_txt}。\n\n"
+        "可继续上传其它资料（PRD / 测试脑图 / 飞书链接），准备好后点「开始生成」进入下一步。"
+    )
+
+
 def _build_lark_done_content(filename: str, raw_text_len: int, clarification: dict, *, cached: bool = False) -> str:
     summary = clarification.get("summary") or ""
     qcount = len(clarification.get("questions") or [])
@@ -652,7 +869,7 @@ async def upload_document_stream(
             )
             existing = result.scalar_one_or_none()
 
-        if existing and existing.clarification:
+        if existing:
             logger.info(
                 "Upload(stream) cache hit | sha=%s document_id=%d filename=%s",
                 sha256[:12], existing.id, existing.filename,
@@ -664,35 +881,30 @@ async def upload_document_stream(
             }
             yield _sse("stage", {
                 "stage": "cache_hit",
-                "message": f"识别到同一份文档（曾以《{existing.filename}》上传过），复用上次的解析与澄清结果，跳过大模型调用。",
+                "message": f"识别到同一份文档（曾以《{existing.filename}》上传过），复用解析结果，跳过重复解析。",
                 "document_id": existing.id,
                 "stats": stats,
             })
-            clarification = existing.clarification
-            content = _build_upload_done_content(existing.filename, stats, clarification, cached=True)
+            # 新流程：命中缓存也只做「暂存」，不再直接跳到澄清——用户可能还要补脑图，
+            # 知识注入勾选也会不同。真正的模块归类 / 知识 / 澄清由 /pipeline/start/stream 触发。
             await _upsert_clarification_state(
                 session_id, project_id,
                 document_id=existing.id,
-                summary=clarification.get("summary"),
-                module_detected=clarification.get("module_detected"),
-                case_prefix_suggestion=clarification.get("case_prefix_suggestion"),
-                current_round=1,
-                rounds=[],
-                current_questions=clarification.get("questions") or [],
-                ready_to_generate=bool(clarification.get("ready_to_generate")),
-                status="awaiting_answers" if clarification.get("questions") else "generating",
+                status="staged",
             )
             msg = await _write_assistant_message(
-                session_id, content, kind="upload_done",
-                ref={"document_id": existing.id, "cached": True},
+                session_id,
+                _build_staged_content(existing.filename, stats, role="prd", cached=True),
+                kind="upload_staged",
+                ref={"document_id": existing.id, "role": "prd", "cached": True},
             )
             yield _sse("assistant_message", {"message": msg})
-            yield _sse("result", {
+            yield _sse("staged", {
                 "document_id": existing.id,
+                "role": "prd",
                 "filename": existing.filename,
                 "module_id": existing.module_id,
                 "stats": stats,
-                "clarification": clarification,
                 "cached": True,
             })
             yield _sse("done", {})
@@ -723,29 +935,14 @@ async def upload_document_stream(
             },
         })
 
-        # Stage 2: resolve module（用户没选时尝试自动分类）
+        # Stage 2: 仅解析入库（不跑模块自动分类，那属于「开始生成」阶段的第一步）。
+        # 用户在上传时若显式指定了 module_id 则沿用，否则留空待 /pipeline/start/stream 归类。
         module_name: str | None = None
-        auto_module_suggestion: ModuleSuggestion | None = None
-        effective_module_id = module_id
-        if effective_module_id is None:
-            yield _sse("stage", {"stage": "module_classify", "message": "正在分析文档归属模块…"})
-            classified_id, auto_module_suggestion = await _auto_classify_module_if_needed(
-                project_id=project_id,
-                user_module_id=None,
-                raw_text=parsed["raw_text"],
-            )
-            if classified_id is not None:
-                effective_module_id = classified_id
-                logger.info(
-                    "auto-classify hit | document module_id=%s confidence=%.2f",
-                    classified_id,
-                    auto_module_suggestion.confidence if auto_module_suggestion else 0.0,
-                )
         async with AsyncSessionLocal() as db:
-            if effective_module_id:
+            if module_id:
                 result = await db.execute(
                     select(Module).where(
-                        Module.id == effective_module_id,
+                        Module.id == module_id,
                         Module.project_id == project_id,
                     )
                 )
@@ -753,9 +950,8 @@ async def upload_document_stream(
                 module_name = module.name if module else None
 
             ext = filename.rsplit(".", 1)[-1].lower()
-            # 同 (project_id, sha256) 的 Document 可能已存在（此前上传崩在澄清前、或
-            # 成功过但方案B下 Document.clarification 为空、上面 cache_hit 未命中）。
-            # 无条件 INSERT 会撞唯一约束 uq_documents_project_sha —— 已存在就复用并刷新。
+            # 同 (project_id, sha256) 的 Document 可能已存在（上面 cache_hit 未命中 existing
+            # 为 None 时才到这，但仍防御竞态）——已存在就复用并刷新，避免撞唯一约束。
             existing_doc = (await db.execute(
                 select(Document).where(
                     Document.sha256 == sha256, Document.project_id == project_id
@@ -764,8 +960,8 @@ async def upload_document_stream(
             if existing_doc is not None:
                 doc_record = existing_doc
                 doc_record.filename = filename
-                if effective_module_id is not None:
-                    doc_record.module_id = effective_module_id
+                if module_id is not None:
+                    doc_record.module_id = module_id
                 doc_record.file_type = ext
                 doc_record.parsed_content = parsed["chunks"]
                 doc_record.raw_text = parsed["raw_text"]
@@ -774,7 +970,7 @@ async def upload_document_stream(
                     project_id=project_id,
                     filename=filename,
                     sha256=sha256,
-                    module_id=effective_module_id,
+                    module_id=module_id,
                     file_type=ext,
                     parsed_content=parsed["chunks"],
                     raw_text=parsed["raw_text"],
@@ -783,69 +979,34 @@ async def upload_document_stream(
             await db.commit()
             await db.refresh(doc_record)
             document_id = doc_record.id
-        # 自动归类成功 → 推 SSE 让前端 chip 跟着切；中等置信度也推（前端弹"建议归类到 XX"）
-        if auto_module_suggestion is not None:
-            async for ev in _emit_module_classification(
-                session_id, document_id,
-                applied_module_id=effective_module_id,
-                module_name=module_name,
-                suggestion=auto_module_suggestion,
-            ):
-                yield ev
-        # 下游统一用 effective_module_id（包含自动归类结果）；不要再重新赋值 module_id，
-        # 否则在 events() 闭包里 module_id 会被 Python 视作 local 变量 → 上面 effective_module_id = module_id 触发 UnboundLocalError
         logger.info("Document persisted(stream) | document_id=%d", document_id)
         yield _sse("stage", {"stage": "persisted", "document_id": document_id, "message": "文档已入库"})
 
-        # B 方案：在跑 Clarifier 之前停下来，让用户先确认要注入到澄清提示词里的知识库条目。
-        # 这里只算预览（不写 Document.clarification、不调 LLM），把候选条目通过 SSE 推给前端。
-        # 真正的 Clarifier 由前端在 /api/clarify/initial/stream 触发，带上用户勾选的 ids。
+        # 新流程：上传只暂存文档，不跑模块分类 / 知识检索 / 知识抽取 / 澄清。
+        # 用户备齐资料后点「开始生成」→ POST /pipeline/start/stream 统一触发下游流程。
         stats = {
             "chunks": len(parsed["chunks"]),
             "tables": len(parsed["tables"]),
             "raw_text_length": len(parsed["raw_text"]),
         }
-
-        # 步骤顺序：模块归类（上面已发）→ 产品知识草稿抽取 → 知识库预览（注入 + 开始澄清）。
-        # 先同步抽取草稿并停在审核闸门，再算知识预览——保证前端"模块→知识草稿→开始澄清"的推进顺序。
-        yield _sse("stage", {"stage": "knowledge_extract", "message": "正在抽取可沉淀的产品知识…"})
-        drafts = await _extract_and_stash_pending(
-            document_id=document_id,
-            raw_text=parsed["raw_text"],
-            module_name=module_name,
-            project_id=project_id,
-            module_id=effective_module_id,
-        )
-        yield _sse("extracted_knowledge_drafts", {
-            "document_id": document_id,
-            "module_id": effective_module_id,
-            "module_name": module_name,
-            "role": "prd",
-            "drafts": drafts,
-        })
-
-        yield _sse("stage", {"stage": "knowledge_lookup", "message": "正在检索项目知识库相关条目…"})
-        knowledge_hits = await _compute_knowledge_preview(
-            project_id=project_id, module_id=effective_module_id, document_id=document_id,
-            raw_text=parsed["raw_text"],
-        )
         await _upsert_clarification_state(
             session_id, project_id,
             document_id=document_id,
-            module_detected=module_name,
-            current_round=1,
-            rounds=[],
-            current_questions=[],
-            ready_to_generate=False,
-            status="awaiting_clarification",
+            status="staged",
         )
-        yield _sse("knowledge_preview", {
+        msg = await _write_assistant_message(
+            session_id,
+            _build_staged_content(filename, stats, role="prd"),
+            kind="upload_staged",
+            ref={"document_id": document_id, "role": "prd"},
+        )
+        yield _sse("assistant_message", {"message": msg})
+        yield _sse("staged", {
             "document_id": document_id,
-            "module_id": effective_module_id,
+            "role": "prd",
             "filename": filename,
+            "module_id": module_id,
             "stats": stats,
-            "module_name": module_name,
-            "hits": knowledge_hits,
         })
         yield _sse("done", {})
 
@@ -966,9 +1127,9 @@ async def upload_lark_stream(
             )
             existing = result.scalar_one_or_none()
 
-        if existing and (is_mindmap_role or existing.clarification):
-            # PRD 路径要求 existing.clarification 非空（保持原行为，复用澄清缓存）
-            # 脑图路径不需要 clarification 缓存，命中即复用 Document 行
+        if existing:
+            # 新流程：无论 PRD 还是脑图，命中缓存都只做「暂存」（复用已解析的 Document 行），
+            # 不再直接跳澄清；模块归类 / 知识 / 澄清统一由 /pipeline/start/stream 触发。
             stats = {
                 "chunks": len(existing.parsed_content or []),
                 "tables": 0,
@@ -977,7 +1138,7 @@ async def upload_lark_stream(
             cache_hit_msg = (
                 f"识别到同一份脑图（曾以《{existing.filename}》导入过），复用解析结果。"
                 if is_mindmap_role else
-                f"识别到同一份文档（曾以《{existing.filename}》导入过），复用上次的解析与澄清结果，跳过大模型调用。"
+                f"识别到同一份文档（曾以《{existing.filename}》导入过），复用解析结果，跳过重复抓取。"
             )
             yield _sse("stage", {
                 "stage": "cache_hit",
@@ -985,78 +1146,44 @@ async def upload_lark_stream(
                 "document_id": existing.id,
                 "stats": stats,
             })
+            role_label = "mindmap" if is_mindmap_role else "prd"
             if is_mindmap_role:
-                # 脑图缓存命中：只 upsert mindmap_document_id，不动 PRD slot / 澄清状态
+                # 脑图：只 upsert mindmap_document_id，不动 PRD slot
                 await _upsert_clarification_state(
                     session_id, project_id,
                     mindmap_document_id=existing.id,
+                    status="staged",
                 )
-                msg = await _write_assistant_message(
-                    session_id, _build_mindmap_done_content(existing.filename, stats),
-                    kind="mindmap_done",
-                    ref={
-                        "document_id": existing.id, "url": url[:200],
-                        "cached": True, "role": "mindmap", "source": "lark",
-                    },
+            else:
+                await _upsert_clarification_state(
+                    session_id, project_id,
+                    document_id=existing.id,
+                    status="staged",
                 )
-                yield _sse("assistant_message", {"message": msg})
-                yield _sse("knowledge_preview", {
-                    "document_id": existing.id,
-                    "module_id": existing.module_id,
-                    "filename": existing.filename,
-                    "stats": stats,
-                    "module_name": None,
-                    "hits": [],
-                    "role": "mindmap",
-                    "source": "lark",
-                    "url": url[:200],
-                    "cached": True,
-                })
-                yield _sse("done", {})
-                return
-            clarification = existing.clarification
-            await _upsert_clarification_state(
-                session_id, project_id,
-                document_id=existing.id,
-                summary=clarification.get("summary"),
-                module_detected=clarification.get("module_detected"),
-                case_prefix_suggestion=clarification.get("case_prefix_suggestion"),
-                current_round=1,
-                rounds=[],
-                current_questions=clarification.get("questions") or [],
-                ready_to_generate=bool(clarification.get("ready_to_generate")),
-                status="awaiting_answers" if clarification.get("questions") else "generating",
-            )
             msg = await _write_assistant_message(
                 session_id,
-                _build_lark_done_content(existing.filename, len(existing.raw_text or ""), clarification, cached=True),
-                kind="lark_done",
-                ref={"document_id": existing.id, "url": url[:200], "cached": True},
+                _build_staged_content(existing.filename, stats, role=role_label, source="lark", cached=True),
+                kind="mindmap_staged" if is_mindmap_role else "upload_staged",
+                ref={
+                    "document_id": existing.id, "url": url[:200],
+                    "cached": True, "role": role_label, "source": "lark",
+                },
             )
             yield _sse("assistant_message", {"message": msg})
-            yield _sse("result", {
+            yield _sse("staged", {
                 "document_id": existing.id,
+                "role": role_label,
                 "filename": existing.filename,
                 "module_id": existing.module_id,
                 "stats": stats,
-                "clarification": clarification,
+                "source": "lark",
+                "url": url[:200],
                 "cached": True,
             })
             yield _sse("done", {})
             return
 
-        # Stage 4: persist Document（source_type=lark）
-        # 用户没指定 module 时尝试自动归类（脑图 raw_text 和 PRD 同样是有效信号）
-        auto_module_suggestion: ModuleSuggestion | None = None
-        if module_id is None:
-            yield _sse("stage", {"stage": "module_classify", "message": "正在分析文档归属模块…"})
-            classified_id, auto_module_suggestion = await _auto_classify_module_if_needed(
-                project_id=project_id,
-                user_module_id=None,
-                raw_text=raw_text,
-            )
-            if classified_id is not None:
-                module_id = classified_id
+        # Stage 4: persist Document（source_type=lark）——只暂存，不做模块自动分类
         async with AsyncSessionLocal() as db:
             module_name: str | None = None
             if module_id:
@@ -1066,9 +1193,7 @@ async def upload_lark_stream(
                 module = result.scalar_one_or_none()
                 module_name = module.name if module else None
 
-            # 同 (project_id, sha256) 的 Document 可能已存在——比如此前导入跑到一半
-            # 崩了、或成功过但未走 clarification 缓存分支（方案B下 PRD 澄清在独立端点
-            # 完成，Document.clarification 常为空，上面的 cache_hit 判断对 PRD 基本不命中）。
+            # 同 (project_id, sha256) 的 Document 可能已存在——比如此前导入跑到一半崩了。
             # 若仍无条件 INSERT 会撞唯一约束 uq_documents_project_sha。这里改为：已存在
             # 就复用该行（刷新可变字段），不存在才新建。
             existing_doc = (await db.execute(
@@ -1157,89 +1282,38 @@ async def upload_lark_stream(
             "Lark document persisted | document_id=%d title=%s role=%s",
             document_id, title[:60], role,
         )
-        if auto_module_suggestion is not None:
-            async for ev in _emit_module_classification(
-                session_id, document_id,
-                applied_module_id=module_id,
-                module_name=module_name,
-                suggestion=auto_module_suggestion,
-            ):
-                yield ev
         yield _sse("stage", {"stage": "persisted", "document_id": document_id, "message": "文档已入库"})
 
-        # 步骤顺序：模块归类（上面已发）→ 产品知识草稿抽取 → 知识库预览。
-        # 先同步抽取草稿并停在审核闸门，再算知识预览——与本地上传保持一致的推进顺序。
-        yield _sse("stage", {"stage": "knowledge_extract", "message": "正在抽取可沉淀的产品知识…"})
-        drafts = await _extract_and_stash_pending(
-            document_id=document_id,
-            raw_text=doc_record.raw_text or "",
-            module_name=module_name,
-            project_id=project_id,
-            module_id=module_id,
-        )
-        yield _sse("extracted_knowledge_drafts", {
-            "document_id": document_id,
-            "module_id": module_id,
-            "module_name": module_name,
-            "role": "mindmap" if is_mindmap_role else "prd",
-            "source": "lark",
-            "drafts": drafts,
-        })
-
-        # 知识库预览 + 状态写库 + 系统气泡
-        yield _sse("stage", {"stage": "knowledge_lookup", "message": "正在检索项目知识库相关条目…"})
-        knowledge_hits = await _compute_knowledge_preview(
-            project_id=project_id, module_id=module_id, document_id=document_id,
-            raw_text=doc_record.raw_text or "",
-        )
-
+        # 新流程：飞书导入也只暂存，不跑模块分类 / 知识检索 / 抽取。
+        role_label = "mindmap" if is_mindmap_role else "prd"
         if is_mindmap_role:
-            # 脑图：只 upsert mindmap_document_id，不动 PRD slot / 澄清状态（与本地 .md 上传一致）
             await _upsert_clarification_state(
                 session_id, project_id,
                 mindmap_document_id=document_id,
+                status="staged",
             )
-            msg = await _write_assistant_message(
-                session_id, _build_mindmap_done_content(title, stats),
-                kind="mindmap_done",
-                ref={
-                    "document_id": document_id, "url": url[:200],
-                    "role": "mindmap", "source": "lark",
-                },
+        else:
+            await _upsert_clarification_state(
+                session_id, project_id,
+                document_id=document_id,
+                status="staged",
             )
-            yield _sse("assistant_message", {"message": msg})
-            yield _sse("knowledge_preview", {
-                "document_id": document_id,
-                "module_id": module_id,
-                "filename": title,
-                "stats": stats,
-                "module_name": module_name,
-                "hits": knowledge_hits,
-                "role": "mindmap",
-                "source": "lark",
-                "url": url[:200],
-            })
-            yield _sse("done", {})
-            return
-
-        # PRD 路径（原行为）：B 方案先停在预览阶段，由前端确认后再调 /clarify/initial/stream
-        await _upsert_clarification_state(
-            session_id, project_id,
-            document_id=document_id,
-            module_detected=module_name,
-            current_round=1,
-            rounds=[],
-            current_questions=[],
-            ready_to_generate=False,
-            status="awaiting_clarification",
+        msg = await _write_assistant_message(
+            session_id,
+            _build_staged_content(title, stats, role=role_label, source="lark"),
+            kind="mindmap_staged" if is_mindmap_role else "upload_staged",
+            ref={
+                "document_id": document_id, "url": url[:200],
+                "role": role_label, "source": "lark",
+            },
         )
-        yield _sse("knowledge_preview", {
+        yield _sse("assistant_message", {"message": msg})
+        yield _sse("staged", {
             "document_id": document_id,
-            "module_id": module_id,
+            "role": role_label,
             "filename": title,
+            "module_id": module_id,
             "stats": stats,
-            "module_name": module_name,
-            "hits": knowledge_hits,
             "source": "lark",
             "url": url[:200],
         })
@@ -1384,21 +1458,21 @@ async def upload_mindmap_stream(
             await _upsert_clarification_state(
                 session_id, project_id,
                 mindmap_document_id=existing.id,
+                status="staged",
             )
             msg = await _write_assistant_message(
-                session_id, _build_mindmap_done_content(existing.filename, stats),
-                kind="mindmap_done",
+                session_id,
+                _build_staged_content(existing.filename, stats, role="mindmap", cached=True),
+                kind="mindmap_staged",
                 ref={"document_id": existing.id, "cached": True, "role": "mindmap"},
             )
             yield _sse("assistant_message", {"message": msg})
-            yield _sse("knowledge_preview", {
+            yield _sse("staged", {
                 "document_id": existing.id,
-                "module_id": existing.module_id,
-                "filename": existing.filename,
-                "stats": stats,
-                "module_name": None,
-                "hits": [],
                 "role": "mindmap",
+                "filename": existing.filename,
+                "module_id": existing.module_id,
+                "stats": stats,
                 "cached": True,
             })
             yield _sse("done", {})
@@ -1430,17 +1504,7 @@ async def upload_mindmap_stream(
             "stats": stats,
         })
 
-        # Stage 2: persist Document(role="mindmap")（用户没指定模块时尝试自动归类）
-        auto_module_suggestion: ModuleSuggestion | None = None
-        if module_id is None:
-            yield _sse("stage", {"stage": "module_classify", "message": "正在分析脑图归属模块…"})
-            classified_id, auto_module_suggestion = await _auto_classify_module_if_needed(
-                project_id=project_id,
-                user_module_id=None,
-                raw_text=parsed["raw_text"],
-            )
-            if classified_id is not None:
-                module_id = classified_id
+        # Stage 2: persist Document(role="mindmap")（不做模块自动分类，留给「开始生成」阶段）
         async with AsyncSessionLocal() as db:
             module_name: str | None = None
             if module_id:
@@ -1481,59 +1545,209 @@ async def upload_mindmap_stream(
             await db.commit()
             await db.refresh(doc_record)
             document_id = doc_record.id
+        yield _sse("stage", {"stage": "persisted", "document_id": document_id, "message": "脑图已入库"})
+
+        # 新流程：脑图上传也只暂存，不跑模块分类 / 知识检索 / 抽取。
+        await _upsert_clarification_state(
+            session_id, project_id,
+            mindmap_document_id=document_id,
+            status="staged",
+        )
+        msg = await _write_assistant_message(
+            session_id,
+            _build_staged_content(filename, stats, role="mindmap"),
+            kind="mindmap_staged",
+            ref={"document_id": document_id, "role": "mindmap"},
+        )
+        yield _sse("assistant_message", {"message": msg})
+        yield _sse("staged", {
+            "document_id": document_id,
+            "role": "mindmap",
+            "filename": filename,
+            "module_id": module_id,
+            "stats": stats,
+        })
+        yield _sse("done", {})
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
+    )
+
+
+class ExtractCombinedRequest(BaseModel):
+    session_id: int
+
+
+@router.post("/documents/extract_combined_drafts")
+async def extract_combined_drafts(
+    req: ExtractCombinedRequest,
+    project_id: int = Depends(require_project),
+    _user: User = Depends(get_current_user),
+):
+    """上传完成后触发的「PRD + 脑图」合并知识抽取（脑图优先）。
+
+    读本会话 ClarificationState 里的 PRD / 脑图文档，合并成一次 LLM 抽取，产物 stash
+    到主文档（有 PRD 就是 PRD，否则脑图）并清空副文档的 pending_knowledge，返回草稿。
+    前端据 role 把草稿落到对应审核面板（只出一个）。fail-open：异常返回空 drafts。
+    """
+    if not await _verify_session(req.session_id, project_id):
+        raise HTTPException(status_code=404, detail="Session not found")
+    return await _extract_combined_and_stash(req.session_id, project_id)
+
+
+class PipelineStartRequest(BaseModel):
+    session_id: int
+    # 用户在「开始生成」时可显式指定模块；给了就跳过自动分类。
+    module_id: int | None = None
+
+
+@router.post("/pipeline/start/stream")
+async def pipeline_start_stream(
+    req: PipelineStartRequest,
+    project_id: int = Depends(require_project),
+    _user: User = Depends(get_current_user),
+):
+    """「开始生成」闸门：把本会话已暂存（status="staged"）的 PRD / 脑图推进到下游流程第一步。
+
+    上传端点如今只解析入库、不跑任何大模型。用户备齐资料后点「开始生成」调它，
+    这里才做上传流曾经内联的两件事——顺序与旧 /upload/stream 末段一致：
+      1) 模块自动分类（用户未显式指定模块时）→ module_auto_classified 帧 + 系统气泡
+      2) 知识库检索预览 → knowledge_preview 帧
+    随后把 status 置为 awaiting_clarification，前端据此弹「模块确认卡 / 知识审核 / 澄清」。
+    真正的 Clarifier 仍由前端在 /clarify/initial/stream 触发。
+    """
+    session_id = req.session_id
+    if not await _verify_session(session_id, project_id):
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    # 读取本会话暂存的 PRD / 脑图文档
+    async with AsyncSessionLocal() as db:
+        st = (await db.execute(
+            select(ClarificationState).where(ClarificationState.session_id == session_id)
+        )).scalar_one_or_none()
+        if st is None or (st.document_id is None and st.mindmap_document_id is None):
+            raise HTTPException(status_code=400, detail="请先上传至少一份需求文档或测试脑图。")
+        prd_doc: Document | None = None
+        mm_doc: Document | None = None
+        if st.document_id is not None:
+            prd_doc = (await db.execute(
+                select(Document).where(Document.id == st.document_id, Document.project_id == project_id)
+            )).scalar_one_or_none()
+        if st.mindmap_document_id is not None:
+            mm_doc = (await db.execute(
+                select(Document).where(Document.id == st.mindmap_document_id, Document.project_id == project_id)
+            )).scalar_one_or_none()
+
+    document_id = prd_doc.id if prd_doc else None
+    mindmap_document_id = mm_doc.id if mm_doc else None
+    if document_id is None and mindmap_document_id is None:
+        raise HTTPException(status_code=400, detail="暂存的文档已失效，请重新上传。")
+
+    # 模块分类 / 知识检索的文本源：优先脑图原文（更贴近"要测什么"），回退 PRD。
+    user_module_id = req.module_id
+    prd_raw_text = (prd_doc.raw_text or "") if prd_doc else ""
+    mm_raw_text = (mm_doc.raw_text or "") if mm_doc else ""
+    classify_src = mm_raw_text or prd_raw_text
+    # 归类落库对象：有 PRD 就落 PRD，否则落脑图（与 combined 抽取的"主文档"口径一致）。
+    primary_doc_id = document_id or mindmap_document_id
+
+    async def _events_inner():
+        # Stage 1: 模块自动分类（用户未显式指定模块时）
+        module_id = user_module_id
+        module_name: str | None = None
+        auto_module_suggestion: ModuleSuggestion | None = None
+        if module_id is None:
+            yield _sse("stage", {"stage": "module_classify", "message": "正在分析文档归属模块…"})
+            classified_id, auto_module_suggestion = await _auto_classify_module_if_needed(
+                project_id=project_id,
+                user_module_id=None,
+                raw_text=classify_src,
+            )
+            if classified_id is not None:
+                module_id = classified_id
+
+        # 把归类结果落到主文档，并解析模块名
+        async with AsyncSessionLocal() as db:
+            if module_id:
+                mr = await db.execute(
+                    select(Module).where(Module.id == module_id, Module.project_id == project_id)
+                )
+                module = mr.scalar_one_or_none()
+                module_name = module.name if module else None
+                # 高置信自动命中 → 把主文档归入该模块（用户可在确认卡里改）
+                if auto_module_suggestion is not None and auto_module_suggestion.is_high_confidence:
+                    doc = (await db.execute(
+                        select(Document).where(Document.id == primary_doc_id)
+                    )).scalar_one_or_none()
+                    if doc is not None:
+                        doc.module_id = module_id
+                        await db.commit()
+
         if auto_module_suggestion is not None:
             async for ev in _emit_module_classification(
-                session_id, document_id,
+                session_id, primary_doc_id,
                 applied_module_id=module_id,
                 module_name=module_name,
                 suggestion=auto_module_suggestion,
             ):
                 yield ev
-        yield _sse("stage", {"stage": "persisted", "document_id": document_id, "message": "脑图已入库"})
 
-        # 步骤顺序：模块归类（上面已发）→ 产品知识草稿抽取 → 知识库预览（与 /upload/stream 一致）
-        yield _sse("stage", {"stage": "knowledge_extract", "message": "正在抽取可沉淀的产品知识…"})
-        drafts = await _extract_and_stash_pending(
-            document_id=document_id,
-            raw_text=parsed["raw_text"],
-            module_name=module_name,
-            project_id=project_id,
-            module_id=module_id,
-        )
-        yield _sse("extracted_knowledge_drafts", {
-            "document_id": document_id,
-            "module_id": module_id,
-            "module_name": module_name,
-            "role": "mindmap",
-            "drafts": drafts,
-        })
-
-        # Stage 3: 知识库预览 + 状态写库 + 系统气泡（与 /upload/stream 同节奏）
+        # Stage 2: 知识库检索预览（同文档排除，防自反馈污染）
         yield _sse("stage", {"stage": "knowledge_lookup", "message": "正在检索项目知识库相关条目…"})
         knowledge_hits = await _compute_knowledge_preview(
-            project_id=project_id, module_id=module_id, document_id=document_id,
-            raw_text=parsed["raw_text"],
+            project_id=project_id, module_id=module_id, document_id=primary_doc_id,
+            raw_text=classify_src,
         )
+
         await _upsert_clarification_state(
             session_id, project_id,
-            mindmap_document_id=document_id,
+            document_id=document_id,
+            mindmap_document_id=mindmap_document_id,
+            module_detected=module_name,
+            current_round=1,
+            rounds=[],
+            current_questions=[],
+            ready_to_generate=False,
+            status="awaiting_clarification",
         )
-        msg = await _write_assistant_message(
-            session_id, _build_mindmap_done_content(filename, stats),
-            kind="mindmap_done",
-            ref={"document_id": document_id, "role": "mindmap"},
-        )
-        yield _sse("assistant_message", {"message": msg})
         yield _sse("knowledge_preview", {
             "document_id": document_id,
+            "mindmap_document_id": mindmap_document_id,
             "module_id": module_id,
-            "filename": filename,
-            "stats": stats,
+            "filename": (prd_doc.filename if prd_doc else (mm_doc.filename if mm_doc else "")),
+            "stats": {
+                "chunks": len((prd_doc or mm_doc).parsed_content or []),
+                "tables": 0,
+                "raw_text_length": len(classify_src),
+            },
             "module_name": module_name,
             "hits": knowledge_hits,
-            "role": "mindmap",
         })
         yield _sse("done", {})
+
+    async def events():
+        # 顶层兜底：分类 / 检索 / DB 任一抛错都转成 error + done 帧，避免 chunked 流被掐断。
+        try:
+            async for ev in _events_inner():
+                yield ev
+        except Exception as exc:
+            logger.exception("Pipeline start stream crashed | session=%s", session_id)
+            try:
+                await _upsert_clarification_state(session_id, project_id, status="error")
+            except Exception:
+                pass
+            try:
+                msg = await _write_assistant_message(
+                    session_id, f"❌ 启动生成流程失败：{exc}", kind="pipeline_error",
+                    ref={"session_id": session_id},
+                )
+                yield _sse("assistant_message", {"message": msg})
+            except Exception:
+                pass
+            yield _sse("error", {"message": str(exc)})
+            yield _sse("done", {})
 
     return StreamingResponse(
         events(),

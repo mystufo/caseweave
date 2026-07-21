@@ -11,6 +11,7 @@ interface Props {
   maxRounds?: number
   lockedModuleName?: string  // when present (round > 1), module input is hidden
   lockedCasePrefix?: string  // when present (round > 1), prefix input is hidden
+  hideCasePrefix?: boolean   // 脑图模式：用例编号前缀无意义，隐藏该输入并从就绪校验中剔除
   confirmLabel?: string  // e.g. "继续澄清" vs "生成测试用例"
   onConfirm: (answers: Record<string, string>, moduleName: string, casePrefix: string) => void
 }
@@ -31,7 +32,7 @@ type ChoiceState = { selected: string | null; custom: string }
 
 export default function ClarificationPanel({
   questions, summary, suggestedModule, suggestedPrefix,
-  round, maxRounds, lockedModuleName, lockedCasePrefix, confirmLabel,
+  round, maxRounds, lockedModuleName, lockedCasePrefix, hideCasePrefix, confirmLabel,
   onConfirm,
 }: Props) {
   const [choices, setChoices] = useState<Record<string, ChoiceState>>({})
@@ -48,12 +49,14 @@ export default function ClarificationPanel({
     questions.map(q => [String(q.id), resolveAnswer(String(q.id))]),
   )
 
-  const isFollowup = !!lockedModuleName && !!lockedCasePrefix
+  // 续答轮：模块/前缀已锁定，改用紧凑信息条。脑图模式无前缀，仅凭已锁定模块名判定。
+  const isFollowup = hideCasePrefix ? !!lockedModuleName : (!!lockedModuleName && !!lockedCasePrefix)
 
   const allAnswered = questions.every(q => answers[String(q.id)])
   const trimmedModule = moduleName.trim()
   const moduleReady = trimmedModule.length > 0 && CHINESE_ONLY_RE.test(trimmedModule)
-  const prefixReady = PREFIX_RE.test(casePrefix)
+  // 脑图模式隐藏前缀 → 就绪校验不看前缀
+  const prefixReady = hideCasePrefix ? true : PREFIX_RE.test(casePrefix)
   const ready = allAnswered && moduleReady && prefixReady
 
   return (
@@ -104,7 +107,7 @@ export default function ClarificationPanel({
         </div>
       )}
 
-      {!isFollowup && (
+      {!isFollowup && !hideCasePrefix && (
         <div className="bg-white rounded-lg p-3 border border-amber-100 space-y-2">
           <div className="flex items-center gap-1.5 text-xs font-medium text-amber-800">
             <Hash size={14} />
@@ -143,13 +146,15 @@ export default function ClarificationPanel({
       {isFollowup && (
         <div className="bg-white rounded-lg p-3 border border-amber-100 text-xs text-gray-600 flex flex-wrap gap-x-4 gap-y-1">
           <span>模块：<span className="text-gray-800 font-medium">{lockedModuleName}</span></span>
-          <span>前缀：<span className="font-mono text-gray-800">{lockedCasePrefix}-</span></span>
+          {!hideCasePrefix && lockedCasePrefix && (
+            <span>前缀：<span className="font-mono text-gray-800">{lockedCasePrefix}-</span></span>
+          )}
         </div>
       )}
 
       <div className="space-y-3">
         <p className="text-xs font-medium text-amber-800">
-          在生成测试用例前，请确认以下 {questions.length} 个问题（点选候选答案，或选「自定义」自行输入）：
+          在{hideCasePrefix ? '生成测试脑图' : '生成测试用例'}前，请确认以下 {questions.length} 个问题（点选候选答案，或选「自定义」自行输入）：
         </p>
         {questions.map(q => {
           const qid = String(q.id)
@@ -251,7 +256,9 @@ export default function ClarificationPanel({
             ? '请填写有效的用例编号前缀'
             : !allAnswered
               ? '请回答全部澄清问题'
-              : (confirmLabel || `确认，按「${trimmedModule}」/ ${casePrefix}- 生成测试用例`)}
+              : (confirmLabel || (hideCasePrefix
+                  ? `确认，按「${trimmedModule}」生成测试脑图`
+                  : `确认，按「${trimmedModule}」/ ${casePrefix}- 生成测试用例`))}
       </button>
     </div>
   )

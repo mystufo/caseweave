@@ -12,6 +12,9 @@ class Session(Base):
     user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
     title = Column(String(255), nullable=False, default="New Session")
     module_id = Column(Integer, ForeignKey("modules.id", ondelete="SET NULL"), nullable=True)
+    # 会话用途：cases=生成测试用例（默认，可传 PRD/脑图）；mindmap=从需求文档生成测试脑图存飞书。
+    # 新建会话时在对话页顶层选定，固定不变；老会话无值默认 cases，行为不变。
+    mode = Column(String(16), nullable=False, server_default="cases")
     status = Column(String(20), default="active")  # active / completed / archived
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())

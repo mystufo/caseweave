@@ -728,6 +728,9 @@ class AcceptedDraftIn(BaseModel):
     content: str
     source: str | None = "document"
     confidence: float | None = 0.6
+    # 用户选择"保留新的（替换旧条目）"时，这里带上被替代的已有条目 id 列表；
+    # 入库该草稿的同时会硬删除这些旧条目。空/None = 不替换任何旧条目。
+    supersedes_entry_ids: list[int] | None = None
 
 
 class ConfirmPendingKnowledgeRequest(BaseModel):
@@ -782,7 +785,9 @@ async def confirm_pending_knowledge(
         target_module_id = body.module_id
         doc.module_id = target_module_id
 
-    # 优先使用前端编辑过的 accepted_drafts；否则按 indices 从原 pending 取
+    # 优先使用前端编辑过的 accepted_drafts；否则按 indices 从原 pending 取。
+    # supersedes_ids 收集所有草稿选择"替换"掉的旧条目 id（仅 accepted_drafts 路径可带）。
+    supersedes_ids: set[int] = set()
     if body.accepted_drafts is not None:
         selected_raw: list[dict] = [
             {
@@ -793,6 +798,10 @@ async def confirm_pending_knowledge(
             }
             for d in body.accepted_drafts
         ]
+        for d in body.accepted_drafts:
+            for eid in (d.supersedes_entry_ids or []):
+                if isinstance(eid, int):
+                    supersedes_ids.add(eid)
     elif body.accepted_indices is None:
         selected_raw = list(pending)
     else:
@@ -817,6 +826,13 @@ async def confirm_pending_knowledge(
             confidence=max(0.1, min(0.95, conf)),
         ))
 
+    # 先删被替代的旧条目（"保留新的"）：逐个校验归属本项目后硬删，与写入同一事务提交。
+    superseded = 0
+    for eid in supersedes_ids:
+        entry = await _load_entry_scoped(eid, project_id, db)
+        await db.delete(entry)
+        superseded += 1
+
     stored = 0
     if drafts:
         stored = await store_entries(
@@ -827,7 +843,10 @@ async def confirm_pending_knowledge(
     # 清空 pending，标记已审核
     doc.pending_knowledge = None
     await db.commit()
-    return {"document_id": doc.id, "stored": stored, "settled": True, "module_id": target_module_id}
+    return {
+        "document_id": doc.id, "stored": stored, "superseded": superseded,
+        "settled": True, "module_id": target_module_id,
+    }
 
 
 # ── Skills ────────────────────────────────────────────────────────────────────
@@ -1079,10 +1098,30 @@ async def regenerate_skill(
     )).scalars().all()
     knowledge_entries = [c for c in ke_rows if c]
 
+    auto_name = f"auto_module_{body.module_id}"
+    existing = (await db.execute(
+        select(Skill).where(Skill.module_id == body.module_id, Skill.name == auto_name)
+    )).scalar_one_or_none()
+
+    # 短路：没有任何待消费的新反馈、且已存在自动 Skill —— 无新信号，跳过重复归纳（省一次 LLM）
+    if not consumed_feedback_ids and existing is not None:
+        logger.info(
+            "skill regenerate skipped | module=%s no new feedback (existing skill_id=%d)",
+            module.name, existing.id,
+        )
+        return {
+            "created": False,
+            "reason": "无新反馈，跳过重复归纳",
+            "feedback_count": 0,
+            "knowledge_count": len(knowledge_entries),
+        }
+
+    # 有旧 Skill 时进入增量合并模式：在旧备忘单基础上并入新信号，而非整篇覆盖
     skill_md = await generate_skill_for_module(
         module_name=module.name,
         feedback_samples=feedback_samples,
         knowledge_entries=knowledge_entries,
+        existing_skill=existing.content if existing is not None else None,
     )
     if not skill_md:
         return {
@@ -1091,11 +1130,6 @@ async def regenerate_skill(
             "feedback_count": len(feedback_samples),
             "knowledge_count": len(knowledge_entries),
         }
-
-    auto_name = f"auto_module_{body.module_id}"
-    existing = (await db.execute(
-        select(Skill).where(Skill.module_id == body.module_id, Skill.name == auto_name)
-    )).scalar_one_or_none()
 
     if existing is not None:
         existing.content = skill_md

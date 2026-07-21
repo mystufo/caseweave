@@ -9,6 +9,11 @@ class Settings(BaseSettings):
     llm_model: str = "claude-opus-4-6"
     llm_api_key: str = ""
     llm_base_url: Optional[str] = None
+    # 单次 LLM 调用的超时（秒）与重试次数。没有超时的话，provider 卡住时请求会永久挂起——
+    # 前端「正在抽取产品知识…」等 loader 靠调用返回/抛错才解除，一旦挂起就界面卡死。
+    # 有了超时，慢/挂起的调用会在 timeout*(1+retries) 内抛错，调用方的 fail-open 分支即可兜底。
+    llm_timeout_seconds: float = 120.0
+    llm_max_retries: int = 1
 
     # 各 agent 的 max_tokens 上限。三个分开是因为输出体量需求差异很大：
     #   generator   ：要输出几十条用例的 JSON 数组，最易被截断；同时填了 PRD + 脑图 + 多轮澄清时

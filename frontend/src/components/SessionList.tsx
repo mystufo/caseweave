@@ -1,5 +1,5 @@
 import { useState, type KeyboardEvent } from 'react'
-import { Plus, MessageSquare, Pencil, Check, X, Loader2, Trash2 } from 'lucide-react'
+import { Plus, Pencil, Check, X, Loader2, Trash2, FileText, Brain } from 'lucide-react'
 import type { ChatSession } from '../api/client'
 
 interface Props {
@@ -7,7 +7,7 @@ interface Props {
   activeId: number | null
   busyIds?: Set<number>
   onSelect: (id: number) => void
-  onNew: () => void
+  onNew: (mode: 'cases' | 'mindmap') => void
   onRename: (id: number, title: string) => Promise<void> | void
   onDelete: (id: number) => Promise<void> | void
 }
@@ -44,13 +44,22 @@ export default function SessionList({ sessions, activeId, busyIds, onSelect, onN
     <div className="flex flex-col h-full">
       <div className="p-4 border-b border-gray-200">
         <h1 className="text-lg font-bold text-gray-800 mb-3">TestCraft AI</h1>
-        <button
-          onClick={onNew}
-          className="w-full flex items-center gap-2 px-3 py-2 text-sm bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors"
-        >
-          <Plus size={16} />
-          新会话
-        </button>
+        <div className="space-y-2">
+          <button
+            onClick={() => onNew('cases')}
+            className="w-full flex items-center gap-2 px-3 py-2 text-sm bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors"
+          >
+            <Plus size={16} />
+            生成测试用例
+          </button>
+          <button
+            onClick={() => onNew('mindmap')}
+            className="w-full flex items-center gap-2 px-3 py-2 text-sm bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 transition-colors"
+          >
+            <Plus size={16} />
+            生成测试脑图
+          </button>
+        </div>
       </div>
 
       <div className="flex-1 overflow-y-auto p-2 space-y-1">
@@ -69,7 +78,9 @@ export default function SessionList({ sessions, activeId, busyIds, onSelect, onN
                   : 'text-gray-700 hover:bg-gray-100'
               }`}
             >
-              <MessageSquare size={14} className="flex-shrink-0 opacity-60" />
+              {s.mode === 'mindmap'
+                ? <Brain size={14} className="flex-shrink-0 text-indigo-500" />
+                : <FileText size={14} className="flex-shrink-0 opacity-60" />}
               {busyIds?.has(s.id) && !isEditing && (
                 <Loader2 size={12} className="flex-shrink-0 animate-spin text-amber-500" />
               )}

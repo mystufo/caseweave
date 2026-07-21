@@ -1,7 +1,7 @@
-import { MessageSquare, ListChecks, BookOpen } from 'lucide-react'
+import { MessageSquare, ListChecks, BookOpen, LineChart } from 'lucide-react'
 import type { LucideIcon } from 'lucide-react'
 
-export type ViewKey = 'chat' | 'cases' | 'knowledge'
+export type ViewKey = 'chat' | 'cases' | 'knowledge' | 'feedback'
 
 interface Props {
   value: ViewKey
@@ -12,6 +12,7 @@ const tabs: { key: ViewKey; label: string; icon: LucideIcon }[] = [
   { key: 'chat', label: '对话', icon: MessageSquare },
   { key: 'cases', label: '用例管理', icon: ListChecks },
   { key: 'knowledge', label: '知识库', icon: BookOpen },
+  { key: 'feedback', label: '进化报告', icon: LineChart },
 ]
 
 export default function TabBar({ value, onChange }: Props) {

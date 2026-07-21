@@ -1,9 +1,10 @@
 """Prompt 版本化加载层（Phase 4.2 第一阶段）。
 
-把 3 个原本硬编码在 agent 模块里的 system prompt 统一登记为可版本化的逻辑 key：
+把原本硬编码在 agent 模块里的 system prompt 统一登记为可版本化的逻辑 key：
   - clarifier_initial   首轮澄清
   - clarifier_followup  续答澄清
   - generator           用例生成
+  - mindmap_generator   测试脑图生成
 
 代码里的常量是每个 key 的“原始建议版本”（default）。网页端允许用户基于它
 另存为新版本并选择激活。运行时：
@@ -24,6 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.agents.clarifier import SYSTEM_PROMPT as CLARIFIER_INITIAL_DEFAULT
 from app.agents.clarifier import FOLLOWUP_SYSTEM_PROMPT as CLARIFIER_FOLLOWUP_DEFAULT
 from app.agents.generator import SYSTEM_PROMPT as GENERATOR_DEFAULT
+from app.agents.mindmap_generator import SYSTEM_PROMPT as MINDMAP_DEFAULT
 from app.models.knowledge import PromptVersion
 
 logger = logging.getLogger("testcraft.prompts")
@@ -59,6 +61,13 @@ PROMPT_SPECS: list[PromptSpec] = [
         label="测试用例生成",
         description="根据文档 + 澄清结果生成结构化测试用例 JSON。",
         default_text=GENERATOR_DEFAULT,
+    ),
+    PromptSpec(
+        key="mindmap_generator",
+        purpose="mindmap",
+        label="测试脑图生成",
+        description="把 PRD 按功能结构与交互逻辑重建成脑图（入口→触发→界面→状态→分支），显式表达依赖与联动，测试覆盖就近挂在功能节点下。",
+        default_text=MINDMAP_DEFAULT,
     ),
 ]
 

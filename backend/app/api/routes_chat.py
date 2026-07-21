@@ -34,6 +34,7 @@ class ChatRequest(BaseModel):
 class SessionCreate(BaseModel):
     title: str = "New Session"
     module_id: int | None = None
+    mode: str = "cases"  # cases（生成用例，默认）/ mindmap（生成测试脑图）
 
 
 class SessionUpdate(BaseModel):
@@ -105,6 +106,7 @@ async def create_session(
     session = Session(
         title=data.title,
         module_id=data.module_id,
+        mode=data.mode if data.mode in ("cases", "mindmap") else "cases",
         project_id=project_id,
         user_id=user.id,
     )
@@ -114,6 +116,7 @@ async def create_session(
     return {
         "id": session.id,
         "title": session.title,
+        "mode": session.mode,
         "status": session.status,
         "created_at": session.created_at,
     }
@@ -136,6 +139,7 @@ async def list_sessions(
         {
             "id": s.id,
             "title": s.title,
+            "mode": s.mode,
             "status": s.status,
             "created_at": s.created_at,
         }
@@ -164,6 +168,7 @@ async def update_session(
     return {
         "id": session.id,
         "title": session.title,
+        "mode": session.mode,
         "status": session.status,
         "created_at": session.created_at,
     }

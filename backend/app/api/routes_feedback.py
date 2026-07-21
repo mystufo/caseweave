@@ -281,6 +281,94 @@ async def list_recent_feedback(
     return {"items": items}
 
 
+@router.get("/feedback/negative")
+async def list_negative_feedback(
+    module_id: int | None = Query(default=None),
+    feedback_type: str | None = Query(default=None, description="edit / dislike；不传=两者都要"),
+    limit: int = Query(default=50, ge=1, le=200),
+    project_id: int = Depends(require_project),
+    _user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """负反馈单独视图数据源：已分析的 edit + 带原因 dislike 反馈（diff_analysis IS NOT NULL）。
+
+    每条返回本次归纳的完整信息——意图/摘要/改动字段/原因/分诊出口/**归纳出的规则全文**，
+    以及该反馈已被哪些进化出口消费（knowledge/skill/prompt）。供「负反馈」页面把
+    每次归纳的相关记录独立展示，不再和文档来源的知识混在一起。
+    """
+    stmt = (
+        select(Feedback, TestCase)
+        .join(TestCase, TestCase.id == Feedback.test_case_id)
+        .where(
+            TestCase.project_id == project_id,
+            Feedback.feedback_type.in_(("edit", "dislike")),
+            Feedback.diff_analysis.is_not(None),
+        )
+        .order_by(Feedback.id.desc())
+        .limit(limit)
+    )
+    if feedback_type in ("edit", "dislike"):
+        stmt = stmt.where(Feedback.feedback_type == feedback_type)
+
+    # module_id → 反查 module name 后按字符串过滤（test_cases.module 存的是名字）
+    if module_id is not None:
+        mq = await db.execute(
+            select(Module.name).where(Module.id == module_id, Module.project_id == project_id)
+        )
+        mod_name = mq.scalar_one_or_none()
+        if mod_name is None:
+            return {"items": []}
+        stmt = stmt.where(TestCase.module == mod_name)
+
+    rows = (await db.execute(stmt)).all()
+    if not rows:
+        return {"items": []}
+
+    # 一次性拉这批反馈的消费台账：feedback_id → set(output_kind)
+    fb_ids = [fb.id for fb, _ in rows]
+    consumed = (await db.execute(
+        select(FeedbackConsumption.feedback_id, FeedbackConsumption.output_kind)
+        .where(FeedbackConsumption.feedback_id.in_(fb_ids))
+    )).all()
+    consumed_map: dict[int, list[str]] = {}
+    for fid, kind in consumed:
+        consumed_map.setdefault(fid, []).append(kind)
+
+    items: list[dict[str, Any]] = []
+    for fb, tc in rows:
+        analysis_obj: dict[str, Any] = {}
+        try:
+            analysis_obj = json.loads(fb.diff_analysis) if fb.diff_analysis else {}
+        except (TypeError, ValueError):
+            analysis_obj = {}
+        raw_rules = analysis_obj.get("extracted_rules")
+        rules = [
+            {
+                "knowledge_type": r.get("knowledge_type"),
+                "content": r.get("content"),
+                "confidence": r.get("confidence"),
+            }
+            for r in raw_rules
+            if isinstance(r, dict) and (r.get("content") or "").strip()
+        ] if isinstance(raw_rules, list) else []
+        items.append({
+            "id": fb.id,
+            "feedback_type": fb.feedback_type,
+            "test_case_id": tc.id,
+            "test_case_name": tc.name,
+            "module": tc.module,
+            "intent": analysis_obj.get("intent") or fb.triage,
+            "summary": analysis_obj.get("summary"),
+            "changed_fields": analysis_obj.get("changed_fields") or [],
+            "reason": fb.reason,
+            "triage_targets": [t for t in (fb.triage_targets.split(",") if fb.triage_targets else []) if t],
+            "extracted_rules": rules,
+            "consumed_by": consumed_map.get(fb.id, []),
+            "created_at": fb.created_at.isoformat() if fb.created_at else None,
+        })
+    return {"items": items}
+
+
 @router.get("/feedback/evolution/summary")
 async def evolution_summary(
     project_id: int = Depends(require_project),

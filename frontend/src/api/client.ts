@@ -111,6 +111,7 @@ export const deleteProject = (id: number) =>
 export interface ChatSession {
   id: number
   title: string
+  mode?: 'cases' | 'mindmap'  // 会话用途：生成用例 / 生成测试脑图（老会话无值按 cases）
   status: string
   created_at: string
 }
@@ -167,8 +168,8 @@ export interface UploadResult {
 export const fetchSessions = () =>
   api.get<ChatSession[]>('/api/sessions').then(r => r.data)
 
-export const createSession = (title: string, module_id?: number) =>
-  api.post<ChatSession>('/api/sessions', { title, module_id }).then(r => r.data)
+export const createSession = (title: string, module_id?: number, mode?: 'cases' | 'mindmap') =>
+  api.post<ChatSession>('/api/sessions', { title, module_id, mode }).then(r => r.data)
 
 export const renameSession = (sessionId: number, title: string) =>
   api.patch<ChatSession>(`/api/sessions/${sessionId}`, { title }).then(r => r.data)
@@ -209,7 +210,7 @@ export interface ClarificationStateDTO {
   rounds: ClarificationRoundHistory[]
   current_questions: ClarificationQuestion[]
   ready_to_generate: boolean
-  status: 'clarifying' | 'awaiting_clarification' | 'awaiting_answers' | 'generating' | 'done' | 'error'
+  status: 'clarifying' | 'staged' | 'awaiting_clarification' | 'awaiting_answers' | 'generating' | 'done' | 'error'
   updated_at: string | null
 }
 
@@ -244,6 +245,9 @@ export interface UploadStreamCallbacks {
   // knowledge_preview，里面是即将注入到 Clarifier 提示词里的候选条目，让用户先勾选。
   // 用户在前端确认后再调 streamInitialClarification 触发真正的澄清。
   onKnowledgePreview?: (preview: UploadKnowledgePreview) => void
+  // 新流程：上传只「暂存」文档（解析入库，不跑任何大模型），完成时发一帧 staged。
+  // 前端据此展示"已上传"chip + 「开始生成」按钮，用户备齐资料后点按钮才进入下游流程。
+  onStaged?: (payload: StagedPayload) => void
   // 抽取出的知识草稿（用户确认后才入库）。drafts 可能为 []（抽完了但 LLM 没产出条目），
   // 前端用空数组判定"直接进入澄清"；非空时需要先在 UI 弹审核面板。
   onKnowledgeDrafts?: (payload: ExtractedKnowledgeDrafts) => void
@@ -274,6 +278,10 @@ export interface KnowledgeConflictHint {
   content: string
   confidence: number
   distance: number
+  // LLM 判定的关系：similar（相似，可共存）/ conflict（冲突，取值矛盾）
+  relation?: 'similar' | 'conflict'
+  // 判定理由（一句中文），展示给用户复核
+  reason?: string
 }
 
 export interface KnowledgeDraft {
@@ -281,8 +289,12 @@ export interface KnowledgeDraft {
   content: string
   source: string
   confidence: number
-  // 可选：本草稿与已有库内条目语义相近时的"潜在冲突"提示
+  // 本草稿与库内已有条目的整体关系：new（无冲突）/ similar / conflict
+  relation_status?: 'new' | 'similar' | 'conflict'
+  // 可选：本草稿与已有库内条目语义相近时的"相似 / 冲突"近邻
   conflicts?: KnowledgeConflictHint[]
+  // 用户在审核面板选"保留新的"时，带上被替代的旧条目 id；入库时后端会删除它们。
+  supersedes_entry_ids?: number[]
 }
 
 export interface ExtractedKnowledgeDrafts {
@@ -294,8 +306,21 @@ export interface ExtractedKnowledgeDrafts {
   drafts: KnowledgeDraft[]
 }
 
+// 上传完成后触发的「PRD + 脑图」合并知识抽取（脑图优先）。
+// 后端读本会话的 PRD/脑图文档合成一次抽取，产物落到主文档并清空副文档，返回草稿。
+// document_id 可能为 null（会话还没任何文档）→ drafts 为空。
+export const extractCombinedDrafts = (sessionId: number) =>
+  api.post<ExtractedKnowledgeDrafts & { document_id: number | null }>(
+    '/api/documents/extract_combined_drafts', { session_id: sessionId },
+    // 后端单次 LLM 调用超时 120s、最多重试 1 次（最坏 ~240s）。前端超时给足余量，
+    // 避免网络/后端偶发挂起时「正在抽取产品知识…」loader 永久打转（catch 分支会清 loader）。
+    { timeout: 300_000 },
+  ).then(r => r.data)
+
 export interface UploadKnowledgePreview {
   document_id: number
+  // pipeline/start 阶段会带上会话里并存的另一份文档 id（PRD + 脑图合并预览）
+  mindmap_document_id?: number | null
   module_id: number | null
   filename: string
   module_name: string | null
@@ -309,6 +334,17 @@ export interface UploadKnowledgePreview {
   cached?: boolean
 }
 
+// 上传「暂存」完成帧：文档已解析入库，尚未跑任何大模型。
+export interface StagedPayload {
+  document_id: number
+  role: 'prd' | 'mindmap'
+  filename: string
+  module_id: number | null
+  stats: { chunks: number; tables: number; raw_text_length: number }
+  source?: string
+  url?: string
+  cached?: boolean
+}
 export function streamUpload(
   file: File,
   sessionId: number,
@@ -366,10 +402,10 @@ export function streamUpload(
             const { type, ...rest } = payload
             void type
             callbacks.onKnowledgePreview?.(rest as UploadKnowledgePreview)
-          } else if (payload.type === 'extracted_knowledge_drafts') {
+          } else if (payload.type === 'staged') {
             const { type, ...rest } = payload
             void type
-            callbacks.onKnowledgeDrafts?.(rest as ExtractedKnowledgeDrafts)
+            callbacks.onStaged?.(rest as StagedPayload)
           } else if (payload.type === 'module_auto_classified') {
             const { type, ...rest } = payload
             void type
@@ -455,10 +491,10 @@ export function streamLarkImport(
             const { type, ...rest } = payload
             void type
             callbacks.onKnowledgePreview?.(rest as UploadKnowledgePreview)
-          } else if (payload.type === 'extracted_knowledge_drafts') {
+          } else if (payload.type === 'staged') {
             const { type, ...rest } = payload
             void type
-            callbacks.onKnowledgeDrafts?.(rest as ExtractedKnowledgeDrafts)
+            callbacks.onStaged?.(rest as StagedPayload)
           } else if (payload.type === 'module_auto_classified') {
             const { type, ...rest } = payload
             void type
@@ -548,10 +584,10 @@ export function streamMindmapUpload(
             const { type, ...rest } = payload
             void type
             callbacks.onKnowledgePreview?.(rest as UploadKnowledgePreview)
-          } else if (payload.type === 'extracted_knowledge_drafts') {
+          } else if (payload.type === 'staged') {
             const { type, ...rest } = payload
             void type
-            callbacks.onKnowledgeDrafts?.(rest as ExtractedKnowledgeDrafts)
+            callbacks.onStaged?.(rest as StagedPayload)
           } else if (payload.type === 'module_auto_classified') {
             const { type, ...rest } = payload
             void type
@@ -591,6 +627,81 @@ export function streamLarkMindmapImport(
   moduleId?: number,
 ): () => void {
   return streamLarkImport(url, sessionId, callbacks, moduleId, 'mindmap')
+}
+
+// ── Pipeline start（「开始生成」闸门） ─────────────────────────────────────────
+// 上传只暂存文档。用户备齐资料后点「开始生成」调它，后端才跑模块自动分类 + 知识检索预览，
+// 发 module_auto_classified / knowledge_preview 帧，并把状态推进到 awaiting_clarification。
+// 复用 UploadStreamCallbacks（onModuleAutoClassified / onKnowledgePreview / onError / onDone）。
+export function streamPipelineStart(
+  sessionId: number,
+  callbacks: UploadStreamCallbacks,
+  moduleId?: number,
+): () => void {
+  const controller = new AbortController()
+
+  fetch(`${BASE_URL}/api/pipeline/start/stream`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify({ session_id: sessionId, module_id: moduleId }),
+    signal: controller.signal,
+  }).then(async res => {
+    if (!res.ok || !res.body) {
+      callbacks.onError(`HTTP ${res.status}`)
+      return
+    }
+
+    const reader = res.body.getReader()
+    const decoder = new TextDecoder()
+    let buffer = ''
+    let sawTerminal = false
+
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+
+      let idx: number
+      while ((idx = buffer.indexOf('\n\n')) !== -1) {
+        const frame = buffer.slice(0, idx)
+        buffer = buffer.slice(idx + 2)
+        const line = frame.split('\n').find(l => l.startsWith('data: '))
+        if (!line) continue
+        try {
+          const payload = JSON.parse(line.slice(6))
+          if (payload.type === 'stage') {
+            callbacks.onStage(payload.stage, payload.message)
+          } else if (payload.type === 'token') {
+            callbacks.onToken(payload.content)
+          } else if (payload.type === 'assistant_message') {
+            callbacks.onAssistantMessage?.(payload.message as ChatMessage)
+          } else if (payload.type === 'knowledge_preview') {
+            const { type, ...rest } = payload
+            void type
+            callbacks.onKnowledgePreview?.(rest as UploadKnowledgePreview)
+          } else if (payload.type === 'module_auto_classified') {
+            const { type, ...rest } = payload
+            void type
+            callbacks.onModuleAutoClassified?.(rest as ModuleAutoClassifiedPayload)
+          } else if (payload.type === 'error') {
+            sawTerminal = true
+            callbacks.onError(payload.message)
+          } else if (payload.type === 'done') {
+            sawTerminal = true
+            callbacks.onDone()
+          }
+        } catch {
+          // ignore parse errors on partial frames
+        }
+      }
+    }
+    if (!sawTerminal) callbacks.onError('连接中断（未收到结束帧），请重试')
+  }).catch(err => {
+    if (err.name === 'AbortError') callbacks.onDone()
+    else callbacks.onError(String(err))
+  })
+
+  return () => controller.abort()
 }
 
 // ── Initial clarification (B 方案：用户勾完知识库后才跑 Clarifier) ─────────────
@@ -905,6 +1016,31 @@ export const updateKnowledge = (
 export const deleteKnowledge = (entryId: number) =>
   api.delete<{ deleted: boolean; id: number }>(`/api/knowledge/${entryId}`).then(r => r.data)
 
+// 从 PRD 生成测试脑图并写入飞书文档，返回可点击的飞书链接。
+// sessionId 可选：从「知识库/模块详情」触发时不传（纯文档级操作，不往聊天流追加气泡）。
+export const generateMindmap = (
+  documentId: number,
+  opts?: {
+    sessionId?: number | null
+    moduleId?: number | null
+    moduleName?: string
+    clarifications?: Record<string, string>
+  },
+) =>
+  api.post<{
+    url: string
+    title: string
+    document_id: number
+    markdown: string
+    assistant_message?: ChatMessage | null
+  }>('/api/mindmap/generate', {
+    document_id: documentId,
+    session_id: opts?.sessionId ?? null,
+    module_id: opts?.moduleId ?? null,
+    module_name: opts?.moduleName,
+    clarifications: opts?.clarifications ?? null,
+  }).then(r => r.data)
+
 export const generateCases = (
   sessionId: number,
   documentId: number | null | undefined,
@@ -1213,6 +1349,43 @@ export const fetchRecentFeedback = (params: {
   if (params.moduleId != null) query.module_id = params.moduleId
   if (params.limit != null) query.limit = params.limit
   return api.get<{ items: RecentFeedbackItem[] }>('/api/feedback/recent', { params: query })
+    .then(r => r.data.items)
+}
+
+// ── 负反馈单独视图（每次归纳的相关记录）─────────────────────────────────────────
+// edit 修改 + 带原因 dislike 的已分析反馈，含本次归纳出的规则全文与消费出口。
+export interface NegativeFeedbackRule {
+  knowledge_type: string | null
+  content: string | null
+  confidence: number | null
+}
+
+export interface NegativeFeedbackRecord {
+  id: number
+  feedback_type: 'edit' | 'dislike'
+  test_case_id: number
+  test_case_name: string
+  module: string | null
+  intent: string | null
+  summary: string | null
+  changed_fields: string[]
+  reason: string | null
+  triage_targets: string[]          // 分诊出口：knowledge / skill / prompt
+  extracted_rules: NegativeFeedbackRule[]
+  consumed_by: string[]             // 已被哪些出口消费
+  created_at: string | null
+}
+
+export const fetchNegativeFeedback = (params: {
+  moduleId?: number | null
+  feedbackType?: 'edit' | 'dislike'
+  limit?: number
+} = {}) => {
+  const query: Record<string, string | number> = {}
+  if (params.moduleId != null) query.module_id = params.moduleId
+  if (params.feedbackType) query.feedback_type = params.feedbackType
+  if (params.limit != null) query.limit = params.limit
+  return api.get<{ items: NegativeFeedbackRecord[] }>('/api/feedback/negative', { params: query })
     .then(r => r.data.items)
 }
 

@@ -33,12 +33,22 @@ SYSTEM_PROMPT = """你是一名资深产品分析师，正在阅读一份产品�
 - module_relation：与其他模块的关联（如 "下单成功后会触发库存模块扣减"）
 - ui_behavior：明确写出的 UI/交互行为（如 "未登录点击购买跳转到登录页"）
 
+不要抽取（以下内容一律跳过，宁可漏抽也不要收进来）：
+1. 不确定 / 未定稿的内容：如「二期/后续版本再支持 XX」「XX 待定」「文案待确认」「TBD」「TODO」
+   「待补充」「待评审」等——凡是当前版本尚未定稿、或明说以后再做的，都不抽。
+2. 琐碎的表现层细节：如「时间戳统一为 MM/DD/YYYY」「按钮为蓝色」「字号 14px」「间距 8px」
+   等纯格式 / 样式 / 排版约定——除非该细节本身就是一条可校验的业务规则，否则不抽。
+3. 具体文案原文：如 toast/弹窗的整句提示语——除非文案里含明确的取值/校验规则（如「密码至少 8 位」）。
+4. 非规则性内容：产品背景 / 目标 / 愿景 / 价值主张、需求变更历史、版本排期与里程碑、
+   人员分工、埋点上报字段等——这些不是未来用例能直接引用的规则。
+5. 主观 / 模糊 / 仅凭猜测的描述：如「提升用户体验」「界面更友好」，以及任何需要脑补文档外背景才成立的推断。
+
 抽取要点：
 1. 每条 content 必须自包含可单独阅读，不要写成「见上文」「同前」
 2. 不要总结/缩写文档大意；只保留**可以被未来用例引用的具体规则**
 3. 同一规则不要重复发出，保持去重
-4. 不确定 / 模糊不清 / 仅猜测的，不要写
-5. 控制总数：一份文档最多输出 12 条，宁缺勿滥
+4. 判断标准：这条知识能否成为未来某条测试用例的判定依据？不能 → 不抽。宁缺勿滥。
+5. 有多少可沉淀的具体规则就抽多少，不要为了凑数硬编，也不要因为条数多而遗漏
 6. confidence 取值范围 0.4–0.9：文档明确直述用 0.8+，需要推断的用 0.5–0.6
 
 输出格式（必须是 JSON 数组，仅此而已，不要解释）：
@@ -92,26 +102,43 @@ def _parse(raw: str) -> list[KnowledgeDraft]:
             conf = 0.6
         conf = max(0.1, min(0.95, conf))
         out.append(KnowledgeDraft(knowledge_type=t, content=c, source="document", confidence=conf))
-    return out[:12]
+    return out
 
 
 async def extract_knowledge(
     doc_content: str,
     module_name: str | None = None,
+    mindmap_content: str | None = None,
 ) -> list[KnowledgeDraft]:
-    """Best-effort knowledge extraction. Returns [] on any failure."""
-    if not (doc_content or "").strip():
+    """Best-effort knowledge extraction. Returns [] on any failure.
+
+    可同时传 PRD 正文（doc_content）与测试脑图正文（mindmap_content）：两者都在时合并成
+    一次抽取，脑图代表测试人员的最终意图，冲突时以脑图为准（与 clarifier 的约定一致）。
+    仅传一份时行为不变。
+    """
+    if not (doc_content or "").strip() and not (mindmap_content or "").strip():
         return []
 
     # max_tokens 由 .env 的 KNOWLEDGE_MAX_TOKENS 控制（默认 8192）。
     # 部分模型（如 kimi-k2 思考版）会先消耗大量 reasoning_tokens，预算太小
     # 会导致正文被截断为空（finish_reason=length），不要随意往下调。
-    llm = build_chat_model(max_tokens=get_settings().knowledge_max_tokens, temperature=0)
-    user_content = f"产品模块：{module_name or '未指定'}\n\n需求文档内容：\n{doc_content}"
+    settings = get_settings()
+    llm = build_chat_model(max_tokens=settings.knowledge_max_tokens, temperature=0)
+
+    # 脑图放在 PRD 之前，提示 LLM 优先以脑图为准（与 clarifier 的 build_user_content 呼应）
+    parts = [f"产品模块：{module_name or '未指定'}\n"]
+    if (mindmap_content or "").strip():
+        parts.append(f"## 测试脑图（与 PRD 冲突时以脑图为准）\n{mindmap_content}\n")
+    if (doc_content or "").strip():
+        label = "## 需求文档（PRD）" if (mindmap_content or "").strip() else "需求文档内容："
+        parts.append(f"{label}\n{doc_content}\n")
+    user_content = "\n".join(parts)
 
     logger.info(
-        "knowledge extractor LLM call | module=%s doc_chars=%d",
-        module_name or "未指定", len(doc_content),
+        "knowledge extractor LLM call | module=%s doc_chars=%d mindmap_chars=%d "
+        "timeout=%.0fs max_retries=%d",
+        module_name or "未指定", len(doc_content or ""), len(mindmap_content or ""),
+        settings.llm_timeout_seconds, settings.llm_max_retries,
     )
     start = time.perf_counter()
     try:
@@ -120,7 +147,12 @@ async def extract_knowledge(
             HumanMessage(content=user_content),
         ])
     except Exception as e:
-        logger.warning("knowledge extractor LLM call failed: %s", e)
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        logger.warning(
+            "knowledge extractor LLM call failed after %.0fms (%s): %s "
+            "（超时可调大 LLM_TIMEOUT_SECONDS，当前 %.0fs）",
+            elapsed_ms, type(e).__name__, e, settings.llm_timeout_seconds,
+        )
         return []
 
     elapsed_ms = (time.perf_counter() - start) * 1000

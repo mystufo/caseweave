@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import ChatPage from './pages/ChatPage'
 import CasesPage from './pages/CasesPage'
 import KnowledgePage from './pages/KnowledgePage'
+import NegativeFeedbackPage from './pages/NegativeFeedbackPage'
 import LoginPage from './pages/LoginPage'
 import ProjectPickerPage from './pages/ProjectPickerPage'
 import type { ViewKey } from './components/TabBar'
@@ -126,6 +127,9 @@ export default function App() {
         </div>
         <div className={view === 'knowledge' ? 'block h-full' : 'hidden'}>
           <KnowledgePage view={view} onChangeView={setView} />
+        </div>
+        <div className={view === 'feedback' ? 'block h-full' : 'hidden'}>
+          <NegativeFeedbackPage view={view} onChangeView={setView} />
         </div>
       </div>
     </div>

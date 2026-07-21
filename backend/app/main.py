@@ -11,6 +11,7 @@ from app.logging_config import setup_logging
 from app.api.routes_chat import router as chat_router
 from app.api.routes_upload import router as upload_router
 from app.api.routes_generate import router as generate_router
+from app.api.routes_mindmap import router as mindmap_router
 from app.api.routes_knowledge import router as knowledge_router
 from app.api.routes_feedback import router as feedback_router
 from app.api.routes_auth import router as auth_router
@@ -130,6 +131,7 @@ app.include_router(projects_router, prefix="/api", tags=["projects"])
 app.include_router(chat_router, prefix="/api", tags=["chat"])
 app.include_router(upload_router, prefix="/api", tags=["upload"])
 app.include_router(generate_router, prefix="/api", tags=["generate"])
+app.include_router(mindmap_router, prefix="/api", tags=["mindmap"])
 app.include_router(knowledge_router, prefix="/api", tags=["knowledge"])
 app.include_router(feedback_router, prefix="/api", tags=["feedback"])
 app.include_router(prompts_router, prefix="/api", tags=["prompts"])

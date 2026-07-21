@@ -10,7 +10,7 @@ import {
 import TabBar, { type ViewKey } from '../components/TabBar'
 import {
   Search, RefreshCw, ChevronDown, ChevronRight, Loader2, Filter, X, Download,
-  Edit2, Check, Trash2,
+  Edit2, Check, Trash2, ThumbsUp, ThumbsDown,
 } from 'lucide-react'
 
 interface PageProps {
@@ -48,7 +48,7 @@ const COLUMNS: ColDef[] = [
   { key: 'remarks', label: '备注', width: 140, minWidth: 80 },
   { key: 'session', label: '所属会话', width: 160, minWidth: 100 },
   { key: 'created_at', label: '创建时间', width: 130, minWidth: 100 },
-  { key: 'actions', label: '操作', width: 96, minWidth: 80, align: 'center' },
+  { key: 'actions', label: '操作', width: 150, minWidth: 130, align: 'center' },
 ]
 
 type EditableField = 'name' | 'priority' | 'preconditions' | 'steps' | 'expected_result' | 'remarks'
@@ -106,6 +106,10 @@ export default function CasesPage({ view, onChangeView }: PageProps) {
   const [savingEdit, setSavingEdit] = useState(false)
   const [confirmingDelete, setConfirmingDelete] = useState<number | null>(null)
   const [deleting, setDeleting] = useState<number | null>(null)
+  // 点赞/点踩：feedback 记住每行已选态；dislikeReasonFor 展开原因输入的行 id
+  const [feedback, setFeedback] = useState<Record<number, 'like' | 'dislike'>>({})
+  const [dislikeReasonFor, setDislikeReasonFor] = useState<number | null>(null)
+  const [dislikeReason, setDislikeReason] = useState('')
 
   useEffect(() => {
     localStorage.setItem(COL_WIDTHS_KEY, JSON.stringify(colWidths))
@@ -296,6 +300,35 @@ export default function CasesPage({ view, onChangeView }: PageProps) {
     }
   }, [editDraft, savingEdit])
 
+  const handleLike = useCallback(async (id: number) => {
+    setFeedback(prev => ({ ...prev, [id]: 'like' }))
+    try {
+      await submitFeedback(id, 'like')
+    } catch (err) {
+      console.error('Like feedback failed:', err)
+    }
+  }, [])
+
+  // 点👎先展开可选原因输入，不立即提交；填了原因作强信号进分诊，可直接跳过
+  const startDislike = useCallback((id: number) => {
+    setEditing(null)
+    setConfirmingDelete(null)
+    setDislikeReasonFor(id)
+    setDislikeReason('')
+  }, [])
+
+  const submitDislike = useCallback(async (id: number) => {
+    setFeedback(prev => ({ ...prev, [id]: 'dislike' }))
+    const reason = dislikeReason.trim()
+    setDislikeReasonFor(null)
+    setDislikeReason('')
+    try {
+      await submitFeedback(id, 'dislike', undefined, undefined, reason || undefined)
+    } catch (err) {
+      console.error('Dislike feedback failed:', err)
+    }
+  }, [dislikeReason])
+
   const performDelete = useCallback(async (id: number) => {
     setDeleting(id)
     try {
@@ -440,8 +473,51 @@ export default function CasesPage({ view, onChangeView }: PageProps) {
             </div>
           )
         }
+        if (dislikeReasonFor === c.id) {
+          return (
+            <div className="flex items-center justify-center gap-1">
+              <input
+                type="text"
+                value={dislikeReason}
+                onChange={e => setDislikeReason(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter') void submitDislike(c.id) }}
+                placeholder="原因（可选）"
+                autoFocus
+                className="w-24 px-1.5 py-0.5 text-[11px] border border-gray-200 rounded focus:outline-none focus:ring-1 focus:ring-red-300"
+              />
+              <button
+                onClick={() => void submitDislike(c.id)}
+                className="text-red-500 hover:text-red-600"
+                title="提交（可留空）"
+              >
+                <Check size={14} />
+              </button>
+              <button
+                onClick={() => { setDislikeReasonFor(null); setDislikeReason('') }}
+                className="text-gray-400 hover:text-gray-500"
+                title="取消"
+              >
+                <X size={14} />
+              </button>
+            </div>
+          )
+        }
         return (
           <div className="flex items-center justify-center gap-1.5">
+            <button
+              onClick={() => void handleLike(c.id)}
+              className={`transition-colors ${feedback[c.id] === 'like' ? 'text-green-600' : 'text-gray-300 hover:text-green-500'}`}
+              title="赞"
+            >
+              <ThumbsUp size={13} />
+            </button>
+            <button
+              onClick={() => startDislike(c.id)}
+              className={`transition-colors ${feedback[c.id] === 'dislike' ? 'text-red-500' : 'text-gray-300 hover:text-red-400'}`}
+              title="踩（可补充原因，帮助系统改进）"
+            >
+              <ThumbsDown size={13} />
+            </button>
             <button
               onClick={() => startEdit(c)}
               className="text-gray-300 hover:text-blue-500 transition-colors"
@@ -478,6 +554,7 @@ export default function CasesPage({ view, onChangeView }: PageProps) {
             <li>支持按模块 / 优先级 / 创建时间筛选</li>
             <li>拖拽表头右边缘可调整列宽（自动记住）</li>
             <li>支持就地编辑用例字段、单条删除（二次确认）</li>
+            <li>可对用例点赞 / 点踩（踩可补充原因），驱动系统进化</li>
             <li>点击「导出」下载当前筛选结果的 Excel</li>
           </ul>
         </div>

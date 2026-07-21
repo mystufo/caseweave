@@ -46,6 +46,14 @@ SYSTEM_PROMPT = """你是一名资深测试架构师，正在为某个产品模�
   - 全文不超过 600 字；宁少勿水
 - 仅输出 Markdown 正文，不要前言/解释/代码 fence
 
+## 增量合并（当提供了"已有备忘单"时）
+- 若输入里带有**已有备忘单**，说明这是在旧经验之上的增量更新：
+  - **保留**旧备忘单里仍然有效的要点，不要删除或改写与本次新信号无关的内容
+  - 把本次新反馈/新规则**合并进对应小节**，语义重复的条目去重、不要堆叠
+  - 输出**完整的合并后 Markdown**（不是只输出新增部分）
+- 若本次新信号无法带来任何新增/修正（如全是"改写表达"类噪声），输出固定字符串 `__NO_SIGNAL__`，
+  以便上层保留旧备忘单不动
+
 ## 何时输出空
 - 如果输入信号无法归纳出任何有用经验（如全是"改写表达"类的措辞修改），输出固定字符串 `__NO_SIGNAL__`
 """
@@ -73,29 +81,45 @@ async def generate_skill_for_module(
     module_name: str,
     feedback_samples: list[dict[str, Any]],
     knowledge_entries: list[str],
+    existing_skill: str | None = None,
 ) -> str | None:
-    """归纳一份 Skill Markdown。失败 / 信号不足返回 None。"""
+    """归纳一份 Skill Markdown。失败 / 信号不足返回 None。
+
+    existing_skill 非空时进入"增量合并"模式：在旧备忘单基础上并入新信号、保留旧要点，
+    此时放宽 MIN_SAMPLES 闸门（哪怕只有 1 条新反馈也值得合并进旧经验）。
+    """
+    incremental = bool((existing_skill or "").strip())
     total_signal = len(feedback_samples) + len(knowledge_entries)
-    if total_signal < MIN_SAMPLES:
+    # 首次归纳需要足够信号避免噪声成篇；增量合并只要有任意新信号即可
+    if not incremental and total_signal < MIN_SAMPLES:
         logger.info(
             "skill_generator skip | module=%s feedback=%d knowledge=%d (need >=%d)",
             module_name, len(feedback_samples), len(knowledge_entries), MIN_SAMPLES,
         )
         return None
+    if incremental and total_signal == 0:
+        logger.info("skill_generator skip | module=%s incremental but no new signal", module_name)
+        return None
 
     llm = build_chat_model(max_tokens=get_settings().knowledge_max_tokens, temperature=0.2)
-    user_content = (
-        f"# 模块名：{module_name}\n\n"
+    parts = [
+        f"# 模块名：{module_name}\n",
         f"## 最近修改记录（{len(feedback_samples)} 条）\n"
-        f"{_format_feedback_samples(feedback_samples)}\n\n"
+        f"{_format_feedback_samples(feedback_samples)}\n",
         f"## 已沉淀的产品规则（{len(knowledge_entries)} 条，来自历史用例修改）\n"
-        f"{_format_knowledge_entries(knowledge_entries)}\n\n"
-        "请按要求输出 Markdown 经验备忘单。"
-    )
+        f"{_format_knowledge_entries(knowledge_entries)}\n",
+    ]
+    if incremental:
+        parts.append(
+            f"## 已有备忘单（请在其基础上增量合并，保留仍有效的旧要点）\n"
+            f"{existing_skill.strip()}\n"  # type: ignore[union-attr]
+        )
+    parts.append("请按要求输出 Markdown 经验备忘单。")
+    user_content = "\n".join(parts)
 
     logger.info(
-        "skill_generator LLM call | module=%s feedback=%d knowledge=%d",
-        module_name, len(feedback_samples), len(knowledge_entries),
+        "skill_generator LLM call | module=%s feedback=%d knowledge=%d incremental=%s",
+        module_name, len(feedback_samples), len(knowledge_entries), incremental,
     )
     start = time.perf_counter()
     try:

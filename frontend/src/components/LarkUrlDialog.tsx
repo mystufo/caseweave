@@ -11,12 +11,14 @@ interface Props {
   onClose: () => void
   onSubmit: (urls: LarkUrlSubmit) => void
   loading?: boolean
+  // 脑图模式：只收需求文档链接（隐藏脑图链接输入），提交时 mindmapUrl 恒为 null。
+  mindmapOnly?: boolean
 }
 
 // 与后端 lark_fetcher.classify_lark_url 同款正则（前端先验，避免一次后端往返）
 const LARK_URL_RE = /^https?:\/\/[\w.-]*(?:feishu|larksuite|lark)\.[\w.-]+\/(?:docx|wiki|docs|sheets?|sheet)\/[A-Za-z0-9]{15,}/i
 
-export default function LarkUrlDialog({ open, onClose, onSubmit, loading }: Props) {
+export default function LarkUrlDialog({ open, onClose, onSubmit, loading, mindmapOnly }: Props) {
   const [prdUrl, setPrdUrl] = useState('')
   const [mindmapUrl, setMindmapUrl] = useState('')
   const [error, setError] = useState<string | null>(null)
@@ -86,8 +88,12 @@ export default function LarkUrlDialog({ open, onClose, onSubmit, loading }: Prop
 
         <p className="text-xs text-gray-500 leading-relaxed">
           后端会调用本机 <code className="px-1 py-0.5 bg-gray-100 rounded text-[11px]">lark-cli</code> 抓取文档原文。
-          两个链接都可填、也可只填一个：仅 PRD 走需求文档流程，仅脑图按 Markdown 大纲解析为测试脑图，
-          同时填则两份内容并排注入提示词，<strong>冲突时以脑图为准</strong>。
+          {mindmapOnly ? (
+            <>填入需求文档链接，抓取后将据此生成测试脑图。</>
+          ) : (
+            <>两个链接都可填、也可只填一个：仅 PRD 走需求文档流程，仅脑图按 Markdown 大纲解析为测试脑图，
+            同时填则两份内容并排注入提示词，<strong>冲突时以脑图为准</strong>。</>
+          )}
           支持 <strong>新版文档（docx）</strong>、<strong>知识库（wiki）</strong>、<strong>旧版文档（docs）</strong>；电子表格暂不支持。
         </p>
 
@@ -95,7 +101,7 @@ export default function LarkUrlDialog({ open, onClose, onSubmit, loading }: Prop
           <div className="space-y-1">
             <label className="flex items-center gap-1.5 text-xs font-medium text-amber-700">
               <FileText size={12} />
-              PRD 文档链接（可选）
+              {mindmapOnly ? '需求文档链接' : 'PRD 文档链接（可选）'}
             </label>
             <input
               type="url"
@@ -118,6 +124,7 @@ export default function LarkUrlDialog({ open, onClose, onSubmit, loading }: Prop
             />
           </div>
 
+          {!mindmapOnly && (
           <div className="space-y-1">
             <label className="flex items-center gap-1.5 text-xs font-medium text-emerald-700">
               <Network size={12} />
@@ -142,6 +149,7 @@ export default function LarkUrlDialog({ open, onClose, onSubmit, loading }: Prop
               }`}
             />
           </div>
+          )}
 
           {error && <div className="text-xs text-red-600">{error}</div>}
           {!error && hasAny && prdValid && mindmapValid && (

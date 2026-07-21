@@ -34,6 +34,9 @@ _LARK_URL_RE = re.compile(
     re.IGNORECASE,
 )
 
+# lark-cli v2 fetch-doc 把文档标题内嵌成 `<title>…</title>` 前缀（markdown/xml 皆如此）
+_TITLE_TAG_RE = re.compile(r"<title>(?P<title>.*?)</title>", re.IGNORECASE | re.DOTALL)
+
 
 @dataclass
 class LarkContent:
@@ -117,9 +120,11 @@ async def fetch_lark_content(url: str, timeout: float | None = None) -> LarkCont
     cli = settings.lark_cli_path or "lark-cli"
     timeout_sec = float(timeout if timeout is not None else settings.lark_cli_timeout_seconds)
 
-    # v1 默认（走 MCP fetch-doc）能直接吃 docx/wiki/docs 三种 URL —— 是当前唯一统一入口。
-    # v1 已被官方标记 deprecated，将来要切到 v2，但 v2 不收 wiki URL，需要先解析 wiki node。
-    cmd = [cli, "docs", "+fetch", "--doc", url, "--format", "json"]
+    # lark-cli v1 fetch-doc 已下线，现走 v2：能直接吃 docx/wiki/docs 三种 URL。
+    # --doc-format markdown：拿干净的 markdown 正文喂 LLM（默认是 DocxXML，不适合直接生成用例）。
+    # 成功响应 shape 见 `_extract_title_and_text`：正文在 data.document.content，
+    # 标题以 <title>…</title> 前缀内嵌在正文里。
+    cmd = [cli, "docs", "+fetch", "--doc", url, "--doc-format", "markdown", "--format", "json"]
     logger.info("lark fetch | kind=%s url=%s", kind, url[:120])
 
     try:
@@ -210,20 +215,26 @@ def _classify_and_raise(message: str) -> None:
 def _extract_title_and_text(payload: dict) -> tuple[str, str]:
     """从 lark-cli 的成功响应里抠 title 和正文。
 
-    v1 走 MCP fetch-doc，常见 shape：
-        {"ok": true, "result": {"content": "...md...", "title": "..."}}
-    或 MCP 风格：
-        {"ok": true, "result": {"content": [{"type":"text","text":"..."}]}}
+    lark-cli v2 fetch-doc 的成功 shape：
+        {"ok": true, "data": {"document": {"content": "<title>标题</title>\\n\\n# 正文…",
+                                            "document_id": "...", "revision_id": 12}}}
 
-    用宽容策略：title 试 result.title / data.title / title；正文优先 markdown/text，
-    回退到 content 字段。第一次接到真实响应时如果不匹配会进 LarkEmptyDoc，
-    可以根据 log 里 dump 的 keys 调整。
+    正文以 markdown 输出（backend 传了 --doc-format markdown），标题被内嵌成
+    `<title>…</title>` 前缀，需要单独抠出来并从正文里剥掉。
+
+    仍保留对历史 shape（result / 顶层 markdown 字段 / MCP content list）的宽容兜底。
     """
+    # data.document 是 v2 的正文所在；连同历史 shape 一起纳入候选根
     candidates_root: list[dict] = [payload]
-    for key in ("result", "data", "doc", "document"):
+    for key in ("data", "result", "doc", "document"):
         v = payload.get(key)
         if isinstance(v, dict):
             candidates_root.append(v)
+            # 再下潜一层（v2 是 data.document）
+            for subkey in ("document", "doc", "result"):
+                sv = v.get(subkey)
+                if isinstance(sv, dict):
+                    candidates_root.append(sv)
 
     # 提 title
     title = ""
@@ -239,7 +250,7 @@ def _extract_title_and_text(payload: dict) -> tuple[str, str]:
     # 提正文
     text = ""
     for d in candidates_root:
-        for k in ("markdown", "md", "text", "raw_text", "body", "plain_text"):
+        for k in ("content", "markdown", "md", "text", "raw_text", "body", "plain_text"):
             v = d.get(k)
             if isinstance(v, str) and v.strip():
                 text = v
@@ -264,8 +275,17 @@ def _extract_title_and_text(payload: dict) -> tuple[str, str]:
             text = content
             break
 
+    # 剥掉内嵌的 <title>…</title> 前缀；若响应里没拿到显式 title 就用它回填
+    if text:
+        m = _TITLE_TAG_RE.match(text.lstrip())
+        if m:
+            embedded = m.group("title").strip()
+            if not title and embedded:
+                title = embedded
+            text = text.lstrip()[m.end():].lstrip()
+
     if not text:
-        # 第一次接到未识别 shape 时打印 keys，方便适配
+        # 接到未识别 shape 时打印 keys，方便适配
         logger.warning(
             "lark-cli payload had no recognizable text field | keys=%s",
             list(payload.keys()),
