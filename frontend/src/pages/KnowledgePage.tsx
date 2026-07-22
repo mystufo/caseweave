@@ -1900,7 +1900,7 @@ export default function KnowledgePage({ view, onChangeView }: PageProps) {
                               </span>
                               <span className="text-gray-400">模块：{moduleLabel}</span>
                               <span className="text-gray-400">v{s.version}</span>
-                              <span className="text-gray-400">{formatDate(s.updated_at || s.created_at)}</span>
+                              <span className="text-gray-400">{formatDate(s.updated_at || s.created_at || null)}</span>
                             </div>
                           </div>
                           <div className="flex items-center gap-1 flex-shrink-0">
