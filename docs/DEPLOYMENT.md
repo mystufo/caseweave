@@ -98,7 +98,7 @@ ADMIN_EMAILS=you@example.com        # 只有这些账号能创建/删除项目
 JWT_SECRET=用一段足够长的随机字符串替换   # 例如 openssl rand -hex 32
 JWT_EXPIRE_HOURS=168
 
-DEBUG=false
+DEBUG=true
 ```
 
 > **重要**：把上面的 `SERVER_IP` 换成实际服务器 IP 或域名。如果通过域名+反向代理走 HTTPS，`CORS_ORIGINS` 要填 `https://你的域名`。
@@ -129,7 +129,7 @@ echo "VITE_API_URL=http://SERVER_IP:8001" > frontend/.env
 ### A.5 构建并启动
 
 ```bash
-docker compose up --build -d
+docker compose up --build -d（docker-compose up --build -d）
 # 或（项目提供了 Makefile 快捷方式）
 make up
 ```
