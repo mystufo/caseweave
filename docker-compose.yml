@@ -10,7 +10,9 @@ services:
     volumes:
       - pg_data:/var/lib/postgresql/data
     ports:
-      - "5432:5432"
+      # 宿主机端口可通过 .env 的 DB_HOST_PORT 覆盖，默认 5433 以避开本机已装的 PostgreSQL(5432)。
+      # 仅用于从宿主机/外部用工具连库；容器间通信走内网 db:5432，与此无关。
+      - "${DB_HOST_PORT:-5433}:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U testcraft"]
       interval: 5s
