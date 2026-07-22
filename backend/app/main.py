@@ -72,7 +72,7 @@ async def _prompt_suggestion_loop() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("Starting TestCraft AI | provider=%s model=%s", settings.llm_provider, settings.llm_model)
+    logger.info("Starting CaseWeave | provider=%s model=%s", settings.llm_provider, settings.llm_model)
     await init_db()
     logger.info("Database initialized")
 
@@ -97,7 +97,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="TestCraft AI",
+    title="CaseWeave 纬策",
     description="Intelligent Test Case Generation System",
     version="1.0.0",
     lifespan=lifespan,

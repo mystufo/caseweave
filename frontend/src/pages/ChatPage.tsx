@@ -2139,7 +2139,7 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
           {!activeSessionId && (
             <div className="flex flex-col items-center justify-center h-full text-center text-gray-400">
               <FileText size={44} className="mb-4 opacity-30" />
-              <p className="text-lg font-medium mb-1 text-gray-600">TestCraft AI</p>
+              <p className="text-lg font-medium mb-1 text-gray-600">CaseWeave 纬策</p>
               <p className="text-sm">从左侧选择「生成测试用例」或「生成测试脑图」开始</p>
             </div>
           )}

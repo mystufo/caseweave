@@ -43,7 +43,7 @@ export default function SessionList({ sessions, activeId, busyIds, onSelect, onN
   return (
     <div className="flex flex-col h-full">
       <div className="p-4 border-b border-gray-200">
-        <h1 className="text-lg font-bold text-gray-800 mb-3">TestCraft AI</h1>
+        <h1 className="text-lg font-bold text-gray-800 mb-3">CaseWeave 纬策</h1>
         <div className="space-y-2">
           <button
             onClick={() => onNew('cases')}

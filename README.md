@@ -1,92 +1,53 @@
-# case_generate_claude
+# CaseWeave 纬策
 
+> 把需求织成用例 —— 智能测试用例生成系统
 
+**CaseWeave（纬策）** 是一个 AI 驱动的测试用例生成系统。上传产品需求文档（Word / PDF / 飞书文档），系统先自动**澄清需求中的歧义**，再据此生成结构化、可执行的**测试用例**并导出 Excel。系统还具备**持续自我进化**能力：从用户反馈、编辑修改、Bug 数据中不断提炼测试设计经验，反哺后续生成。
 
-## Getting started
+## 核心特性
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
+- 📄 **文档解析** — 支持 Word / PDF 上传，以及飞书文档、脑图粘贴导入
+- ❓ **需求澄清** — 生成前先由 Clarifier Agent 识别文档中的歧义并向用户提问
+- 🧪 **用例生成** — Generator Agent 产出结构化测试用例，按模块分 Sheet 导出 Excel
+- 🧠 **知识库** — 基于 pgvector 的语义检索，跨文档积累产品知识并注入生成过程
+- 🔁 **反馈进化** — 分析用户的点赞/点踩/编辑差异，蒸馏测试设计规则（Skill），并给出 Prompt 改进建议
+- 👥 **多项目隔离 + JWT 鉴权** — 支持多团队/多项目独立使用
 
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
+## 技术栈
 
-## Add your files
+- **前端**：React + TypeScript + Vite + Tailwind CSS
+- **后端**：FastAPI + SQLAlchemy(async) + asyncpg
+- **数据库**：PostgreSQL 16 + pgvector
+- **LLM**：可切换 Provider（Anthropic 官方 API，或 OpenAI 兼容协议网关，如火山方舟 / DeepSeek 等）
 
-- [ ] [Create](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#create-a-file) or [upload](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#upload-a-file) files
-- [ ] [Add files using the command line](https://docs.gitlab.com/ee/gitlab-basics/add-file.html#add-a-file-using-the-command-line) or push an existing Git repository with the following command:
+## 快速开始
 
+```bash
+# 1. 配置环境变量
+cp .env.example .env
+# 编辑 .env，至少填入 LLM_API_KEY / LLM_MODEL / LLM_PROVIDER
+
+# 2. Docker 一键启动（PostgreSQL + 后端 + 前端）
+make up
+
+# 打开 http://localhost:3001，注册管理员账号（邮箱须在 .env 的 ADMIN_EMAILS 中）
 ```
-cd existing_repo
-git remote add origin http://172.31.0.3:8099/qa/case_generate_claude.git
-git branch -M main
-git push -uf origin main
+
+本地开发（需已装 Python 3.11、Node 20，并启动 PostgreSQL）：
+
+```bash
+make install       # 安装前后端依赖
+make db-up         # 仅启动 PostgreSQL
+make dev-backend   # FastAPI on :8001
+make dev-frontend  # Vite on :5173
 ```
 
-## Integrate with your tools
+## 部署
 
-- [ ] [Set up project integrations](http://172.31.0.3:8099/qa/case_generate_claude/-/settings/integrations)
+生产部署（Docker Compose 或裸机 + systemd/Nginx）详见 **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)**。
 
-## Collaborate with your team
+## 文档
 
-- [ ] [Invite team members and collaborators](https://docs.gitlab.com/ee/user/project/members/)
-- [ ] [Create a new merge request](https://docs.gitlab.com/ee/user/project/merge_requests/creating_merge_requests.html)
-- [ ] [Automatically close issues from merge requests](https://docs.gitlab.com/ee/user/project/issues/managing_issues.html#closing-issues-automatically)
-- [ ] [Enable merge request approvals](https://docs.gitlab.com/ee/user/project/merge_requests/approvals/)
-- [ ] [Set auto-merge](https://docs.gitlab.com/ee/user/project/merge_requests/merge_when_pipeline_succeeds.html)
-
-## Test and Deploy
-
-Use the built-in continuous integration in GitLab.
-
-- [ ] [Get started with GitLab CI/CD](https://docs.gitlab.com/ee/ci/quick_start/index.html)
-- [ ] [Analyze your code for known vulnerabilities with Static Application Security Testing(SAST)](https://docs.gitlab.com/ee/user/application_security/sast/)
-- [ ] [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/ee/topics/autodevops/requirements.html)
-- [ ] [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/ee/user/clusters/agent/)
-- [ ] [Set up protected environments](https://docs.gitlab.com/ee/ci/environments/protected_environments.html)
-
-***
-
-# Editing this README
-
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thank you to [makeareadme.com](https://www.makeareadme.com/) for this template.
-
-## Suggestions for a good README
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
-
-## Name
-Choose a self-explaining name for your project.
-
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
-
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
-
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
-
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
-
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
-
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
-
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
-
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
-
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
-
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
-
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
-
-## License
-For open source projects, say how it is licensed.
-
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+- [部署文档](docs/DEPLOYMENT.md)
+- [反馈进化设计](docs/feedback-evolution-design.md)
+- 开发指引与架构说明见 [CLAUDE.md](CLAUDE.md)

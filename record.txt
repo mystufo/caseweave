@@ -267,6 +267,30 @@ TestCraft AI — 开发进度记录
 ================================================================================
 变更 / 修复记录（倒序，最新在上）
 ================================================================================
+■ 2026-07-22 — 项目更名 CaseWeave（纬策）+ 新增 Ubuntu 部署文档 + 补全 .env 配置项
+  背景：项目准备开源到 GitHub，原代号「TestCraft AI」在 GitHub 上有 167 个同名仓库，
+        且已有同赛道 AI 测试项目 TestCraft-App（⭐77），撞名严重。经比选（TestCraft /
+        SpecCraft / TestWeaver 均在同领域已被占名），选定 CaseWeave（纬策）——PyPI+npm
+        全空、GitHub 仅 3 个 0 星空壳；语义「Case 用例 + Weave 编织」贴合多源信息编织+
+        持续进化，中文「纬策」扣经纬编织 + 测试策略。
+  改动（仅展示名 + 文档，代码逻辑/数据库/包名/目录名不动）：
+    ├─ 前端展示名：index.html <title>、SessionList / LoginPage / ChatPage 三处标题
+    │   TestCraft AI → CaseWeave 纬策。
+    ├─ 后端可见文字：main.py FastAPI title（/docs 页可见）+ 启动日志；
+    │   routes_chat.py 系统提示词助手自我介绍「你是 CaseWeave（纬策）」。
+    ├─ 文档：CLAUDE.md 简介、README.md（原 GitLab 空模板 → 正式开源介绍）、
+    │   docs/DEPLOYMENT.md 标题 / 正文 / systemd 服务描述。
+    └─ 新增 docs/DEPLOYMENT.md：Ubuntu 部署文档，覆盖 Docker Compose（推荐）与裸机
+        systemd+Nginx 两套方案，含前端 VITE_API_URL 构建期注入、CORS、SSE 反代缓冲、
+        数据备份、生产加固（去 --reload / 改 JWT_SECRET / 改库密码）等要点。
+  配置补全：
+    ├─ .env：补齐缺失项 LLM_TIMEOUT_SECONDS / LLM_MAX_RETRIES / JWT_SECRET（换成
+    │   openssl rand -hex 32 随机值，不再是默认 dev-secret）/ JWT_ALGORITHM /
+    │   JWT_EXPIRE_HOURS / PROMPT_SUGGESTION_* / LARK_*；原有值未动，仅追加。
+    └─ .env.example：补上 PROMPT_SUGGESTION_* 与 LARK_* 两组说明（开源模板完整性）。
+  注意：JWT_SECRET 更换后现有登录 token 全部失效，需重新登录；前端标题是构建期产物，
+        Docker 部署需重新 build 才生效。
+
 ■ 2026-07-21 — 修复：LLM 调用无超时导致界面卡在「正在抽取产品知识…」
   背景：从 PRD 抽知识时前端 loader 靠 extractCombinedDrafts 返回/抛错才解除，但整条 LLM
         调用链无任何超时——llm_factory.build_chat_model 建 client 时未传 timeout/max_retries，

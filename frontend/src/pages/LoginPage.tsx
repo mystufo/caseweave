@@ -46,7 +46,7 @@ export default function LoginPage({ onSuccess }: Props) {
     <div className="min-h-screen flex items-center justify-center bg-gray-50 px-4">
       <div className="w-full max-w-sm bg-white border border-gray-200 rounded-2xl shadow-sm p-7">
         <div className="text-center mb-5">
-          <h1 className="text-lg font-semibold text-gray-900">TestCraft AI</h1>
+          <h1 className="text-lg font-semibold text-gray-900">CaseWeave 纬策</h1>
           <p className="text-xs text-gray-400 mt-1">智能测试用例生成系统</p>
         </div>
 

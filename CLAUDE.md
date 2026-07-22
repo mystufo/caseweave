@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-**TestCraft AI** — 智能测试用例生成系统。用户上传产品需求文档（Word/PDF），系统先澄清歧义、再生成可执行测试用例（Excel）。具备持续自我进化能力（用户反馈、Bug数据、Browser Agent探索）。
+**CaseWeave（纬策）** — 智能测试用例生成系统。用户上传产品需求文档（Word/PDF），系统先澄清歧义、再生成可执行测试用例（Excel）。具备持续自我进化能力（用户反馈、Bug数据、Browser Agent探索）。
 
 ## Commands
 
