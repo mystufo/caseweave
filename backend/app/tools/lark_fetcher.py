@@ -122,9 +122,11 @@ async def fetch_lark_content(url: str, timeout: float | None = None) -> LarkCont
 
     # lark-cli v1 fetch-doc 已下线，现走 v2：能直接吃 docx/wiki/docs 三种 URL。
     # --doc-format markdown：拿干净的 markdown 正文喂 LLM（默认是 DocxXML，不适合直接生成用例）。
+    # --as user：用个人授权身份（lark-cli auth login），否则默认 bot 身份需配 app_id/secret。
     # 成功响应 shape 见 `_extract_title_and_text`：正文在 data.document.content，
     # 标题以 <title>…</title> 前缀内嵌在正文里。
-    cmd = [cli, "docs", "+fetch", "--doc", url, "--doc-format", "markdown", "--format", "json"]
+    cmd = [cli, "docs", "+fetch", "--doc", url, "--as", settings.lark_cli_identity,
+           "--doc-format", "markdown", "--format", "json"]
     logger.info("lark fetch | kind=%s url=%s", kind, url[:120])
 
     try:

@@ -74,6 +74,9 @@ class Settings(BaseSettings):
     # lark-cli (Feishu doc URL import)
     lark_cli_path: str = "lark-cli"
     lark_cli_timeout_seconds: int = 60
+    # 抓取身份：user（个人授权，走 auth login）| bot（应用，需 app_id/secret）。
+    # 默认 user，与 `lark-cli auth login` 的登录方式一致。
+    lark_cli_identity: str = "user"
 
     # App
     debug: bool = False
