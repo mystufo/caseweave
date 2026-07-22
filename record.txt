@@ -267,6 +267,26 @@ TestCraft AI — 开发进度记录
 ================================================================================
 变更 / 修复记录（倒序，最新在上）
 ================================================================================
+■ 2026-07-22 — 修复：知识抽取超时被静默吞掉，用户误以为"没抽到"
+  背景：extract_knowledge 是 fail-open 设计——LLM 调用超时/报错一律返回 []，与"文档里
+        确实没有可沉淀规则"返回同一个空数组。前端 triggerCombinedExtraction 拿到空
+        drafts 就直接置空审核面板、静默进入下一步（澄清）。用户看到"正在抽取可沉淀的
+        产品知识"过一会变成后续界面，无法区分是抽取超时还是本就无可抽内容。
+        （注：前端"不注入知识，开始澄清"按钮反映的是【知识库检索】未命中，走 pgvector
+         无 LLM，基本不会超时；与本次的【知识抽取】超时是两回事。）
+  改动（最小改动，让超时可见，不阻塞澄清/生成）：
+    ├─ knowledge_extractor.py：extract_knowledge 加 raise_on_error=False 参数，
+    │   True 时把 LLM 超时/异常抛出而非静默返回 []。默认 False，其他调用方不受影响。
+    ├─ routes_upload.py：_extract_combined_and_stash 改用 raise_on_error=True 并捕获，
+    │   返回 dict 加 extract_status（"ok" 含抽到空 / "error" 超时或报错被跳过）。
+    └─ 前端 client.ts 补 extract_status 类型；ChatPage.tsx triggerCombinedExtraction
+        拿到 "error" 时推一条 assistant 提示气泡（超时已跳过，不影响澄清与生成）。
+  超时上限说明：LLM_TIMEOUT_SECONDS 代码层无硬上限，但实际有效上限被 nginx
+        proxy_read_timeout 300s（frontend/nginx.conf:17）与 axios timeout 300s
+        （client.ts）卡住。抽取最坏耗时 = timeout×(1+LLM_MAX_RETRIES)：默认 retries=1
+        时安全上限约 140s（140×2=280s<300s）；retries=0 可放到约 290s。想超 300s
+        必须同步调大 nginx proxy_read_timeout 与 axios timeout。
+
 ■ 2026-07-22 — 项目更名 CaseWeave（纬策）+ 新增 Ubuntu 部署文档 + 补全 .env 配置项
   背景：项目准备开源到 GitHub，原代号「TestCraft AI」在 GitHub 上有 167 个同名仓库，
         且已有同赛道 AI 测试项目 TestCraft-App（⭐77），撞名严重。经比选（TestCraft /

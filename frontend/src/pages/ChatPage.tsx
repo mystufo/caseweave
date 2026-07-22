@@ -458,12 +458,23 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
               submitting: false,
             }
           : null
-      patchSession(sid, {
+      patchSession(sid, prev => ({
         extractingDrafts: false,
         // 草稿只落一个 slot，另一个清空——合并后永远只出一个审核面板
         prdDraftReview: payload.role === 'prd' ? (slot as SessionState['prdDraftReview']) : null,
         mindmapDraftReview: payload.role === 'mindmap' ? (slot as SessionState['mindmapDraftReview']) : null,
-      })
+        // 抽取超时/报错：静默 fail-open 会让用户误以为"没抽到"，这里补一条提示气泡。
+        // 不阻塞后续澄清 / 生成。
+        messages: payload.extract_status === 'error'
+          ? [...prev.messages, {
+              id: Date.now(),
+              role: 'assistant' as const,
+              content: '⚠️ 产品知识抽取超时或失败，已自动跳过（不影响澄清与生成）。'
+                + '如需沉淀本文档知识，可稍后重新上传重试，或联系管理员调大 LLM_TIMEOUT_SECONDS。',
+              created_at: new Date().toISOString(),
+            }]
+          : prev.messages,
+      }))
     } catch (err) {
       console.error('Combined extraction failed:', err)
       if (extractTokenRef.current.get(sid) === token) {

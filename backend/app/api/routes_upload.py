@@ -542,11 +542,13 @@ async def _extract_combined_and_stash(session_id: int, project_id: int) -> dict:
     """合并抽取：把本会话的 PRD 与测试脑图合成一次知识抽取（脑图优先），产物 stash 到
     主文档（有 PRD 就是 PRD，否则脑图），并清空另一份文档的 pending_knowledge。
 
-    返回 {document_id, module_id, module_name, role, drafts}，shape 与旧
+    返回 {document_id, module_id, module_name, role, drafts, extract_status}，shape 与旧
     extracted_knowledge_drafts 帧一致，供前端直接落到审核面板。fail-open：
     任何异常都返回空 drafts（前端按"无草稿"处理，继续走注入预览 / 澄清）。
+    extract_status="ok" 正常（含"抽到空"）；="error" 表示 LLM 抽取超时/报错被跳过，
+    前端据此给用户提示（不阻塞后续澄清 / 生成）。
     """
-    empty = {"document_id": None, "module_id": None, "module_name": None, "role": "prd", "drafts": []}
+    empty = {"document_id": None, "module_id": None, "module_name": None, "role": "prd", "drafts": [], "extract_status": "ok"}
     t0 = time.perf_counter()
     try:
         async with AsyncSessionLocal() as db:
@@ -586,15 +588,18 @@ async def _extract_combined_and_stash(session_id: int, project_id: int) -> dict:
             other_id = other.id if other is not None else None
 
         # LLM 合并抽取（一次调用）
+        extract_status = "ok"
         try:
             drafts_objs = await extract_knowledge(
                 truncate_for_llm(prd_text) if prd_text else "",
                 module_name=module_name,
                 mindmap_content=truncate_for_llm(mm_text) if mm_text else None,
+                raise_on_error=True,
             )
         except Exception as exc:
             logger.warning("combined knowledge extraction failed (treated as empty): %s", exc)
             drafts_objs = []
+            extract_status = "error"
 
         drafts_dicts = await _drafts_to_dicts_with_conflicts(
             drafts_objs, project_id=project_id, module_id=module_id,
@@ -616,6 +621,7 @@ async def _extract_combined_and_stash(session_id: int, project_id: int) -> dict:
             "module_name": module_name,
             "role": primary_role,
             "drafts": drafts_dicts,
+            "extract_status": extract_status,
         }
     except Exception as exc:
         logger.warning(

@@ -109,12 +109,16 @@ async def extract_knowledge(
     doc_content: str,
     module_name: str | None = None,
     mindmap_content: str | None = None,
+    raise_on_error: bool = False,
 ) -> list[KnowledgeDraft]:
     """Best-effort knowledge extraction. Returns [] on any failure.
 
     可同时传 PRD 正文（doc_content）与测试脑图正文（mindmap_content）：两者都在时合并成
     一次抽取，脑图代表测试人员的最终意图，冲突时以脑图为准（与 clarifier 的约定一致）。
     仅传一份时行为不变。
+
+    raise_on_error=True 时，LLM 调用超时/报错会把异常抛出（而非静默返回 []），供调用方
+    区分"抽到空"与"抽取失败"并给用户提示。默认 False 保持旧的 fail-open 行为。
     """
     if not (doc_content or "").strip() and not (mindmap_content or "").strip():
         return []
@@ -153,6 +157,8 @@ async def extract_knowledge(
             "（超时可调大 LLM_TIMEOUT_SECONDS，当前 %.0fs）",
             elapsed_ms, type(e).__name__, e, settings.llm_timeout_seconds,
         )
+        if raise_on_error:
+            raise
         return []
 
     elapsed_ms = (time.perf_counter() - start) * 1000

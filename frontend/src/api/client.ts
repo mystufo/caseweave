@@ -304,6 +304,9 @@ export interface ExtractedKnowledgeDrafts {
   role: 'prd' | 'mindmap'
   source?: string
   drafts: KnowledgeDraft[]
+  // "ok" 正常（含抽到空）；"error" 表示知识抽取 LLM 调用超时/报错被跳过，
+  // 前端据此给用户提示（不影响后续澄清 / 生成）。仅 extract_combined_drafts 返回。
+  extract_status?: 'ok' | 'error'
 }
 
 // 上传完成后触发的「PRD + 脑图」合并知识抽取（脑图优先）。
