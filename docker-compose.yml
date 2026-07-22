@@ -24,12 +24,19 @@ services:
     env_file: .env
     environment:
       DATABASE_URL: postgresql+asyncpg://testcraft:testcraft@db:5432/testcraft
+      # 把宿主机 Node 运行时挂到 /opt/node，其 bin 加进 PATH，供 lark-cli(Node 程序)使用
+      PATH: "/opt/node/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin"
     ports:
       - "8001:8001"
     volumes:
       - ./backend:/app
       - ./prompts:/app/prompts
       - ./skills:/app/skills
+      # 复用宿主机的 lark-cli：挂载 Node 运行时(含全局 @larksuite/cli) + 登录凭证目录。
+      # 路径按你的机器覆盖：LARK_NODE_DIR 指向 nvm 里的某个 node 版本目录，LARK_CLI_HOME 为 ~/.lark-cli。
+      # 未装 lark-cli 的机器：变量留空/路径不存在时会挂成空目录，飞书导入优雅失败，不影响其他功能。
+      - ${LARK_NODE_DIR:-/root/.nvm/versions/node/v24.14.0}:/opt/node:ro
+      - ${LARK_CLI_HOME:-/root/.lark-cli}:/root/.lark-cli
     depends_on:
       db:
         condition: service_healthy
