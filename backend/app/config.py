@@ -75,8 +75,8 @@ class Settings(BaseSettings):
     lark_cli_path: str = "lark-cli"
     lark_cli_timeout_seconds: int = 60
     # 抓取身份：user（个人授权，走 auth login）| bot（应用，需 app_id/secret）。
-    # 默认 user，与 `lark-cli auth login` 的登录方式一致。
-    lark_cli_identity: str = "user"
+    # 默认 bot：应用凭证不过期、不依赖 OS keychain，适合容器/服务器无人值守部署。
+    lark_cli_identity: str = "bot"
 
     # App
     debug: bool = False
