@@ -6,9 +6,11 @@
 
 | 服务 | 说明 | 端口 |
 |------|------|------|
-| `db` | PostgreSQL 16 + pgvector（语义检索） | 5432 |
+| `db` | PostgreSQL 16 + pgvector（语义检索） | 宿主机 5433 → 容器 5432（可配置，见下） |
 | `backend` | FastAPI + SQLAlchemy(async)，提供全部 API | 8001 |
 | `frontend` | React 构建产物，由 Nginx 托管，并反向代理 `/api/` 到 backend | 3001（映射容器 80） |
+
+> **db 端口**：为避开宿主机上可能已存在的 PostgreSQL（5432），compose 默认把 db 容器映射到宿主机 **5433**（`"${DB_HOST_PORT:-5433}:5432"`）。可在 `.env` 用 `DB_HOST_PORT` 改端口。这只影响从宿主机/外部用工具连库；**容器间通信始终走内网 `db:5432`，与此无关**，所以 `DATABASE_URL` 里的 `@db:5432` 不用改。
 
 推荐用 **Docker Compose 一键部署**（方式 A）。若服务器不便安装 Docker，可用**裸机部署**（方式 B）。
 
@@ -63,6 +65,14 @@ sudo usermod -aG docker $USER
 # 验证
 docker --version && docker compose version
 ```
+
+> **国内服务器拉镜像 / 构建慢**：`docker compose up --build` 会拉 `python:3.11-slim`、`node:20-alpine`、`nginx:alpine`、`pgvector/pgvector:pg16` 四个基础镜像，并在构建时装 apt/pip/npm 依赖。国内访问 Docker Hub 与官方源常超时，两处已做处理：
+> - **基础镜像**：给 Docker 配国内加速器。编辑 `/etc/docker/daemon.json`（用你云厂商的加速地址最稳；公共站可用 `https://docker.m.daocloud.io`），改完 `sudo systemctl daemon-reload && sudo systemctl restart docker`。若加速器仍连不上官方，可带前缀显式拉取再打回原 tag，例如 `docker pull docker.m.daocloud.io/library/python:3.11-slim && docker tag docker.m.daocloud.io/library/python:3.11-slim python:3.11-slim`。
+> - **构建期依赖**：`backend/Dockerfile` 已把 apt 换阿里云 Debian 源、pip 换阿里云 PyPI 源；`frontend/Dockerfile` 已把 npm 换 npmmirror 源。无需额外配置。
+
+### A.1.1 关于 docker compose 版本
+
+本文命令用 **v2 语法 `docker compose`（带空格）**。若服务器上是老的 **v1 `docker-compose`（带连字符，如 1.29.2）**，用它 `up`/`recreate` 时可能报 `KeyError: 'ContainerConfig'`——这是 v1 与新版 Docker 镜像格式不兼容的已知 bug，触发点是"就地重建旧容器"。绕过办法：**先 `docker-compose down` 删掉旧容器，再 `docker-compose up -d` 全新创建**（`down` 不删 `pg_data` 卷，数据安全）。长期建议装 v2 插件（`sudo apt-get install -y docker-compose-plugin`）改用 `docker compose`。
 
 ### A.2 拉取代码
 
@@ -129,7 +139,8 @@ echo "VITE_API_URL=http://SERVER_IP:8001" > frontend/.env
 ### A.5 构建并启动
 
 ```bash
-docker compose up --build -d（docker-compose up --build -d）
+docker compose up --build -d
+# 老版本用连字符：docker-compose up --build -d（若报 ContainerConfig 错，见 A.1.1）
 # 或（项目提供了 Makefile 快捷方式）
 make up
 ```
@@ -367,7 +378,7 @@ Docker 数据卷为 `pg_data`（`docker volume ls` 可见），删除 compose �
   - 把 Dockerfile 的 `CMD` 改为不带 `--reload`，并可加 `--workers 2`（如 `uvicorn app.main:app --host 0.0.0.0 --port 8001 --workers 2`）。
 - **防火墙**：仅对外开放需要的端口。走 A.7/B.6 的统一 Nginx 时，只需放行 80/443，把 8001、5432 限制在本机。
 - **LLM 超时**：文档较长、用思考型模型时，若出现「正在抽取产品知识…」一直转圈，调大 `.env` 的 `LLM_TIMEOUT_SECONDS`。
-- **飞书文档导入**（可选功能）：依赖 `lark-cli`，需在后端环境中另行安装并配置 `LARK_CLI_PATH`；不使用该功能可忽略。
+- **飞书文档导入**（可选功能）：依赖 `lark-cli`。Docker 部署下后端在容器里，配置较特殊，见下方「附录：飞书文档导入（lark-cli）配置」。不使用该功能可忽略。
 
 ## 4. 常见问题
 
@@ -378,3 +389,72 @@ Docker 数据卷为 `pg_data`（`docker volume ls` 可见），删除 compose �
 | 后端日志 `alembic upgrade failed` | 非致命（服务仍会起），但需关注；通常是数据库连接或历史 schema 问题，查 `journalctl` / `docker compose logs backend` |
 | 上传大文档超时 | 调大 `LLM_TIMEOUT_SECONDS`；确认 Nginx `proxy_read_timeout` 足够（已给 300s） |
 | SSE 流式（聊天/生成进度）不流式、一次性返回 | 反代必须 `proxy_buffering off`（本文的 Nginx 配置已包含） |
+| `docker-compose up` 报 `KeyError: 'ContainerConfig'` | v1 与新版镜像不兼容的已知 bug。先 `docker-compose down` 再 `up -d`；或改用 v2 `docker compose`。见 A.1.1 |
+| 启动报 `bind: address already in use`（5432/8001/3001） | 宿主机端口被占用（常见于同机已跑另一套项目）。db 可用 `.env` 的 `DB_HOST_PORT` 改宿主机端口；其他服务改 `docker-compose.yml` 里 `ports` 左侧的宿主机端口 |
+| 拉基础镜像超时 / 构建极慢 | 配 Docker 国内加速器，或带前缀显式 `docker pull` 再打 tag。见 A.1 的说明框 |
+| 飞书导入报 `lark-cli 未安装` / `invalid_client` / `token_missing` | 见「附录：飞书文档导入（lark-cli）配置」 |
+
+---
+
+## 附录：飞书文档导入（lark-cli）配置
+
+可选功能。允许粘贴飞书文档 URL（docx / wiki / docs）直接导入。依赖 [`lark-cli`](https://www.npmjs.com/package/@larksuite/cli)。**不用此功能可整节跳过。**
+
+### 为什么 Docker 下要特殊处理
+
+后端跑在容器里，而 `lark-cli` 是宿主机上用 nvm 装的 Node 程序，且它的凭证不是普通文件——容器默认既找不到二进制、也读不到凭证。要点：
+
+- **二进制**：`lark-cli` 依赖整个 Node 运行时，光拷二进制没用。做法是把宿主机的 Node 目录挂进容器。
+- **身份**：`lark-cli` 支持 `user`（个人授权，`auth login`）和 `bot`（应用，app_id+secret）两种身份。
+  - **user token 存进 OS keychain**，容器读不到，且会过期需重新浏览器授权——**不适合服务器/容器**。
+  - **bot 凭证是 app_id+secret**，静态不过期，是服务器部署的正解。**本项目默认 `bot`**（`LARK_CLI_IDENTITY=bot`）。
+- **凭证持久化**：`lark-cli config init` 把 App Secret 也存进**容器级 keychain**（`config.json` 里只留 `source=keychain` 指针），`docker compose down` 重建容器后即失效。为此后端镜像内置了 `docker-entrypoint.sh`，**每次启动用 `.env` 里的 secret 自动重新 `config init`，自愈**。
+
+### 配置步骤（Docker 方式）
+
+**1. 飞书开放平台准备**（[open.feishu.cn](https://open.feishu.cn/)）
+- 创建/选用一个企业自建应用，记下 **App ID** 和 **App Secret**（凭证与基础信息页）。
+- 权限管理里开通文档读取权限（至少 `docx:document:readonly`，导入知识库 wiki 链接还需 wiki 节点读取权限），**发布应用版本**才生效。
+- 把要导入的文档 / 知识库**共享给该应用**（bot 是独立机器人，默认看不到你的文档）。
+
+**2. 挂载宿主机 Node 运行时**（`docker-compose.yml` 已配好，按你的机器核对路径）
+```bash
+which lark-cli                       # 反查 → /root/.nvm/versions/node/vX.Y.Z/bin/lark-cli
+```
+在 `.env` 里设：
+```ini
+LARK_NODE_DIR=/root/.nvm/versions/node/v24.14.0   # 上面反查到的 node 版本目录
+LARK_CLI_HOME=/root/.lark-cli                     # lark-cli 配置目录
+```
+
+**3. 填 bot 凭证到 `.env`**
+```ini
+LARK_CLI_IDENTITY=bot
+LARK_APP_ID=cli_xxxxxxxxxxxxxxxx
+LARK_APP_SECRET=你的AppSecret
+```
+
+**4. 重建后端**（Dockerfile / 挂载变更，需 `--build`）
+```bash
+docker compose down && docker compose up -d --build
+```
+
+**5. 验证**
+```bash
+# 看 entrypoint 是否成功自动 init
+docker compose logs backend | grep entrypoint
+# 应出现：[entrypoint] lark-cli bot 凭证已初始化 (app_id=cli_...)
+
+# 容器里实拉一篇文档（换成你的、且已共享给应用的文档 URL）
+docker compose exec backend lark-cli docs +fetch --doc "https://xxx.feishu.cn/wiki/xxxx" --as bot --format json
+```
+返回 `"ok": true` + 内容即成功。之后网页端粘贴飞书链接导入即可。
+
+### 排错
+
+| 现象 | 原因 / 处理 |
+|------|-------------|
+| `lark-cli 未安装：No such file or directory` | 容器没挂到 Node。核对 `.env` 的 `LARK_NODE_DIR` 路径、`which lark-cli` 反查是否一致；`docker compose exec backend lark-cli --version` 验证 |
+| `invalid_client` / `The auth method is not supported` | bot 凭证没生效。看 `docker compose logs backend \| grep entrypoint`；确认 `.env` 的 `LARK_APP_ID/LARK_APP_SECRET` 已填、且容器已 `--build` 重建 |
+| `token_missing` + `identity: user` | 后端仍走 user 身份。确认 `LARK_CLI_IDENTITY=bot` 且容器已重启读到新配置 |
+| 抓取报无权限 / 读不到文档内容 | 应用权限没开全或没发布，或目标文档没共享给应用。回开放平台补权限、发版本、共享文档 |
