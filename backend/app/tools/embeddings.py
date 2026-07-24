@@ -11,7 +11,10 @@ Phase 3 用于把知识条目向量化后写入 pgvector。所有调用走标准
   批量调用方需自行 fan-out。
 
 设计要点：
-- 配置缺失（无 api_key）时 `embed_texts` 返回 None，调用方需做 None 检查并优雅降级
+- provider=local（默认）走随 docker-compose 起的本地 TEI 容器（BAAI/bge-m3），
+  base_url 留空时自动指向 http://embedding:80/v1，无需 api_key。
+- provider=openai 走远程兼容接口，必须配 api_key，否则 `embed_texts` 返回 None。
+- 配置缺失 / TEI 未就绪时 `embed_texts` 返回 None，调用方需做 None 检查并优雅降级
   （知识入库照常写 content，仅跳过 embedding 字段；搜索退化为按 confidence/时间排序）
 - 失败只 log+返回 None，不抛出，避免后台抽取任务把请求线吞了
 - 自动按 settings.embedding_dim 校验维度，维度对不上视为配置错误
@@ -28,12 +31,16 @@ from app.config import get_settings
 logger = logging.getLogger(__name__)
 
 _DEFAULT_BASE = "https://api.openai.com/v1"
+_DEFAULT_LOCAL_BASE = "http://embedding:80/v1"  # docker-compose 里的 TEI 服务
 
 
 def _resolve_base_url() -> str:
     s = get_settings()
     base = (s.embedding_base_url or "").rstrip("/")
     if not base:
+        # provider=local 且没显式配 base_url → 指向随 compose 起的本地 TEI 容器
+        if (s.embedding_provider or "openai").lower() == "local":
+            return _DEFAULT_LOCAL_BASE
         return _DEFAULT_BASE
     # 容错：允许用户填到 /v1 或不填，统一去掉尾部 /embeddings(/multimodal) 防重复
     for suffix in ("/embeddings/multimodal", "/embeddings"):
@@ -115,12 +122,15 @@ async def embed_texts(texts: list[str]) -> Optional[list[list[float]]]:
         return []
 
     s = get_settings()
-    if not s.embedding_api_key:
-        logger.info("embedding skipped: no embedding_api_key configured")
+    provider = (s.embedding_provider or "openai").lower()
+
+    if provider not in ("openai", "local"):
+        logger.warning("embedding provider %r not supported, skipping", s.embedding_provider)
         return None
 
-    if (s.embedding_provider or "openai").lower() != "openai":
-        logger.warning("embedding provider %r not supported, skipping", s.embedding_provider)
+    # 远程 openai 兼容接口必须有 key；local（本地 TEI 容器）不需要鉴权。
+    if provider == "openai" and not s.embedding_api_key:
+        logger.info("embedding skipped: no embedding_api_key configured")
         return None
 
     mode = (s.embedding_mode or "standard").lower()

@@ -50,5 +50,20 @@ services:
       - backend
     restart: unless-stopped
 
+  # 本地开源 embedding 服务（HuggingFace Text Embeddings Inference）。
+  # 用户不配置远程 EMBEDDING_API_KEY 时，backend 默认走内网 http://embedding:80/v1，
+  # 让知识库语义检索开箱即用（模型 BAAI/bge-m3，1024 维，多语言/中文友好）。
+  # 首次启动会下载模型权重（~2GB，几分钟），存入 embedding_data 卷避免每次重拉。
+  # backend 故意不 depends_on 本服务：TEI 冷启动慢，靠 embeddings.py 的 fail-open
+  # 降级兜底（未就绪时暂无语义检索，就绪后自动恢复），不拖慢后端启动。
+  # 架构覆盖：x86 用默认 cpu-1.9；Apple Silicon/ARM 服务器设 EMBEDDING_IMAGE=...:cpu-arm64-1.9。
+  embedding:
+    image: ${EMBEDDING_IMAGE:-ghcr.io/huggingface/text-embeddings-inference:cpu-1.9}
+    command: ["--model-id", "BAAI/bge-m3", "--auto-truncate"]
+    volumes:
+      - embedding_data:/data
+    restart: unless-stopped
+
 volumes:
   pg_data:
+  embedding_data:

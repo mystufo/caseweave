@@ -34,12 +34,16 @@ class Settings(BaseSettings):
     prompt_suggestion_min_samples: int = 3
 
     # Embedding (OpenAI-compatible /v1/embeddings; 用于 Phase 3 知识库语义检索)
-    # 留空 → store 静默降级（写入跳过 embedding，搜索退化为按时间倒序），不会阻塞 LLM 主流程
-    embedding_provider: str = "openai"           # 目前仅支持 openai 兼容接口
-    embedding_model: str = "text-embedding-3-small"
-    embedding_api_key: str = ""
-    embedding_base_url: Optional[str] = None     # e.g. https://ark.cn-beijing.volces.com/api/v3
-    embedding_dim: int = 1536                    # 必须与上面 model 输出维度一致；默认 OpenAI small=1536
+    # provider:
+    #   local  → 默认。指向随 docker-compose 起的本地 TEI 容器（BAAI/bge-m3，1024 维），
+    #            无需 api_key，base_url 留空时自动用 http://embedding:80/v1，开箱即用。
+    #   openai → 远程 OpenAI 兼容接口（含火山方舟/智谱等），必须配 embedding_api_key；
+    #            不配 key 则静默降级（写入跳过 embedding，检索退化为按时间倒序），不阻塞主流程。
+    embedding_provider: str = "local"            # local（本地 TEI）| openai（远程兼容接口）
+    embedding_model: str = "bge-m3"              # TEI 不校验此值仅占位；远程时填实际模型名
+    embedding_api_key: str = ""                  # provider=local 无需；provider=openai 必填
+    embedding_base_url: Optional[str] = None     # local 留空→http://embedding:80/v1；远程 e.g. https://ark.cn-beijing.volces.com/api/v3
+    embedding_dim: int = 1024                    # 必须与 model 实际输出维度一致；bge-m3=1024，OpenAI small=1536
     embedding_mode: str = "standard"             # standard | multimodal（火山方舟视觉版走 /embeddings/multimodal）
 
     # ── Knowledge retrieval (Phase 3) ─────────────────────────────────────────

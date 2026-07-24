@@ -267,6 +267,24 @@ TestCraft AI — 开发进度记录
 ================================================================================
 变更 / 修复记录（倒序，最新在上）
 ================================================================================
+■ 2026-07-24 — 新增：本地自带开源 embedding 服务（用户不配远程时开箱即用）
+  背景：此前 embedding 只有远程一条路——不配 EMBEDDING_API_KEY 就静默降级，知识库检索
+        从「语义近邻」退化成「按 confidence/时间倒序」，效果明显变差。希望零配置也能有语义检索。
+  方案：docker-compose 新增独立 embedding 容器（HuggingFace TEI，模型 BAAI/bge-m3，1024 维，
+        中文友好），暴露标准 OpenAI /v1/embeddings，backend 代码几乎零改动即可对接。
+  改动：
+    ├─ docker-compose.yml：新增 embedding 服务（TEI，镜像 EMBEDDING_IMAGE 可覆盖架构，
+    │   x86=cpu-1.9 / ARM=cpu-arm64-1.9），模型权重持久化到 embedding_data 卷（~2GB，仅首次下载）。
+    │   backend 故意不 depends_on 它——TEI 冷启动慢，靠 embeddings.py 的 fail-open 兜底，不拖慢后端。
+    ├─ config.py：默认 embedding_provider=local、embedding_dim=1024、embedding_model=bge-m3。
+    ├─ tools/embeddings.py：新增 provider=local 分支。解耦「必须有 api_key」——仅远程 openai
+    │   要求 key，local 不鉴权；base_url 留空时自动指向 http://embedding:80/v1。降级/维度校验全复用。
+    └─ .env.example：三种模式说明（local 默认 / 远程 openai / 关闭降级）+ EMBEDDING_IMAGE 架构覆盖
+        + 非 Docker 本地开发单独起 TEI 的命令示例。
+  注意：维度 1536→1024 无需手写迁移——init_db 已有「维度不一致自动 DROP 重建 knowledge_entries」
+        逻辑（database.py），改配置重启即可，知识条目可从 documents.raw_text 重新抽取。
+        已有 1536 维旧向量的生产库重启会重建该表（旧向量丢失，需重抽），全新库无影响。
+
 ■ 2026-07-24 — 修复：alembic 启动迁移把应用日志配置整个冲掉，文件里只剩启动几行
   背景：接上"日志落盘"后发现 app.log 停在 alembic 的 "Will assume transactional DDL"
         之后就再无内容——Database initialized、每条请求日志、知识检索诊断全丢。
