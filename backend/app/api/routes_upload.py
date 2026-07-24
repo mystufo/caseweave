@@ -39,7 +39,7 @@ from app.agents.knowledge_dedup import classify_relations
 from app.agents.module_classifier import classify_module, ModuleSuggestion
 from app.knowledge.store import (
     store_entries, search_relevant, summarize_for_prompt, HitEntry,
-    find_similar_entries,
+    find_similar_entries, log_miss_diagnostics,
 )
 from app.api._assistant_messages import record_knowledge_selection
 from app.config import get_settings
@@ -230,6 +230,10 @@ async def _compute_knowledge_preview(
         top_k = get_settings().knowledge_preview_top_k
     query = truncate_for_llm(raw_text or "", limit=2000)
     if not query.strip():
+        logger.info(
+            "knowledge preview project=%s module=%s doc=%s | 文档正文为空 → 面板显示未命中（未触发检索）",
+            project_id, module_id, document_id,
+        )
         return []
     try:
         async with AsyncSessionLocal() as db:
@@ -238,6 +242,14 @@ async def _compute_knowledge_preview(
                 query=query, top_k=top_k,
             )
             if not hits:
+                logger.info(
+                    "knowledge preview project=%s module=%s doc=%s | search_relevant 返回 0 条 → 面板显示未命中",
+                    project_id, module_id, document_id,
+                )
+                await log_miss_diagnostics(
+                    db, project_id=project_id, module_id=module_id,
+                    document_id=document_id, query=query, top_k=top_k, context="upload",
+                )
                 return []
             hit_ids = [h.id for h in hits]
             rows = (await db.execute(
@@ -245,12 +257,23 @@ async def _compute_knowledge_preview(
             )).scalars().all()
             by_id = {e.id: e for e in rows}
             dist_by_id = {h.id: h.distance for h in hits}
-            return [
+            out = [
                 _knowledge_hit_dict(by_id[h.id], dist_by_id.get(h.id))
                 for h in hits
                 # 排除来自同一文档的条目（自反馈污染防护）
                 if h.id in by_id and by_id[h.id].document_id != document_id
             ]
+            logger.info(
+                "knowledge preview project=%s module=%s doc=%s | 检索=%d 同文档排除后=%d",
+                project_id, module_id, document_id, len(hits), len(out),
+            )
+            if not out:
+                # 检索到了条目、但全被同文档排除（或阈值过滤后本就为空）→ 面板仍显示未命中
+                await log_miss_diagnostics(
+                    db, project_id=project_id, module_id=module_id,
+                    document_id=document_id, query=query, top_k=top_k, context="upload",
+                )
+            return out
     except Exception as exc:
         logger.warning("compute_knowledge_preview failed: %s", exc)
         return []

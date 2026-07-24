@@ -19,7 +19,7 @@ from app.api.routes_projects import router as projects_router
 from app.api.routes_prompts import router as prompts_router
 
 settings = get_settings()
-setup_logging("DEBUG" if settings.debug else "INFO")
+setup_logging("DEBUG" if settings.debug else "INFO", settings.log_file)
 logger = logging.getLogger("testcraft.main")
 
 

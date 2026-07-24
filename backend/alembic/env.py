@@ -21,7 +21,12 @@ from app.database import Base
 from app.models import session, knowledge, feedback, user, clarification  # noqa: F401
 
 config = context.config
-if config.config_file_name is not None:
+# 仅当独立跑 alembic CLI（root logger 还没配置 handler）时才让 alembic 接管日志。
+# 在应用进程内启动迁移时，root 已经被 setup_logging() 挂好了 stderr + 文件 handler；
+# fileConfig() 默认会清空 root 的 handlers（摘掉我们的 RotatingFileHandler）并
+# disable_existing_loggers=True 禁用所有 testcraft.* / uvicorn logger —— 那样迁移之后
+# 全站日志（含请求日志、知识检索诊断）都不再落盘。此处跳过即可保住应用自己的日志配置。
+if config.config_file_name is not None and not logging.getLogger().handlers:
     fileConfig(config.config_file_name)
 
 # Wire DB URL from project settings

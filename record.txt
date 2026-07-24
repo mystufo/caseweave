@@ -267,6 +267,33 @@ TestCraft AI — 开发进度记录
 ================================================================================
 变更 / 修复记录（倒序，最新在上）
 ================================================================================
+■ 2026-07-24 — 修复：alembic 启动迁移把应用日志配置整个冲掉，文件里只剩启动几行
+  背景：接上"日志落盘"后发现 app.log 停在 alembic 的 "Will assume transactional DDL"
+        之后就再无内容——Database initialized、每条请求日志、知识检索诊断全丢。
+  根因：init_db 末尾在进程内跑 alembic upgrade，alembic/env.py 无条件调用
+        fileConfig(alembic.ini)。fileConfig 默认 disable_existing_loggers=True，
+        会①清空 root 的 handlers（摘掉我们刚挂的 RotatingFileHandler）②禁用所有
+        未在 alembic.ini 声明的 logger（testcraft.* / uvicorn / app.knowledge.*）。
+        于是迁移之后全站日志既不落盘、部分 logger 还被禁用。
+  改动：env.py 仅在 root logger 尚无 handler（=独立跑 alembic CLI）时才 fileConfig；
+        应用进程内启动迁移时 root 已被 setup_logging 配好，直接跳过，保住文件 handler。
+        已验证重启后 app.log 恢复 Database initialized / 请求日志 / knowledge 检索日志。
+
+■ 2026-07-24 — 新增：后端日志可落盘到文件（默认 backend/logs/app.log，可在 .env 改路径）
+  背景：此前 setup_logging 只挂 StreamHandler(sys.stderr)，日志仅输出到终端；config.py
+        虽早有 log_file 配置项（默认 logs/app.log）但从未被任何代码读取，属死配置。
+        Docker 下靠 make logs 看，进程重启/终端关闭即无历史可查。
+  改动（把已存在的 log_file 配置真正接上，同时保留终端输出）：
+    ├─ logging_config.py：setup_logging 加 log_file 参数，非空时挂一个
+    │   RotatingFileHandler（单文件 10MB、backupCount=5），自动 makedirs 父目录，
+    │   支持 ~ 展开。落盘失败只 warning 并退回仅 stderr，绝不拖垮启动。
+    ├─ main.py：启动时把 settings.log_file 传入 setup_logging。
+    ├─ .env.example：补 LOG_FILE=logs/app.log，说明留空可关闭、支持 ~/相对/绝对路径。
+    └─ .gitignore：忽略 logs/、backend/logs/、*.log，避免日志被提交。
+  行为：日志【同时】打终端和文件；默认相对后端进程 CWD 落到 backend/logs/app.log。
+        Docker 下 ./backend:/app 已挂载，容器内 /app/logs 会落到宿主机 backend/logs/，
+        重启不丢。已本地冒烟验证文件正常创建与写入。
+
 ■ 2026-07-22 — 修复：知识抽取超时被静默吞掉，用户误以为"没抽到"
   背景：extract_knowledge 是 fail-open 设计——LLM 调用超时/报错一律返回 []，与"文档里
         确实没有可沉淀规则"返回同一个空数组。前端 triggerCombinedExtraction 拿到空

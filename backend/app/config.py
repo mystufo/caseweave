@@ -82,6 +82,10 @@ class Settings(BaseSettings):
     debug: bool = False
     cors_origins: str = "http://localhost:3001,http://localhost:5173"
 
+    # 日志文件路径：非空则日志同时写到该文件（自动轮转），留空则只打到 stderr（终端）。
+    # 支持 ~ 展开；相对路径以后端进程 CWD 为基准。默认写到 backend/logs/app.log。
+    log_file: Optional[str] = "logs/app.log"
+
     # 调试：每次 LLM 调用把完整 prompt + 响应 dump 到这个目录。留空则 no-op。
     # 支持 ~ 与绝对路径；相对路径以后端进程 CWD 为基准（不建议）。
     prompt_dump_dir: Optional[str] = None

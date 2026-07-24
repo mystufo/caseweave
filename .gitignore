@@ -27,3 +27,8 @@ Thumbs.db
 
 # Uploads (large binary files)
 uploads/
+
+# Logs
+logs/
+backend/logs/
+*.log

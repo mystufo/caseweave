@@ -13,7 +13,7 @@ from app.agents.skill_generator import generate_skill_for_module
 from app.agents.clarifier import _sanitize_case_prefix
 from app.auth import get_current_user, require_project
 from app.database import get_db
-from app.knowledge.store import search_relevant, store_entries, KnowledgeDraft
+from app.knowledge.store import search_relevant, store_entries, KnowledgeDraft, log_miss_diagnostics
 from app.config import get_settings
 from app.models.clarification import ClarificationState
 from app.models.feedback import Feedback, TestCase, FeedbackConsumption
@@ -330,6 +330,11 @@ async def preview_knowledge_for_session(
     )
     state = state_q.scalar_one_or_none()
     if state is None or state.document_id is None:
+        # 面板会显示"未命中"，但这里根本没进检索——记一行说明原因，避免日志里查无此事
+        logger.info(
+            "knowledge preview[rest] project=%s session=%s | 无 ClarificationState 或 document_id 为空 → 面板显示未命中（未触发检索）",
+            project_id, session_id,
+        )
         return {"document_id": None, "module_id": None, "hits": []}
 
     doc_q = await db.execute(
@@ -337,14 +342,28 @@ async def preview_knowledge_for_session(
     )
     doc = doc_q.scalar_one_or_none()
     if doc is None:
+        logger.info(
+            "knowledge preview[rest] project=%s session=%s doc=%s | 文档不存在或跨项目 → 面板显示未命中（未触发检索）",
+            project_id, session_id, state.document_id,
+        )
         return {"document_id": None, "module_id": None, "hits": []}
 
     # query 与生成时保持一致：raw_text 截断到 2000 字
     query = truncate_for_llm(doc.raw_text or "", limit=2000)
+    if not query.strip():
+        logger.info(
+            "knowledge preview[rest] project=%s module=%s doc=%s | 文档正文为空 → 面板显示未命中（未触发检索）",
+            project_id, doc.module_id, doc.id,
+        )
+        return {"document_id": doc.id, "module_id": doc.module_id, "hits": []}
     hits = await search_relevant(
         db, project_id=project_id, module_id=doc.module_id, query=query, top_k=top_k,
     )
     if not hits:
+        await log_miss_diagnostics(
+            db, project_id=project_id, module_id=doc.module_id,
+            document_id=doc.id, query=query, top_k=top_k, context="rest",
+        )
         return {"document_id": doc.id, "module_id": doc.module_id, "hits": []}
 
     # 重新拉详细字段（store 只返回精简版）
@@ -361,6 +380,12 @@ async def preview_knowledge_for_session(
         # 不该再当外部上下文喂回 Clarifier/Generator）
         if h.id in by_id and by_id[h.id].document_id != doc.id
     ]
+    if not payload:
+        # 检索到了条目、但全被同文档排除 → 前端面板仍显示未命中
+        await log_miss_diagnostics(
+            db, project_id=project_id, module_id=doc.module_id,
+            document_id=doc.id, query=query, top_k=top_k, context="rest",
+        )
     return {"document_id": doc.id, "module_id": doc.module_id, "hits": payload}
 
 

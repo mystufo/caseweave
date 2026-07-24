@@ -171,6 +171,10 @@ async def search_relevant(
     """
     query = (query or "").strip()
     if not query:
+        logger.info(
+            "knowledge search project=%s module=%s | query 为空，直接返回 0 条",
+            project_id, module_id,
+        )
         return []
 
     if distance_threshold is None:
@@ -206,10 +210,22 @@ async def search_relevant(
                     id=r[0], knowledge_type=r[1], content=r[2],
                     confidence=float(r[3] or 0.0), distance=float(r[4]),
                 ) for r in rows]
+                before = len(hits)
                 if distance_threshold and distance_threshold > 0:
                     hits = [h for h in hits if h.distance is not None and h.distance <= distance_threshold]
+                logger.info(
+                    "knowledge search[vector] project=%s module=%s top_k=%s threshold=%s "
+                    "| 召回=%d 阈值后=%d | 距离(id:dist)=%s",
+                    project_id, module_id, top_k, distance_threshold,
+                    before, len(hits),
+                    ", ".join(f"{r[0]}:{float(r[4]):.3f}" for r in rows),
+                )
                 return hits
             # 落空就走 fallback —— 全新项目第一篇文档时尤其常见
+            logger.info(
+                "knowledge search[vector] project=%s module=%s top_k=%s | 向量近邻 0 条命中，转 fallback",
+                project_id, module_id, top_k,
+            )
         except Exception as e:
             logger.warning("vector search failed, falling back to recency: %s", e)
             # raw SQL 报错时 asyncpg 会把 session 标成 aborted，后续 ORM 查询都会报
@@ -231,6 +247,10 @@ async def search_relevant(
             (KnowledgeEntry.module_id == module_id) | (KnowledgeEntry.module_id.is_(None))
         )
     rows = (await db.execute(stmt)).scalars().all()
+    logger.info(
+        "knowledge search[fallback] project=%s module=%s top_k=%s embedding=%s | 命中=%d 条(按 confidence/时间倒序)",
+        project_id, module_id, top_k, qvec is not None, len(rows),
+    )
     return [HitEntry(
         id=e.id, knowledge_type=e.knowledge_type, content=e.content,
         confidence=float(e.confidence or 0.0), distance=None,
@@ -313,6 +333,71 @@ async def find_similar_entries(
             confidence=float(r[3] or 0.0), distance=d,
         ))
     return out
+
+
+async def log_miss_diagnostics(
+    db: AsyncSession,
+    *,
+    project_id: int,
+    module_id: Optional[int],
+    document_id: Optional[int],
+    query: str,
+    top_k: int,
+    context: str = "",
+) -> None:
+    """前端面板判定"知识库未命中"时，把被丢弃的前 top_k 相关条目打进日志，方便排查。
+
+    重新以 distance_threshold=0（不过滤）跑一次近邻，专供排查：看清楚"差一点命中"
+    的是哪几条、余弦距离多少、为何没进面板（超距离阈值 / 与本文档同源被排除）。
+    仅在未命中时触发，失败绝不影响主流程（只 warning）。
+
+    context: 调用点标识（如 "upload" / "rest"），拼进日志便于区分来源。
+    document_id: 给出时，把"与本文档同源"的候选标注为"同文档排除"。
+    """
+    try:
+        cand = await search_relevant(
+            db, project_id=project_id, module_id=module_id,
+            query=query, top_k=top_k, distance_threshold=0,
+        )
+    except Exception as exc:
+        logger.warning("knowledge miss diagnostics failed: %s", exc)
+        return
+    tag = f"[{context}]" if context else ""
+    if not cand:
+        logger.info(
+            "knowledge miss%s project=%s module=%s doc=%s | 无任何候选（向量库为空或 embedding 不可用）",
+            tag, project_id, module_id, document_id,
+        )
+        return
+    # 找出其中"与本文档同源"的条目 id —— 这类会被同文档排除逻辑剔掉
+    same_doc: set[int] = set()
+    if document_id is not None:
+        try:
+            rows = (await db.execute(
+                select(KnowledgeEntry.id).where(
+                    KnowledgeEntry.id.in_([h.id for h in cand]),
+                    KnowledgeEntry.document_id == document_id,
+                )
+            )).scalars().all()
+            same_doc = set(rows)
+        except Exception:
+            pass
+    thr = get_settings().knowledge_distance_threshold
+    lines: list[str] = []
+    for i, h in enumerate(cand, 1):
+        dist = f"{h.distance:.3f}" if h.distance is not None else "NA"
+        reasons: list[str] = []
+        if h.distance is not None and thr and thr > 0 and h.distance > thr:
+            reasons.append(f"超阈值>{thr}")
+        if h.id in same_doc:
+            reasons.append("同文档排除")
+        why = "｜".join(reasons) if reasons else "本应入选"
+        snippet = (h.content or "").replace("\n", " ")[:80]
+        lines.append(f"    #{i} id={h.id} dist={dist} [{why}] [{h.knowledge_type}] {snippet}")
+    logger.info(
+        "knowledge miss%s project=%s module=%s doc=%s threshold=%s | 被丢弃的前%d相关条目:\n%s",
+        tag, project_id, module_id, document_id, thr, len(cand), "\n".join(lines),
+    )
 
 
 def summarize_for_prompt(hits: list[HitEntry], max_chars: Optional[int] = None) -> str:
