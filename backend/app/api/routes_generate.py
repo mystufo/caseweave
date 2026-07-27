@@ -8,7 +8,7 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth import decode_token, get_current_user, require_project
+from app.auth import authorize_project, decode_token, get_current_user, require_project
 from app.database import get_db
 from app.models.session import Session, Message
 from app.models.knowledge import Document, Module, ModuleRelation, KnowledgeEntry, Skill
@@ -634,8 +634,12 @@ async def export_session(
     # Verify user exists
     user_id = int(payload.get("sub", 0))
     result = await db.execute(select(User).where(User.id == user_id))
-    if not result.scalar_one_or_none():
+    user = result.scalar_one_or_none()
+    if not user:
         raise HTTPException(status_code=401, detail="User not found")
+
+    # 项目访问权限：管理员或项目创建者
+    await authorize_project(project_id, user, db)
 
     result = await db.execute(
         select(Session).where(Session.id == session_id, Session.project_id == project_id)

@@ -267,6 +267,62 @@ TestCraft AI — 开发进度记录
 ================================================================================
 变更 / 修复记录（倒序，最新在上）
 ================================================================================
+■ 2026-07-27 — 新增：项目公开/私有可见性开关（Project.is_public）
+  背景：此前可见性靠「管理员创建的项目对所有人可见」这条隐式规则——普通账号无法自主
+        决定自己项目是否对外可见，管理员建的项目也一律强制公开。
+  需求：给每个项目加显式 is_public 标记。公开→所有用户可见；私有→仅创建者本人和管理员
+        可见。管理员可修改所有项目，其他人只能修改自己创建的项目。
+  改动：
+    ├─ models/user.py：Project 新增 is_public 列（Boolean，NOT NULL，默认 FALSE=私有）。
+    ├─ alembic/versions/0007_project_is_public.py：ADD COLUMN IF NOT EXISTS is_public
+    │   BOOLEAN NOT NULL DEFAULT FALSE。存量项目一律默认私有，需公开的由创建者/管理员
+    │   在界面手动切换（不再按「创建者是否管理员」自动判定）。
+    ├─ auth.py：authorize_project 可见性判定改为「管理员 / 创建者本人 / is_public 公开」，
+    │   删掉原先回查 creator 是否管理员的分支（逻辑更简单、单点判定）。
+    ├─ api/routes_projects.py：列表——普通账号见「自己创建的 OR 公开」；创建——ProjectCreate
+    │   加 is_public（默认私有）；新增 PATCH /projects/{id}（ProjectUpdate：name/description/
+    │   is_public，管理员改任意、普通账号只能改自己创建的，改名做去重校验）；payload 带 is_public。
+    │   移除不再使用的 admin_user_ids 引用。
+    └─ frontend：client.ts Project 加 is_public、createProject 加 isPublic 参数、新增
+        updateProject(PATCH)；ProjectPickerPage 新建表单加「公开项目」勾选框，列表项显示
+        公开/私有徽标，可管理的项目（管理员或本人创建）显示「设为公开/设为私有」切换按钮，
+        canDelete 更名 canManage 统一控制改/删权限。
+  注意：老库升级后原「管理员建的公共项目」会变私有，需管理员到列表里逐个「设为公开」。
+
+■ 2026-07-27 — 修复：后端启动因 .env 里 lark-cli 专用变量报 extra_forbidden
+  现象：make dev-backend 启动即崩，pydantic ValidationError——
+        lark_app_id / lark_node_dir / lark_cli_home「Extra inputs are not permitted」。
+  根因：.env 里的 LARK_APP_ID / LARK_APP_SECRET / LARK_NODE_DIR / LARK_CLI_HOME 是给
+        lark-cli 子进程读的环境变量，并非后端 Settings 模型字段（后端只用 lark_cli_path /
+        lark_cli_timeout_seconds / lark_cli_identity）。pydantic-settings 默认 extra=forbid，
+        遇到这些未声明变量直接启动失败。
+  修复（backend/app/config.py）：Settings.Config 增加 extra = "ignore"，忽略仅供子进程使用
+        的额外环境变量而非报错。已验证 get_settings() 正常加载。
+
+■ 2026-07-27 — 新增：普通账号可自助创建/删除唯一私有项目（项目级访问隔离）
+  背景：此前是开放式租户——任何登录用户能看到并进入所有项目，仅管理员能建/删项目。
+        需求改为：每个非管理员账号可自建且只能建一个项目，该项目仅对本人和管理员可见，
+        本人可删除自己的项目。
+  方案：复用已有 Project.creator_id（无需新增字段/迁移），把创建/删除放开给普通账号并加约束，
+        列表按归属过滤，并在租户统一入口 require_project 增加访问控制（单点堵越权）。
+        可见性保留「管理员创建的项目对所有人可见（公共项目）」老逻辑：普通账号可见/可进入的
+        = 自己创建的 + 管理员创建的。
+  改动：
+    ├─ auth.py：新增 authorize_project(pid,user,db) 助手——放行「管理员/创建者本人/管理员创建的
+    │   公共项目」，否则 404/403；新增 admin_user_ids(db)（邮箱白名单→user.id 列表）；
+    │   require_project 现依赖 get_current_user+db 并调用 authorize_project，使所有 X-Project-Id
+    │   租户路由自动带项目级鉴权（签名仍返回 int，调用点零改动）。
+    ├─ api/routes_projects.py：GET 列表——管理员见全部、普通账号见「自己创建的 + 管理员创建的」；
+    │   POST 创建——改为 get_current_user，普通账号若已拥有自己的项目则 403「每个账号只能创建一个
+    │   项目」，creator_id 记为当前用户；DELETE——普通账号只能删自己创建的（否则 403）。文案改中文。
+    ├─ api/routes_generate.py：Excel 导出直链（/export/{session_id}，走 ?token= 兜底、未用
+    │   require_project）补上 authorize_project 校验，堵住越权导出他人私有项目用例的缺口。
+    └─ frontend/src/pages/ProjectPickerPage.tsx：新建表单对普通账号也显示（仅在其尚未拥有自己的
+        项目时——canCreate=is_admin||!ownsProject，ownsProject 按 creator_id===user.id 判断，
+        避免被可见的公共项目干扰）；删除按钮对「管理员或本人创建」的项目显示；标题按角色区分
+        「全部项目/项目」，空态文案统一为「请使用上方表单创建一个」。
+  注意：Project.name 仍是全局唯一约束——不同账号撞名会 409（本次未改 DB 约束）。
+
 ■ 2026-07-24 — 新增：本地自带开源 embedding 服务（用户不配远程时开箱即用）
   背景：此前 embedding 只有远程一条路——不配 EMBEDDING_API_KEY 就静默降级，知识库检索
         从「语义近邻」退化成「按 confidence/时间倒序」，效果明显变差。希望零配置也能有语义检索。

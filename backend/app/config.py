@@ -111,6 +111,10 @@ class Settings(BaseSettings):
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
+        # .env 里还有一批仅供 lark-cli 子进程读取的变量（LARK_APP_ID/SECRET/
+        # NODE_DIR/CLI_HOME 等），它们不是本模型的字段。默认 forbid 会因这些
+        # 未声明变量直接启动失败，故显式改为 ignore。
+        extra = "ignore"
 
 
 @lru_cache()

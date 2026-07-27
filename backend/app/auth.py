@@ -5,12 +5,12 @@ from typing import Optional
 import jwt
 from fastapi import Depends, HTTPException, Header, status
 from passlib.context import CryptContext
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.database import get_db
-from app.models.user import User
+from app.models.user import Project, User
 
 settings = get_settings()
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -74,10 +74,39 @@ async def require_admin(user: User = Depends(get_current_user)) -> User:
     return user
 
 
+async def admin_user_ids(db: AsyncSession) -> list[int]:
+    """管理员账号的 user.id 列表（邮箱在白名单里）。无管理员则返回空列表。"""
+    if not settings.admin_emails_set:
+        return []
+    result = await db.execute(
+        select(User.id).where(func.lower(User.email).in_(settings.admin_emails_set))
+    )
+    return list(result.scalars().all())
+
+
+async def authorize_project(pid: int, user: User, db: AsyncSession) -> Project:
+    """校验用户对项目的访问权限。
+
+    可访问：管理员（任意项目）、项目创建者本人、以及公开项目（对所有人可见）。
+    """
+    result = await db.execute(select(Project).where(Project.id == pid))
+    project = result.scalar_one_or_none()
+    if not project:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="项目不存在")
+    if is_admin(user) or project.creator_id == user.id or project.is_public:
+        return project
+    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="无权访问该项目")
+
+
 async def require_project(
     x_project_id: Optional[str] = Header(default=None),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
 ) -> int:
-    """Extract project_id from X-Project-Id header (all tenanted routes require it)."""
+    """Extract project_id from X-Project-Id header (all tenanted routes require it).
+
+    同时做访问控制：普通账号只能访问自己创建的项目，管理员不受限。
+    """
     if not x_project_id:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing X-Project-Id header")
     try:
@@ -86,4 +115,5 @@ async def require_project(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid X-Project-Id")
     if pid <= 0:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid X-Project-Id")
+    await authorize_project(pid, user, db)
     return pid

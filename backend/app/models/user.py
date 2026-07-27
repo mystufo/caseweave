@@ -1,5 +1,5 @@
 """User & Project models for auth + multi-tenancy."""
-from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey
+from sqlalchemy import Boolean, Column, Integer, String, Text, DateTime, ForeignKey
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
 from app.database import Base
@@ -24,6 +24,8 @@ class Project(Base):
     name = Column(String(100), nullable=False, unique=True)
     description = Column(Text, nullable=True)
     creator_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    # 是否公开：公开项目对所有用户可见；私有项目仅创建者本人和管理员可见。
+    is_public = Column(Boolean, nullable=False, server_default="false", default=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     creator = relationship("User", back_populates="projects_created")

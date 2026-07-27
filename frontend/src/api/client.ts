@@ -95,14 +95,20 @@ export interface Project {
   name: string
   description: string | null
   creator_id: number | null
+  is_public: boolean
   created_at: string | null
 }
 
 export const fetchProjects = () =>
   api.get<Project[]>('/api/projects').then(r => r.data)
 
-export const createProject = (name: string, description?: string) =>
-  api.post<Project>('/api/projects', { name, description }).then(r => r.data)
+export const createProject = (name: string, description?: string, isPublic = false) =>
+  api.post<Project>('/api/projects', { name, description, is_public: isPublic }).then(r => r.data)
+
+export const updateProject = (
+  id: number,
+  patch: { name?: string; description?: string; is_public?: boolean },
+) => api.patch<Project>(`/api/projects/${id}`, patch).then(r => r.data)
 
 export const deleteProject = (id: number) =>
   api.delete(`/api/projects/${id}`).then(r => r.data)
