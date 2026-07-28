@@ -19,7 +19,7 @@ from app.agents.diff_analyzer import VALID_INTENTS
 from app.agents.llm_factory import build_chat_model
 from app.config import get_settings
 
-logger = logging.getLogger("testcraft.feedback_triage")
+logger = logging.getLogger("caseweave.feedback_triage")
 
 # intent → 出口列表。空列表表示"不消费"（噪声或信号不明）。
 # knowledge：产品规则类，归产品知识（模块级同时也喂 skill）

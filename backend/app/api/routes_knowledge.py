@@ -22,7 +22,7 @@ from app.models.session import Session
 from app.models.user import User
 from app.tools.doc_parser import truncate_for_llm
 
-logger = logging.getLogger("testcraft.routes_knowledge")
+logger = logging.getLogger("caseweave.routes_knowledge")
 
 router = APIRouter()
 

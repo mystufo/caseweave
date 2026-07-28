@@ -1,5 +1,9 @@
 # CaseWeave 纬策
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+**简体中文** | [English](README.en.md)
+
 > 把需求织成用例 —— 智能测试用例生成系统
 
 **CaseWeave（纬策）** 是一个 AI 驱动的测试用例生成系统。上传产品需求文档（Word / PDF / 飞书文档），系统先自动**澄清需求中的歧义**，再据此生成结构化、可执行的**测试用例**并导出 Excel。系统还具备**持续自我进化**能力：从用户反馈、编辑修改、Bug 数据中不断提炼测试设计经验，反哺后续生成。
@@ -51,3 +55,11 @@ make dev-frontend  # Vite on :5173
 - [部署文档](docs/DEPLOYMENT.md)
 - [反馈进化设计](docs/feedback-evolution-design.md)
 - 开发指引与架构说明见 [CLAUDE.md](CLAUDE.md)
+
+## 贡献
+
+欢迎提 Issue 反馈问题或需求，也欢迎提交 Pull Request。
+
+## License
+
+本项目采用 [MIT License](LICENSE) 开源。

@@ -28,7 +28,7 @@ from app.models.feedback import TestCase, Feedback, FeedbackConsumption
 from app.models.knowledge import Module
 from app.models.user import User
 
-logger = logging.getLogger("testcraft.routes_feedback")
+logger = logging.getLogger("caseweave.routes_feedback")
 
 router = APIRouter()
 

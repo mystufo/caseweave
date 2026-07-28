@@ -1,5 +1,5 @@
 ================================================================================
-TestCraft AI — 开发进度记录
+CaseWeave（纬策） — 开发进度记录
 更新时间：2026-07-13
 ================================================================================
 
@@ -267,6 +267,31 @@ TestCraft AI — 开发进度记录
 ================================================================================
 变更 / 修复记录（倒序，最新在上）
 ================================================================================
+■ 2026-07-27 — 开源准备：新增 MIT LICENSE + 命名彻底统一 TestCraft→CaseWeave + 生产加固
+  背景：项目准备开源到 GitHub。安全审计通过（.env 从未进过 git 历史、代码无硬编码
+        密钥/密码/个人邮箱、.gitignore 已忽略 .env/uploads/logs）。此前 07-22 更名仅
+        改了展示名与文档，代码/配置/日志里仍散落 ~70 处 testcraft 标识符，需彻底统一。
+  改动：
+    ├─ 新增 LICENSE：标准 MIT 模板，Copyright (c) 2026 李建飞。
+    ├─ 日志 logger 前缀 testcraft.* → caseweave.*（backend 22 个文件；纯外观，
+    │   logging_config 走 root logger 无按前缀过滤绑定，安全）。
+    ├─ DB/服务/项目标识符统一为 caseweave：docker-compose.yml（POSTGRES_*/healthcheck/
+    │   DATABASE_URL）、config.py（database_url 默认值 + langchain_project）、
+    │   main.py（/health service 名）、deploy.sh（systemd/pm2 服务名）、
+    │   _prompt_dump.py 与 alembic/env.py 注释。
+    ├─ 前端 localStorage 键 testcraft.* → caseweave.*（client.ts token/project_id、
+    │   CasesPage.tsx colWidths）。副作用：现有部署用户需重新登录一次、列宽偏好重置。
+    ├─ .env.example 生产加固：JWT_SECRET / DEBUG / DB 默认密码均加 ⚠️ 醒目警告。
+    ├─ docs/DEPLOYMENT.md：所有 testcraft 示例（DB/systemd/nginx/域名）改名，并新增
+    │   「老部署升级注意」一节，给 ALTER DATABASE/ROLE RENAME 迁移命令（旧名有意保留）。
+    ├─ README.md：加 MIT License 徽章 + 贡献/License 两节。
+    └─ record.txt：标题 TestCraft AI → CaseWeave（纬策）（07-22 更名记录内旧名保留）。
+  不动：数据库表名/SQLAlchemy models/alembic 版本文件（表名与产品名无关，改动破坏迁移链）。
+  副作用（符合预期）：默认库名 testcraft→caseweave 只影响新部署；现有部署保持自己 .env
+        的 DATABASE_URL 不变即可继续用，或按 DEPLOYMENT.md 迁移节重命名。
+  验证：改动的 .py 全部 py_compile 通过；git grep testcraft 仅剩迁移指南内的旧名；
+        docker-compose POSTGRES_* 与 DATABASE_URL 一致（全 caseweave）。
+
 ■ 2026-07-27 — 新增：项目公开/私有可见性开关（Project.is_public）
   背景：此前可见性靠「管理员创建的项目对所有人可见」这条隐式规则——普通账号无法自主
         决定自己项目是否对外可见，管理员建的项目也一律强制公开。

@@ -28,7 +28,7 @@ from app.agents.llm_factory import build_chat_model
 # 英文名（= 用例编号前缀）复用 clarifier 的归一逻辑。clarifier 不 import 本模块，无循环依赖。
 from app.agents.clarifier import _sanitize_case_prefix
 
-logger = logging.getLogger("testcraft.module_classifier")
+logger = logging.getLogger("caseweave.module_classifier")
 
 
 SYSTEM_PROMPT = """你是一名产品经理助手，正在帮测试团队归档新上传的产品需求文档。

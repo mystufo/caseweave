@@ -34,10 +34,10 @@ def setup_logging(level: str = "INFO", log_file: Optional[str] = None) -> None:
                 )
                 file_handler.setFormatter(formatter)
                 root.addHandler(file_handler)
-                logging.getLogger("testcraft.main").info("日志同时写入文件: %s", os.path.abspath(path))
+                logging.getLogger("caseweave.main").info("日志同时写入文件: %s", os.path.abspath(path))
             except OSError as e:
                 # 落盘失败绝不能拖垮启动 —— 退回到只走 stderr
-                logging.getLogger("testcraft.main").warning(
+                logging.getLogger("caseweave.main").warning(
                     "无法写入日志文件 %s（%s），仅输出到 stderr", path, e
                 )
 

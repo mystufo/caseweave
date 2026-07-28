@@ -9,8 +9,8 @@ export const api = axios.create({
 
 // ── Auth + project context (module-local, attached to every request) ─────────
 
-const TOKEN_KEY = 'testcraft.token'
-const PROJECT_KEY = 'testcraft.project_id'
+const TOKEN_KEY = 'caseweave.token'
+const PROJECT_KEY = 'caseweave.project_id'
 
 let _token: string | null = localStorage.getItem(TOKEN_KEY)
 let _projectId: number | null = (() => {

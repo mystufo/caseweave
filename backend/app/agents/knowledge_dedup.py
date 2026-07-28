@@ -25,10 +25,11 @@ from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
+from app.agents._prompt_dump import dump_prompt, dump_response
 from app.agents.llm_factory import build_chat_model
 from app.config import get_settings
 
-logger = logging.getLogger("testcraft.knowledge_dedup")
+logger = logging.getLogger("caseweave.knowledge_dedup")
 
 VALID_RELATIONS = {"duplicate", "similar", "conflict", "unrelated"}
 
@@ -157,6 +158,12 @@ async def classify_relations(
         "knowledge dedup LLM call | drafts_with_candidates=%d timeout=%.0fs max_retries=%d",
         len(pairs), settings.llm_timeout_seconds, settings.llm_max_retries,
     )
+    dump_path = dump_prompt(
+        agent="knowledge_dedup",
+        system=SYSTEM_PROMPT,
+        user=user_content,
+        extra={"drafts_with_candidates": len(pairs)},
+    )
     start = time.perf_counter()
     try:
         resp = await llm.ainvoke([
@@ -175,6 +182,7 @@ async def classify_relations(
     elapsed_ms = (time.perf_counter() - start) * 1000
     raw_content: Any = resp.content
     raw = raw_content if isinstance(raw_content, str) else str(raw_content)
+    dump_response(dump_path, raw)
     result = _parse(raw)
     logger.info(
         "knowledge dedup done | classified_drafts=%d (%.0fms)",

@@ -15,11 +15,12 @@ from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
+from app.agents._prompt_dump import dump_prompt, dump_response
 from app.agents.llm_factory import build_chat_model
 from app.config import get_settings
 from app.knowledge.store import KnowledgeDraft
 
-logger = logging.getLogger("testcraft.knowledge_extractor")
+logger = logging.getLogger("caseweave.knowledge_extractor")
 
 VALID_TYPES = {"product_rule", "constraint", "term", "module_relation", "ui_behavior"}
 
@@ -144,6 +145,16 @@ async def extract_knowledge(
         module_name or "未指定", len(doc_content or ""), len(mindmap_content or ""),
         settings.llm_timeout_seconds, settings.llm_max_retries,
     )
+    dump_path = dump_prompt(
+        agent="knowledge_extractor",
+        system=SYSTEM_PROMPT,
+        user=user_content,
+        extra={
+            "module": module_name or "未指定",
+            "doc_chars": len(doc_content or ""),
+            "mindmap_chars": len(mindmap_content or ""),
+        },
+    )
     start = time.perf_counter()
     try:
         resp = await llm.ainvoke([
@@ -164,6 +175,17 @@ async def extract_knowledge(
     elapsed_ms = (time.perf_counter() - start) * 1000
     raw_content: Any = resp.content
     raw = raw_content if isinstance(raw_content, str) else str(raw_content)
+    finish_reason = None
+    try:
+        meta = getattr(resp, "response_metadata", {}) or {}
+        finish_reason = (
+            meta.get("finish_reason")
+            or meta.get("stop_reason")
+            or (meta.get("model_output", {}) or {}).get("finish_reason")
+        )
+    except Exception:
+        pass
+    dump_response(dump_path, raw, finish_reason=finish_reason)
     drafts = _parse(raw)
     logger.info(
         "knowledge extractor done | extracted=%d raw_chars=%d (%.0fms)",

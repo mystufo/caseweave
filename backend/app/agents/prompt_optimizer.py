@@ -22,7 +22,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from app.agents.llm_factory import build_chat_model
 from app.config import get_settings
 
-logger = logging.getLogger("testcraft.prompt_optimizer")
+logger = logging.getLogger("caseweave.prompt_optimizer")
 
 # 负反馈样本少于该值就不给建议（信号太弱，改了也是拍脑袋）。可被 settings 覆盖。
 DEFAULT_MIN_SAMPLES = 3

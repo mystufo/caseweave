@@ -34,7 +34,7 @@ from app.tools.lark_writer import (
     LarkFetchError,
 )
 
-logger = logging.getLogger("testcraft.routes_mindmap")
+logger = logging.getLogger("caseweave.routes_mindmap")
 
 router = APIRouter()
 

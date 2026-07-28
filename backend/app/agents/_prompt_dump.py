@@ -1,14 +1,15 @@
 """调试用：把每次 LLM 调用的完整 prompt 写到磁盘。
 
 打开方式（任选其一）：
-  1. backend `.env` 里加：`PROMPT_DUMP_DIR=~/tmp/testcraft_prompts`
-  2. 启动前 export 环境变量：`export PROMPT_DUMP_DIR=/tmp/testcraft_prompts`
+  1. backend `.env` 里加：`PROMPT_DUMP_DIR=~/tmp/caseweave_prompts`
+  2. 启动前 export 环境变量：`export PROMPT_DUMP_DIR=/tmp/caseweave_prompts`
 不设置时本模块的所有函数都是 no-op，零开销。
 
 支持 `~` 展开和绝对路径；相对路径以后端进程 CWD 为基准（不建议）。
 
-每次调用产生一个文件，命名形如：
-  20260603-201530_472_0001_generator.txt
+文件按日期分两层子目录归档，避免根目录文件堆积：
+  <PROMPT_DUMP_DIR>/2026-07/28/20260728-201530_472_0001_generator.txt
+  （第一层 年-月，第二层 日）
 内含三段：元信息（agent 名、长度、调用方传的上下文）/ SYSTEM / USER /（最后追加）RESPONSE。
 """
 import logging
@@ -19,7 +20,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-logger = logging.getLogger("testcraft.prompt_dump")
+logger = logging.getLogger("caseweave.prompt_dump")
 
 _LOCK = threading.Lock()
 _SEQ = 0
@@ -66,10 +67,18 @@ def dump_prompt(
     with _LOCK:
         _SEQ += 1
         seq = _SEQ
-    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    now = datetime.now()
+    # 按日期分两层子目录：<root>/2026-07/28/，避免所有 dump 平铺在根目录
+    day_dir = target / now.strftime("%Y-%m") / now.strftime("%d")
+    try:
+        day_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        logger.warning("创建 dump 子目录 %s 失败，退回根目录：%s", day_dir, exc)
+        day_dir = target
+    ts = now.strftime("%Y%m%d-%H%M%S")
     millis = int((time.time() % 1) * 1000)
     fname = f"{ts}_{millis:03d}_{seq:04d}_{agent}.txt"
-    path = target / fname
+    path = day_dir / fname
 
     parts: list[str] = []
     parts.append(f"# agent: {agent}")

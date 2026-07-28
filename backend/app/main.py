@@ -20,7 +20,7 @@ from app.api.routes_prompts import router as prompts_router
 
 settings = get_settings()
 setup_logging("DEBUG" if settings.debug else "INFO", settings.log_file)
-logger = logging.getLogger("testcraft.main")
+logger = logging.getLogger("caseweave.main")
 
 
 async def _prompt_suggestion_loop() -> None:
@@ -139,4 +139,4 @@ app.include_router(prompts_router, prefix="/api", tags=["prompts"])
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "testcraft-ai"}
+    return {"status": "ok", "service": "caseweave"}

@@ -9,7 +9,7 @@ from app.agents.llm_factory import build_chat_model
 from app.agents._prompt_dump import dump_prompt, dump_response
 from app.config import get_settings
 
-logger = logging.getLogger("testcraft.clarifier")
+logger = logging.getLogger("caseweave.clarifier")
 
 CASE_PREFIX_RE = re.compile(r"^[A-Z][A-Z0-9-]{0,39}$")
 

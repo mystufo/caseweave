@@ -16,7 +16,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from app.agents.llm_factory import build_chat_model
 from app.config import get_settings
 
-logger = logging.getLogger("testcraft.skill_generator")
+logger = logging.getLogger("caseweave.skill_generator")
 
 MIN_SAMPLES = 3  # 反馈 + 知识合计少于该值就不归纳（信号太弱）
 

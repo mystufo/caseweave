@@ -20,7 +20,7 @@ from app.agents.llm_factory import build_chat_model
 from app.config import get_settings
 from app.knowledge.store import KnowledgeDraft
 
-logger = logging.getLogger("testcraft.diff_analyzer")
+logger = logging.getLogger("caseweave.diff_analyzer")
 
 VALID_INTENTS = {"补充边界用例", "修正业务规则", "改写表达", "调整步骤", "其它"}
 VALID_RULE_TYPES = {"product_rule", "constraint", "ui_behavior"}

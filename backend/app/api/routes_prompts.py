@@ -27,7 +27,7 @@ from app.models.user import User
 from app.prompts.registry import PROMPT_SPECS, get_spec, get_active_prompt_text
 from app.agents.prompt_optimizer import suggest_generator_prompt
 
-logger = logging.getLogger("testcraft.routes_prompts")
+logger = logging.getLogger("caseweave.routes_prompts")
 
 router = APIRouter()
 

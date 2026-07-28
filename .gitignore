@@ -32,3 +32,6 @@ uploads/
 logs/
 backend/logs/
 *.log
+
+# DB dumps / backups
+backup_*.sql

@@ -25,8 +25,8 @@ cd ..
 
 # 5) 重启后端服务
 #    根据你的进程管理器选一种：
-#    - systemd:  sudo systemctl restart testcraft-backend
-#    - pm2:      pm2 restart testcraft-backend
+#    - systemd:  sudo systemctl restart caseweave-backend
+#    - pm2:      pm2 restart caseweave-backend
 #    - 裸跑:     pkill -f "uvicorn app.main:app" || true
 #                nohup backend/.venv/bin/uvicorn app.main:app \
 #                    --host 0.0.0.0 --port 8001 \

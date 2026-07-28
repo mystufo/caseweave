@@ -21,7 +21,7 @@ from typing import Literal
 
 from app.config import get_settings
 
-logger = logging.getLogger("testcraft.lark_fetcher")
+logger = logging.getLogger("caseweave.lark_fetcher")
 
 LarkKind = Literal["docx", "wiki", "docs", "sheet", "unknown"]
 

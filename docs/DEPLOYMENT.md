@@ -28,7 +28,7 @@
 
 - **LLM 凭证**：`LLM_PROVIDER` / `LLM_MODEL` / `LLM_API_KEY`（以及自建网关时的 `LLM_BASE_URL`）
 - **Embedding 凭证**（可选，Phase 3 知识库语义检索用）：`EMBEDDING_*`。留空则知识检索静默降级为按时间倒序，不影响主流程
-- **服务器对外地址**：下文用 `SERVER_IP` 代指服务器 IP 或域名（例如 `192.168.1.50` 或 `testcraft.example.com`）
+- **服务器对外地址**：下文用 `SERVER_IP` 代指服务器 IP 或域名（例如 `192.168.1.50` 或 `caseweave.example.com`）
 
 ### 0.3 关于数据库初始化（无需手动建表）
 
@@ -98,7 +98,7 @@ LLM_API_KEY=你的key
 LLM_BASE_URL=https://your-gateway/v1   # 用官方 Anthropic 可留空
 
 # ── 数据库（Docker 下保持默认，指向 compose 里的 db 服务）──
-DATABASE_URL=postgresql+asyncpg://testcraft:testcraft@db:5432/testcraft
+DATABASE_URL=postgresql+asyncpg://caseweave:caseweave@db:5432/caseweave
 
 # ── CORS：必须包含前端对外访问地址，否则浏览器会拦截请求 ──
 CORS_ORIGINS=http://SERVER_IP:3001
@@ -134,7 +134,7 @@ echo "VITE_API_URL=http://SERVER_IP:8001" > frontend/.env
 
 （同样把 `SERVER_IP` 换成真实地址。Vite 构建时会自动读取该文件。）
 
-> 若你后面按 A.7 配置了统一的 Nginx 反向代理让前后端同源，则应把它设为对外根地址（例如 `https://testcraft.example.com`），并由外层 Nginx 把 `/api/` 转发到 8001。
+> 若你后面按 A.7 配置了统一的 Nginx 反向代理让前后端同源，则应把它设为对外根地址（例如 `https://caseweave.example.com`），并由外层 Nginx 把 `/api/` 转发到 8001。
 
 ### A.5 构建并启动
 
@@ -172,10 +172,10 @@ curl http://SERVER_IP:3001 -I         # 应 200
 上面的做法前端(3001) 直接调后端(8001)，需要两个端口都对外开放且配好 CORS。生产更推荐用一个对外 Nginx 统一入口、同源访问、上 HTTPS：
 
 ```nginx
-# /etc/nginx/sites-available/testcraft
+# /etc/nginx/sites-available/caseweave
 server {
     listen 80;
-    server_name testcraft.example.com;
+    server_name caseweave.example.com;
 
     location / {
         proxy_pass http://127.0.0.1:3001;   # 前端容器
@@ -193,8 +193,8 @@ server {
 ```
 
 此时：
-- `frontend/.env` 设为 `VITE_API_URL=http://testcraft.example.com`（或 https 域名）
-- `.env` 里 `CORS_ORIGINS=http://testcraft.example.com`
+- `frontend/.env` 设为 `VITE_API_URL=http://caseweave.example.com`（或 https 域名）
+- `.env` 里 `CORS_ORIGINS=http://caseweave.example.com`
 - 用 `certbot --nginx` 申请证书上 HTTPS
 - docker-compose 里可把 3001、8001 只绑到 `127.0.0.1`，不直接对公网暴露
 
@@ -224,9 +224,9 @@ sudo apt-get install -y postgresql-16 postgresql-16-pgvector
 
 ```bash
 sudo -u postgres psql <<'SQL'
-CREATE USER testcraft WITH PASSWORD 'testcraft';
-CREATE DATABASE testcraft OWNER testcraft;
-\c testcraft
+CREATE USER caseweave WITH PASSWORD 'caseweave';
+CREATE DATABASE caseweave OWNER caseweave;
+\c caseweave
 CREATE EXTENSION IF NOT EXISTS vector;
 SQL
 ```
@@ -243,7 +243,7 @@ cp .env.example .env
 编辑 `.env`，与方式 A 相同，但 `DATABASE_URL` 改为本机：
 
 ```ini
-DATABASE_URL=postgresql+asyncpg://testcraft:testcraft@localhost:5432/testcraft
+DATABASE_URL=postgresql+asyncpg://caseweave:caseweave@localhost:5432/caseweave
 CORS_ORIGINS=http://SERVER_IP        # 前端由 Nginx 托管在 80，则填 http://SERVER_IP
 ```
 
@@ -266,7 +266,7 @@ cd frontend && npm ci && npm run build && cd ..
 
 ### B.5 用 systemd 托管后端
 
-创建 `/etc/systemd/system/testcraft-backend.service`：
+创建 `/etc/systemd/system/caseweave-backend.service`：
 
 ```ini
 [Unit]
@@ -292,14 +292,14 @@ WantedBy=multi-user.target
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable --now testcraft-backend
-sudo systemctl status testcraft-backend
-journalctl -u testcraft-backend -f     # 看日志
+sudo systemctl enable --now caseweave-backend
+sudo systemctl status caseweave-backend
+journalctl -u caseweave-backend -f     # 看日志
 ```
 
 ### B.6 用 Nginx 托管前端 + 反代 API
 
-创建 `/etc/nginx/sites-available/testcraft`：
+创建 `/etc/nginx/sites-available/caseweave`：
 
 ```nginx
 server {
@@ -325,7 +325,7 @@ server {
 ```
 
 ```bash
-sudo ln -s /etc/nginx/sites-available/testcraft /etc/nginx/sites-enabled/
+sudo ln -s /etc/nginx/sites-available/caseweave /etc/nginx/sites-enabled/
 sudo nginx -t && sudo systemctl reload nginx
 ```
 
@@ -336,7 +336,7 @@ sudo nginx -t && sudo systemctl reload nginx
 ```bash
 cd /opt/case_generate_claude
 ./deploy.sh                              # git pull + 装依赖 + 构建前端
-sudo systemctl restart testcraft-backend # 按 deploy.sh 末尾提示重启
+sudo systemctl restart caseweave-backend # 按 deploy.sh 末尾提示重启
 ```
 
 ---
@@ -352,19 +352,42 @@ docker compose logs -f backend
 
 数据库迁移随后端启动自动执行（Alembic upgrade head）。
 
+> **老部署升级注意（库名从 `testcraft` 改为 `caseweave`）**：本项目默认的数据库用户/库名已由 `testcraft` 统一为 `caseweave`。**你现有数据库里的数据不会被自动改动，也不会丢**——`docker-compose.yml` 的 `POSTGRES_*` 只在数据卷首次初始化时生效，卷已有数据时被忽略。但拉了新代码后，后端会用 `caseweave` 凭证去连仍叫 `testcraft` 的库而认证失败。二选一：
+>
+> **选项一：继续用 `testcraft`（最省事，不碰数据库）**
+> - **Docker**：把 `docker-compose.yml` 里 backend 的 `environment.DATABASE_URL` 与 db 的 `POSTGRES_*` 改回 `testcraft`（compose 的 `environment` 优先级高于 `.env`，所以这里必须改）。
+> - **裸机**：保持 `.env` 的 `DATABASE_URL=...testcraft...` 不变即可，无需任何操作。
+>
+> **选项二：跟随新命名并保住数据**（推荐先备份：`pg_dump -U testcraft testcraft > backup.sql`）
+> 在库还叫 `testcraft` 时，把 **库名 + 角色名 + 密码** 三样都改成 `caseweave`，再上新代码：
+>   ```bash
+>   # Docker：先停 backend 释放连接，用旧凭证连 postgres 库执行 RENAME
+>   docker compose stop backend
+>   docker compose exec db psql -U testcraft -d postgres \
+>     -c "ALTER DATABASE testcraft RENAME TO caseweave;" \
+>     -c "ALTER ROLE testcraft RENAME TO caseweave;" \
+>     -c "ALTER ROLE caseweave WITH PASSWORD 'caseweave';"
+>   git pull --ff-only && docker compose up -d
+>   ```
+>   ⚠️ 第三条 `ALTER ROLE ... PASSWORD` 不能省：pg16 用 scram-sha-256，改名后密码仍是旧值，新连接串（`caseweave:caseweave`）会认证失败。
+>
+>   裸机方式同理：`sudo systemctl stop <你的服务>` 后，用 `sudo -u postgres psql -d postgres` 跑上面三条 `ALTER`，再把 `.env` 的 `DATABASE_URL` 改成 `caseweave`，并把 systemd 单元名从 `testcraft-backend` 改为 `caseweave-backend`（重新 `daemon-reload`）。
+>
+> `ALTER DATABASE RENAME` 是瞬时的元数据操作，表/数据/pgvector 向量/扩展全部原样保留。
+
 ## 2. 数据备份
 
 数据全部在 Postgres（用例、反馈、知识库、Prompt 版本等）。
 
 ```bash
 # Docker 方式
-docker compose exec db pg_dump -U testcraft testcraft > backup_$(date +%F).sql
+docker compose exec db pg_dump -U caseweave caseweave > backup_$(date +%F).sql
 
 # 裸机方式
-pg_dump -U testcraft -h localhost testcraft > backup_$(date +%F).sql
+pg_dump -U caseweave -h localhost caseweave > backup_$(date +%F).sql
 
 # 恢复
-cat backup_xxxx.sql | docker compose exec -T db psql -U testcraft testcraft
+cat backup_xxxx.sql | docker compose exec -T db psql -U caseweave caseweave
 ```
 
 Docker 数据卷为 `pg_data`（`docker volume ls` 可见），删除 compose 时用 `docker compose down`（不加 `-v`）不会删数据；`docker compose down -v` 会**删除数据库卷**，谨慎使用。
@@ -372,7 +395,7 @@ Docker 数据卷为 `pg_data`（`docker volume ls` 可见），删除 compose �
 ## 3. 生产环境注意事项
 
 - **务必修改 `JWT_SECRET`**（`openssl rand -hex 32` 生成），并设置正确的 `ADMIN_EMAILS`。
-- **数据库密码**：默认 `testcraft/testcraft` 仅供开发，生产请改强密码，并同步更新 `docker-compose.yml` 的 `POSTGRES_PASSWORD` 与 `.env` 的 `DATABASE_URL`。
+- **数据库密码**：默认 `caseweave/caseweave` 仅供开发，生产请改强密码，并同步更新 `docker-compose.yml` 的 `POSTGRES_PASSWORD` 与 `.env` 的 `DATABASE_URL`。
 - **后端热重载**：当前 `backend/Dockerfile` 的启动命令带 `--reload` 且 compose 挂载了源码目录（便于开发）。生产环境建议：
   - 去掉 `docker-compose.yml` 中 backend 的 `volumes` 挂载（`./backend:/app` 等）；
   - 把 Dockerfile 的 `CMD` 改为不带 `--reload`，并可加 `--workers 2`（如 `uvicorn app.main:app --host 0.0.0.0 --port 8001 --workers 2`）。

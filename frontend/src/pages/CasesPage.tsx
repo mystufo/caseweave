@@ -54,7 +54,7 @@ const COLUMNS: ColDef[] = [
 type EditableField = 'name' | 'priority' | 'preconditions' | 'steps' | 'expected_result' | 'remarks'
 type EditDraft = Partial<Pick<TestCase, EditableField>>
 
-const COL_WIDTHS_KEY = 'testcraft.cases.colWidths'
+const COL_WIDTHS_KEY = 'caseweave.cases.colWidths'
 
 function loadColWidths(): Record<string, number> {
   try {

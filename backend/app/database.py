@@ -39,7 +39,7 @@ async def _run_alembic_upgrade_head() -> None:
     - 任何异常都吞掉但写 warning 日志——alembic 失败不该阻塞服务启动，但需要被监控发现
     """
     import logging as _lg
-    log = _lg.getLogger("testcraft.database")
+    log = _lg.getLogger("caseweave.database")
     import os as _os
     if _os.environ.get("ALEMBIC_SKIP") == "1":
         log.info("alembic upgrade skipped via ALEMBIC_SKIP=1")
@@ -180,7 +180,7 @@ async def init_db():
             # 主动 drop 老索引（如果维度从 ≤2000 升到 >2000，索引可能还在）
             await conn.execute(text("DROP INDEX IF EXISTS ix_knowledge_entries_embedding"))
             import logging as _lg
-            _lg.getLogger("testcraft.database").info(
+            _lg.getLogger("caseweave.database").info(
                 "knowledge_entries embedding dim=%d > 2000, skipping ivfflat index (sequential scan)", _dim,
             )
 

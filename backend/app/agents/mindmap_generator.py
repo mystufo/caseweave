@@ -22,7 +22,7 @@ from app.agents.llm_factory import build_chat_model
 from app.agents._prompt_dump import dump_prompt, dump_response
 from app.config import get_settings
 
-logger = logging.getLogger("testcraft.mindmap_generator")
+logger = logging.getLogger("caseweave.mindmap_generator")
 
 SYSTEM_PROMPT = """你是一位资深的测试工程师，负责把产品需求文档（PRD）梳理成一份「测试脑图」。
 测试脑图的核心价值不是罗列测试点，而是**把 PRD 里描述的功能，按其真实的结构与交互逻辑重建成一棵树**——

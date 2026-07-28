@@ -61,12 +61,12 @@ class Settings(BaseSettings):
     knowledge_prompt_max_chars: int = 1800
 
     # Database
-    database_url: str = "postgresql+asyncpg://testcraft:testcraft@db:5432/testcraft"
+    database_url: str = "postgresql+asyncpg://caseweave:caseweave@db:5432/caseweave"
 
     # LangSmith (optional, for dev debugging)
     langsmith_api_key: str = ""
     langchain_tracing_v2: bool = False
-    langchain_project: str = "testcraft-ai"
+    langchain_project: str = "caseweave"
 
     # Product site (for Browser Agent)
     product_url: Optional[str] = None

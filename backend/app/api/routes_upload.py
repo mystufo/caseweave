@@ -310,7 +310,7 @@ async def _resolve_knowledge_brief_by_ids(
         return None
 
 router = APIRouter()
-logger = logging.getLogger("testcraft.upload")
+logger = logging.getLogger("caseweave.upload")
 
 MAX_CLARIFICATION_ROUNDS = 5
 

@@ -27,7 +27,7 @@ from app.tools.lark_fetcher import (
     _extract_json,  # 复用 fetcher 的宽容 JSON 提取（lark-cli 偶尔在 JSON 前打 notice 行）
 )
 
-logger = logging.getLogger("testcraft.lark_writer")
+logger = logging.getLogger("caseweave.lark_writer")
 
 
 @dataclass

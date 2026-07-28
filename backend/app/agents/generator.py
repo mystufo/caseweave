@@ -8,7 +8,7 @@ from app.agents.llm_factory import build_chat_model
 from app.agents._prompt_dump import dump_prompt, dump_response
 from app.config import get_settings
 
-logger = logging.getLogger("testcraft.generator")
+logger = logging.getLogger("caseweave.generator")
 
 SYSTEM_PROMPT = """你是一位资深的测试工程师，负责根据产品需求文档和澄清结果编写完整的测试用例。
 

@@ -28,7 +28,7 @@ from app.agents.generator import SYSTEM_PROMPT as GENERATOR_DEFAULT
 from app.agents.mindmap_generator import SYSTEM_PROMPT as MINDMAP_DEFAULT
 from app.models.knowledge import PromptVersion
 
-logger = logging.getLogger("testcraft.prompts")
+logger = logging.getLogger("caseweave.prompts")
 
 
 @dataclass(frozen=True)
