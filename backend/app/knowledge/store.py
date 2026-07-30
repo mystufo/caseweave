@@ -19,6 +19,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.knowledge import KnowledgeEntry
 from app.tools.embeddings import embed_texts, embed_one
+from app.tools.reranker import rerank
+from app.tools.text_chunking import split_for_embedding
 from app.config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -149,6 +151,17 @@ class HitEntry:
     distance: Optional[float]   # cosine distance, 越小越相关；fallback 路径为 None
 
 
+@dataclass
+class NearMiss:
+    """未命中时"差一点入选"的候选：命中数据 + 落选原因（供前端只读展示）。"""
+    id: int
+    knowledge_type: str
+    content: str
+    confidence: float
+    distance: Optional[float]
+    reason: str   # "超阈值>0.45" / "同文档排除" / "本应入选" 等，可用｜分隔多个
+
+
 async def search_relevant(
     db: AsyncSession,
     *,
@@ -160,14 +173,24 @@ async def search_relevant(
 ) -> list[HitEntry]:
     """Find top-K most relevant knowledge entries for a query.
 
-    路径选择：
-    1. 有 embedding 服务 + 该项目里至少有一条带向量的条目 → pgvector 余弦近邻
-    2. 否则 → 退化为按 confidence DESC, created_at DESC 取最新若干条（保证至少有点上下文）
+    两阶段检索（都在本函数内部，签名保持稳定）：
+    1. 召回（分块 max-sim）：把 query 切成窗口分别 embed，对每个窗口各跑一次 pgvector 近邻，
+       按条目取「跨所有窗口的最小余弦距离」，得到 rerank_candidate_k 大小的候选池。
+       解决「整篇文档平均向量」把单句知识相关度稀释的问题——一条知识只要和文档某一段高度
+       相似即可进池。
+    2. 精排（cross-encoder rerank，可选）：把 query 与候选逐条拼一起打分，按分数排序取 top_k，
+       并把 distance 记为 1-score（与前端「相关度%=1-distance」口径一致）。rerank 不可用/关闭
+       时退回按余弦距离排序过滤（召回改进仍生效）。
+
+    逐级降级（fail-open，绝不阻塞主流程）：
+      embedding 可用 + rerank 可用 → 分块召回 + 精排
+      embedding 可用 + rerank 不可用/关闭 → 分块召回 + 距离阈值
+      embedding 不可用 → 按 confidence DESC, created_at DESC 取最新若干条
 
     distance_threshold:
-      None → 用 settings.knowledge_distance_threshold（默认 0.45）
-      <= 0 → 不过滤
-      > 0  → distance > 该值的命中丢弃（仅 pgvector 路径有效；fallback 路径 distance=None 不过滤）
+      None → 用生效的自然阈值（精排时 1-rerank_score_threshold；否则 knowledge_distance_threshold）
+      <= 0 → 不过滤（log_miss_diagnostics 借此拿完整候选池）
+      > 0  → distance > 该值的命中丢弃（仅向量路径有效；fallback 路径 distance=None 不过滤）
     """
     query = (query or "").strip()
     if not query:
@@ -177,15 +200,22 @@ async def search_relevant(
         )
         return []
 
-    if distance_threshold is None:
-        distance_threshold = get_settings().knowledge_distance_threshold
+    s = get_settings()
+    candidate_k = max(top_k, s.rerank_candidate_k)
 
-    qvec = await embed_one(query)
-    if qvec is not None:
-        # pgvector 路径。注意：模块过滤用 OR 让 module_id IS NULL 的项目级规则也参与
-        # （避免一开始还没有按模块拆的知识就被过滤干净）
-        # NOTE: asyncpg 用 prepared statement 时无法从 `:module_id IS NULL` 推断 NULL 参数类型
-        # （AmbiguousParameterError）。所有可能为 NULL 的参数都必须显式 CAST。
+    # ── 阶段 1：分块 max-sim 召回 ─────────────────────────────────────────────
+    chunks = split_for_embedding(
+        query,
+        size=s.knowledge_query_chunk_size,
+        overlap=s.knowledge_query_chunk_overlap,
+    )
+    vectors = await embed_texts(chunks) if chunks else None
+
+    if vectors:
+        # 对每个 chunk 向量各跑一次近邻，Python 端按 id 取最小距离合并成候选池。
+        # 模块过滤用 OR 让 module_id IS NULL 的项目级规则也参与。
+        # NOTE: asyncpg prepared statement 无法从 `:module_id IS NULL` 推断 NULL 参数类型
+        # （AmbiguousParameterError），所有可能为 NULL 的参数都显式 CAST。
         sql = text(
             """
             SELECT id, knowledge_type, content, confidence,
@@ -197,34 +227,61 @@ async def search_relevant(
                    OR module_id = CAST(:module_id AS INTEGER)
                    OR module_id IS NULL)
             ORDER BY distance ASC
-            LIMIT :top_k
+            LIMIT :cand_k
             """
         )
         try:
-            rows = (await db.execute(
-                sql,
-                {"qvec": str(qvec), "project_id": project_id, "module_id": module_id, "top_k": top_k},
-            )).all()
-            if rows:
-                hits = [HitEntry(
-                    id=r[0], knowledge_type=r[1], content=r[2],
-                    confidence=float(r[3] or 0.0), distance=float(r[4]),
-                ) for r in rows]
-                before = len(hits)
-                if distance_threshold and distance_threshold > 0:
-                    hits = [h for h in hits if h.distance is not None and h.distance <= distance_threshold]
+            best: dict[int, HitEntry] = {}
+            for vec in vectors:
+                rows = (await db.execute(
+                    sql,
+                    {"qvec": str(vec), "project_id": project_id,
+                     "module_id": module_id, "cand_k": candidate_k},
+                )).all()
+                for r in rows:
+                    dist = float(r[4])
+                    prev = best.get(r[0])
+                    if prev is None or dist < (prev.distance if prev.distance is not None else 1e9):
+                        best[r[0]] = HitEntry(
+                            id=r[0], knowledge_type=r[1], content=r[2],
+                            confidence=float(r[3] or 0.0), distance=dist,
+                        )
+            candidates = sorted(best.values(), key=lambda h: h.distance if h.distance is not None else 1e9)
+            candidates = candidates[:candidate_k]
+
+            if candidates:
+                # ── 阶段 2：cross-encoder 精排（可选，fail-open）──────────────
+                scores = await rerank(query, [h.content for h in candidates])
+                reranked = scores is not None
+                if reranked:
+                    for h, sc in zip(candidates, scores):
+                        h.distance = 1.0 - float(sc)   # 归一到与余弦同向的「越小越相关」口径
+                    candidates.sort(key=lambda h: h.distance if h.distance is not None else 1e9)
+
+                # 生效阈值：显式传入优先；否则精排用 1-score_threshold，纯向量用距离阈值
+                if distance_threshold is None:
+                    gate = (1.0 - s.rerank_score_threshold) if reranked else s.knowledge_distance_threshold
+                else:
+                    gate = distance_threshold
+
+                before = len(candidates)
+                hits = candidates
+                if gate and gate > 0:
+                    hits = [h for h in hits if h.distance is not None and h.distance <= gate]
+                hits = hits[:top_k]
                 logger.info(
-                    "knowledge search[vector] project=%s module=%s top_k=%s threshold=%s "
-                    "| 召回=%d 阈值后=%d | 距离(id:dist)=%s",
-                    project_id, module_id, top_k, distance_threshold,
+                    "knowledge search[vector] project=%s module=%s chunks=%d rerank=%s "
+                    "top_k=%s gate=%.3f | 候选=%d 阈值后=%d | 距离(id:dist)=%s",
+                    project_id, module_id, len(chunks), reranked,
+                    top_k, gate if gate else 0.0,
                     before, len(hits),
-                    ", ".join(f"{r[0]}:{float(r[4]):.3f}" for r in rows),
+                    ", ".join(f"{h.id}:{h.distance:.3f}" for h in candidates[:top_k]),
                 )
                 return hits
             # 落空就走 fallback —— 全新项目第一篇文档时尤其常见
             logger.info(
-                "knowledge search[vector] project=%s module=%s top_k=%s | 向量近邻 0 条命中，转 fallback",
-                project_id, module_id, top_k,
+                "knowledge search[vector] project=%s module=%s chunks=%d top_k=%s | 向量近邻 0 条命中，转 fallback",
+                project_id, module_id, len(chunks), top_k,
             )
         except Exception as e:
             logger.warning("vector search failed, falling back to recency: %s", e)
@@ -249,7 +306,7 @@ async def search_relevant(
     rows = (await db.execute(stmt)).scalars().all()
     logger.info(
         "knowledge search[fallback] project=%s module=%s top_k=%s embedding=%s | 命中=%d 条(按 confidence/时间倒序)",
-        project_id, module_id, top_k, qvec is not None, len(rows),
+        project_id, module_id, top_k, bool(vectors), len(rows),
     )
     return [HitEntry(
         id=e.id, knowledge_type=e.knowledge_type, content=e.content,
@@ -344,12 +401,14 @@ async def log_miss_diagnostics(
     query: str,
     top_k: int,
     context: str = "",
-) -> None:
-    """前端面板判定"知识库未命中"时，把被丢弃的前 top_k 相关条目打进日志，方便排查。
+) -> list[NearMiss]:
+    """前端面板判定"知识库未命中"时，把被丢弃的前 top_k 相关条目打进日志并返回，方便排查/展示。
 
     重新以 distance_threshold=0（不过滤）跑一次近邻，专供排查：看清楚"差一点命中"
     的是哪几条、余弦距离多少、为何没进面板（超距离阈值 / 与本文档同源被排除）。
-    仅在未命中时触发，失败绝不影响主流程（只 warning）。
+    仅在未命中时触发，失败绝不影响主流程（只 warning，返回 []）。
+
+    返回值供前端只读展示（携带 reason 落选原因），同时照常写一行诊断日志。
 
     context: 调用点标识（如 "upload" / "rest"），拼进日志便于区分来源。
     document_id: 给出时，把"与本文档同源"的候选标注为"同文档排除"。
@@ -361,14 +420,14 @@ async def log_miss_diagnostics(
         )
     except Exception as exc:
         logger.warning("knowledge miss diagnostics failed: %s", exc)
-        return
+        return []
     tag = f"[{context}]" if context else ""
     if not cand:
         logger.info(
             "knowledge miss%s project=%s module=%s doc=%s | 无任何候选（向量库为空或 embedding 不可用）",
             tag, project_id, module_id, document_id,
         )
-        return
+        return []
     # 找出其中"与本文档同源"的条目 id —— 这类会被同文档排除逻辑剔掉
     same_doc: set[int] = set()
     if document_id is not None:
@@ -382,22 +441,36 @@ async def log_miss_diagnostics(
             same_doc = set(rows)
         except Exception:
             pass
-    thr = get_settings().knowledge_distance_threshold
+    s = get_settings()
+    # near-miss 里的 distance 与 search_relevant 命中同口径：精排开启时是 1-score，
+    # 落选门相应为 1-rerank_score_threshold；否则用余弦距离阈值。文案随之自适应。
+    if s.rerank_enabled:
+        gate = 1.0 - s.rerank_score_threshold
+        gate_label = f"低于精排阈值<{s.rerank_score_threshold}"
+    else:
+        gate = s.knowledge_distance_threshold
+        gate_label = f"超阈值>{gate}"
     lines: list[str] = []
+    misses: list[NearMiss] = []
     for i, h in enumerate(cand, 1):
         dist = f"{h.distance:.3f}" if h.distance is not None else "NA"
         reasons: list[str] = []
-        if h.distance is not None and thr and thr > 0 and h.distance > thr:
-            reasons.append(f"超阈值>{thr}")
+        if h.distance is not None and gate and gate > 0 and h.distance > gate:
+            reasons.append(gate_label)
         if h.id in same_doc:
             reasons.append("同文档排除")
         why = "｜".join(reasons) if reasons else "本应入选"
         snippet = (h.content or "").replace("\n", " ")[:80]
         lines.append(f"    #{i} id={h.id} dist={dist} [{why}] [{h.knowledge_type}] {snippet}")
+        misses.append(NearMiss(
+            id=h.id, knowledge_type=h.knowledge_type, content=h.content,
+            confidence=h.confidence, distance=h.distance, reason=why,
+        ))
     logger.info(
-        "knowledge miss%s project=%s module=%s doc=%s threshold=%s | 被丢弃的前%d相关条目:\n%s",
-        tag, project_id, module_id, document_id, thr, len(cand), "\n".join(lines),
+        "knowledge miss%s project=%s module=%s doc=%s gate=%s | 被丢弃的前%d相关条目:\n%s",
+        tag, project_id, module_id, document_id, gate, len(cand), "\n".join(lines),
     )
+    return misses
 
 
 def summarize_for_prompt(hits: list[HitEntry], max_chars: Optional[int] = None) -> str:

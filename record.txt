@@ -267,6 +267,136 @@ CaseWeave（纬策） — 开发进度记录
 ================================================================================
 变更 / 修复记录（倒序，最新在上）
 ================================================================================
+■ 2026-07-30 — 生成前不再二次弹知识确认面板，沿用澄清阶段的知识选择
+  现象：澄清前已在「确认要注入到澄清提示词的知识库内容」面板选了「不注入」，走完澄清、生成
+        用例前又弹出「确认要注入到生成 prompt 的知识库内容」面板，要求二次确认。
+  诊断纠偏：起初怀疑是"面板被重复拉起"的竞态，遂加了三道防线（渲染条件排 followupActive /
+        startKnowledgePreview 入口守卫 / runGenerate 取消在途流）；但复看后端日志证实生成阶段
+        /api/knowledge/preview 该会话只调用一次、并非重复——真实问题是产品交互：澄清阶段已就
+        知识注入表过态，生成前不该再问第二次。故推翻竞态修法，改为"沿用澄清选择、生成前不弹面板"。
+  方案（纯前端，frontend/src/pages/ChatPage.tsx；后端零改动）：
+    ├─ 新增 session 字段 clarifyKnowledgeIds: number[] | null，语义对齐后端 /api/generate 的
+    │   knowledge_ids 三态（null=未表态自动检索 / []=不注入 / [ids]=用这些）。
+    ├─ startInitialClarification 入口把澄清阶段的 knowledgeIds 存进该字段。
+    ├─ 四个"澄清 ready → 生成"触发点（首轮 ready / 达 MAX_ROUNDS / 追问 ready / 追问出错兜底）
+    │   由 startKnowledgePreview(弹面板) 改为直接 runGenerate(..., 澄清阶段选择)：首轮用闭包
+    │   knowledgeIds，其余读 taskMapRef.current[sid].clarifyKnowledgeIds。
+    ├─ 删除死函数 startKnowledgePreview 及其在两处 useCallback deps 的引用；runGenerate 成功
+    │   清理追加 clarifyKnowledgeIds:null 复位。
+    └─ 回退上一轮防线#3（runGenerate 开头取消在途流——新流程下会自取消刚注册的请求）；
+        保留防线#1（渲染条件 !followupActive，无害更稳）；防线#2 随死函数删除。
+  边界：脑图模式（mindmapReadyToGenerate 独立分支）与 clarify 阶段面板不受影响；正常/多轮/
+        MAX_ROUNDS/追问出错四条路径均直接进生成、沿用澄清选择。tsc --noEmit + eslint（本次改动）通过。
+        （注：ChatPage.tsx:1907 _casePrefix 未用为既有 lint 报错，非本次引入。）
+
+■ 2026-07-29 — 知识检索准确性升级：分块召回（max-sim）+ 精排（rerank，默认 LLM 打分）
+  背景：此前检索把「整篇文档 2000 字截断 blob」压成**一个**向量，去和知识库里的**单条
+        原子语句**做余弦近邻。长文向量是几十个主题揉在一起的质心、单句是一个点，两者余弦
+        天然落在 0.4~0.5——即使内容明显同源（同一份 PRD 抽出的条目），相关度也只有 52~54%，
+        被距离阈值一刀切成「未命中」。这是「长文 query vs 短句 doc」的不对称问题，纯
+        bi-encoder 单向量方案无法解决。
+  方案：两阶段检索，全部收在 store.search_relevant 内部（签名与返回类型不变，所有调用方
+        routes_upload / routes_generate / routes_mindmap / routes_knowledge 及前端零改动）：
+    ① 召回（分块 max-sim）：把 query 切成窗口分别 embed，对每个窗口各跑一次 pgvector 近邻，
+       按条目取「跨所有窗口的最小余弦距离」，得到 RERANK_CANDIDATE_K 大小的候选池。一条知识
+       只要和文档某一段高度相似即可进池，不再被全文其它无关内容稀释。
+    ② 精排（rerank）：把 query 与候选一起判定相关性，按分数排序取 top_k，distance 记为
+       1-score（与前端「相关度%=1-distance」口径一致，故前端显示的百分比终于有意义）。
+  精排 provider 三选一（RERANK_PROVIDER，统一 rerank(query,docs)->Optional[list[float]] 契约）：
+    - llm（默认）：复用主 LLM（LLM_* 凭证）一次调用给整池候选打 0~1 分，零额外部署、不需新服务/
+      新鉴权，契合本项目「模型都走远程火山方舟 Ark」的现状。准确性略逊 cross-encoder。
+      （选型经过：火山方舟 Ark /api/v3 无 rerank 接入点，其 rerank 在 VikingDB 另需 AK/SK 签名，
+       故不复用远程；本地 TEI 容器在 arm64 上多一个 ~2GB 常驻，与「本地不跑模型」现状不符——
+       综合选 LLM 打分。）
+    - local：本地 TEI cross-encoder 容器（BAAI/bge-reranker-v2-m3，走 http://reranker:80/rerank）。
+    - openai：远程兼容 /rerank 接口（TEI 格式，需 RERANK_API_KEY）。
+  逐级降级（fail-open，绝不阻塞主流程）：
+    embedding 可用 + rerank 可用 → 分块召回 + 精排（完整新链路）
+    embedding 可用 + rerank 不可用/关闭 → 分块召回 + 距离阈值（召回改进仍生效）
+    embedding 不可用 → 原 fallback：按 confidence/时间倒序（完全不变）
+  改动：
+    ├─ 新增 backend/app/tools/text_chunking.py：split_for_embedding 按段落/句子边界聚合成
+    │   带 overlap 的窗口，纯函数无 IO，切不出来则返回整段。
+    ├─ 新增 backend/app/tools/reranker.py：统一 rerank(query,docs)->Optional[list[float]] 契约，
+    │   三个 provider——llm（复用 build_chat_model 一次打分、解析 {"scores":[...]}）、
+    │   local/openai（TEI 原生 /rerank）；全部 fail-open，开关关/未配置/出错返回 None。
+    ├─ store.py search_relevant：向量路径两阶段化（分块召回 → 可选精排 → 阈值/top_k）；
+    │   log_miss_diagnostics 的 near-miss 落选原因文案随生效门自适应（精排：低于精排阈值<0.3；
+    │   降级：超阈值>0.45）。
+    ├─ config.py：新增 RERANK_ENABLED（默认 true）/PROVIDER（默认 llm）/MODEL/API_KEY/BASE_URL/
+    │   CANDIDATE_K/SCORE_THRESHOLD 及 KNOWLEDGE_QUERY_CHUNK_SIZE/OVERLAP。
+    ├─ docker-compose.yml：新增 reranker 服务（TEI，BAAI/bge-reranker-v2-m3）+ reranker_data
+    │   卷，仅 RERANK_PROVIDER=local 时需启动；不 depends_on（冷启动慢，靠 fail-open 兜底）。
+    └─ .env.example：新增 Rerank 配置段（三 provider 说明 + arm64 镜像覆盖注释），
+        并注明 KNOWLEDGE_DISTANCE_THRESHOLD 仅在精排降级路径生效。
+
+■ 2026-07-29 — 知识库「未命中但最接近」候选前端可视化（只读）
+  背景：此前知识库检索未命中时，log_miss_diagnostics 会以 distance_threshold=0 重跑一次
+        近邻，把「差一点命中」的前 top_k 条打进后端日志（标注 dist + 落选原因：超阈值 /
+        同文档排除），但只落日志，前端面板一律只显示「未命中」，排查得去翻 app.log。
+        用户希望这些候选也能在前端直接看到。
+  改动：
+    ├─ 后端 store.py：新增 NearMiss dataclass；log_miss_diagnostics 由「只打日志」改为
+    │   「同时 return list[NearMiss]」（日志逻辑保留不变），每条带 reason 落选原因。
+    ├─ 后端 routes_upload.py：_compute_knowledge_preview 返回值 list[dict] → 改为
+    │   (hits, near_misses) 元组；两处未命中分支（0 命中 / 全被同文档排除）收集 near_misses；
+    │   新增 _near_miss_dict 序列化；SSE knowledge_preview 帧新增 near_misses 字段。
+    ├─ 后端 routes_knowledge.py：REST GET /api/knowledge/preview 同步——新增 _near_miss_payload，
+    │   两处未命中分支返回 near_misses，其余 return shape 统一补 "near_misses": []。
+    ├─ 前端 client.ts：新增 KnowledgeNearMiss 类型；KnowledgePreview / UploadKnowledgePreview
+    │   加可选 near_misses（SSE 解析处 spread 透传，无需改 4 个 parse 点）。
+    ├─ 前端 ChatPage.tsx：knowledgePreview 两个 union 分支加 nearMisses；所有 set 点
+    │   （upload SSE / clarify 水合 / generate 预览 + 各自的 catch 分支）透传 near_misses。
+    └─ 前端 KnowledgePreviewPanel.tsx：hits 为空时，若有 nearMisses 渲染一段**只读**的
+        「最接近但未采用的 N 条」列表——灰底、标类型 + 相关度 + 落选原因徽章，不可勾选、
+        不参与注入（按产品决策：仅只读展示，沿用 top_k=8）。
+
+■ 2026-07-28 — 飞书文档图片识别（图片 → 文字，注入正文，默认关闭）
+  背景：飞书导入此前只走 `lark-cli docs +fetch --doc-format markdown`，只拿到纯文字
+        正文——文档里的 UI 原型图/流程图/架构图信息全丢，纯图片文档还直接抛
+        LarkEmptyDoc。需求图常承载关键字段/交互/状态流转，对澄清+生成价值高。
+  方案：在抓取阶段新增可选「图片增强」——枚举文档内图片 → 下载 → 视觉模型转文字 →
+        合并进 Document.raw_text。因下游 Clarifier/Generator/知识抽取全经 raw_text，
+        故一处改动、全链路受益，无需改 DB/前端/agent。全程 fail-open。
+  改动：
+    ├─ config.py：新增 vision_* 配置块（vision_enabled 默认 False 总开关 +
+    │   provider/model/api_key/base_url 留空逐项回退 llm_* + max_tokens/max_images/
+    │   concurrency）。.env.example 同步注释块（含火山方舟 doubao-vision 示例）。
+    ├─ agents/llm_factory.py：新增 build_vision_model()，镜像 build_chat_model，读
+    │   vision_* 并逐项回退 llm_*；复用 ChatAnthropic/ChatOpenAI（均原生支持多模态）。
+    ├─ tools/lark_media.py（新）：download_lark_media(token) 走
+    │   `lark-cli docs +media-download`，下载到临时文件读回 bytes+猜 mime，用完即删；
+    │   失败抛 LarkMediaError 供调用方 fail-open。
+    ├─ agents/image_describer.py（新）：describe_image(bytes,mime,heading) 用视觉模型 +
+    │   多模态 HumanMessage（data URL），测试用例场景提示词（界面元素/流程/状态/规则）；
+    │   任何异常返回空串。
+    ├─ tools/lark_fetcher.py：抽出 _run_fetch() 复用 subprocess 脚手架；新增
+    │   _enumerate_images_from_xml()（再抓一次 XML，正则扫 <img token> 并按位置归到
+    │   就近 heading）+ enrich_content_with_images()（并发受限识别、张数上限、汇总成
+    │   「## 文档配图（自动识别）」段落 append）。fetch_lark_content 在 vision_enabled
+    │   时增强 raw_text；LarkEmptyDoc 判定后移，纯图片文档可靠图片描述救回。
+    ├─ api/routes_upload.py：飞书导入 fetching 阶段的 SSE 文案在开启 vision 时加
+    │   「（含图片识别，可能较慢）」提示。
+  影响：默认关闭，不配 VISION_* 时飞书导入行为与之前完全一致。开启需 provider 侧
+        模型支持多模态（火山方舟 doubao-vision / Anthropic）。多一次 XML 抓取 +
+        每图一次视觉调用，成本/延迟由 VISION_MAX_IMAGES / VISION_CONCURRENCY 兜住。
+  验证：config 加载 OK；全部新增/改动模块 import OK；对真实飞书 wiki 文档跑通完整链路
+        （抓正文 → 枚举 1 张图 → 下载 118KB PNG → 火山方舟视觉接入点识别出下拉面板的
+        9 项语言列表+选中态 → 合并进 raw_text 末尾「## 文档配图（自动识别）」段落）。
+        本地 docx/pdf 图片留作后续。
+  实测暴露并修复的 2 个 bug（按官方 skill 文档写的、与 lark-cli v1.0.69 实际行为不符）：
+    ├─ 图片标签正则对不上：skill 文档写 <img token="..." url="..."/>，v1.0.69 实际输出
+    │   是 <img name="x.png" href="直链" mime="image/png" src="媒体token"/>——token 在
+    │   src=、直链在 href=。原正则找 token= 匹配 0 张。已改 _TOKEN_ATTR_RE 兼容 src|token
+    │   两种命名，并新增 _MIME_ATTR_RE 直接取标签自带 mime（比下载后猜更可靠）；ImgRef
+    │   增加 mime 字段透传给 describe_image。
+    └─ --output 绝对路径被拒：lark-cli media-download 的 --output 只接受相对路径，绝对
+        路径报 "unsafe output path"。原用 tempfile.mkstemp 给的是绝对路径。已改为
+        tempfile.mkdtemp 建临时目录 + 相对文件名 + 子进程 cwd 指到该目录，读回后清理。
+        download_lark_media 另加 identity 可选参数（默认仍用 settings.lark_cli_identity）。
+  依赖的飞书权限：下载图片需应用/用户身份开通 docs:document.media:download（或 docs/drive
+        readonly 任一）scope——正文抓取权限不含此项，需在开放平台单独开通并把文档共享给应用。
+
 ■ 2026-07-27 — 开源准备：新增 MIT LICENSE + 命名彻底统一 TestCraft→CaseWeave + 生产加固
   背景：项目准备开源到 GitHub。安全审计通过（.env 从未进过 git 历史、代码无硬编码
         密钥/密码/个人邮箱、.gitignore 已忽略 .env/uploads/logs）。此前 07-22 更名仅

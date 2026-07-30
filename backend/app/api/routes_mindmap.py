@@ -30,7 +30,6 @@ from app.tools.lark_writer import (
     LarkCliNotLoggedIn,
     LarkPermissionDenied,
     LarkFetchTimeout,
-    LarkFetchFailed,
     LarkFetchError,
 )
 

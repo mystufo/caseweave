@@ -37,12 +37,32 @@ _LARK_URL_RE = re.compile(
 # lark-cli v2 fetch-doc 把文档标题内嵌成 `<title>…</title>` 前缀（markdown/xml 皆如此）
 _TITLE_TAG_RE = re.compile(r"<title>(?P<title>.*?)</title>", re.IGNORECASE | re.DOTALL)
 
+# XML 正文里图片以 <img .../> 出现。注意 lark-cli 实测输出（v1.x）与官方 skill 文档不一致：
+# 文档写的是 <img token="..." url="..."/>，实际输出是 <img name="x.png" href="下载URL"
+#   mime="image/png" src="媒体token"/> —— 即 token 在 src=、直链在 href=。
+# 因此两种命名都兜住：token 优先 src，回退 token；mime 直接取标签属性。
+_IMG_TAG_RE = re.compile(r"<img\b[^>]*?/?>", re.IGNORECASE)
+_TOKEN_ATTR_RE = re.compile(r'\b(?:src|token)="([^"]+)"', re.IGNORECASE)
+_MIME_ATTR_RE = re.compile(r'\bmime="([^"]+)"', re.IGNORECASE)
+# 标题标签 <h1..h6 ...>文字</h1..>；用来给每张图归类章节上下文。
+_HEADING_TAG_RE = re.compile(r"<h([1-6])\b[^>]*>(.*?)</h\1>", re.IGNORECASE | re.DOTALL)
+# 去 XML 标签取纯文本（heading 文字里可能套 <text> 等子标签）。
+_XML_TAG_STRIP_RE = re.compile(r"<[^>]+>")
+
 
 @dataclass
 class LarkContent:
     title: str
     raw_text: str  # markdown / 纯文本，可直接喂 LLM
     kind: LarkKind  # 实际识别到的类型
+
+
+@dataclass
+class ImgRef:
+    """XML 正文里枚举到的一张图片：token + mime + 所在章节标题（就近的上一个 heading）。"""
+    token: str
+    heading: str | None
+    mime: str | None = None
 
 
 # ── 异常族 ────────────────────────────────────────────────────────────────────
@@ -109,6 +129,9 @@ async def fetch_lark_content(url: str, timeout: float | None = None) -> LarkCont
     """通过 lark-cli 抓取飞书文档内容。
 
     抛出对应的 LarkFetchError 子类，由调用方映射成 SSE error 消息。
+
+    开启 settings.vision_enabled 时，抓完正文再枚举文档内图片、用视觉模型识别成文字
+    描述 append 到正文（全程 fail-open，识别失败退回纯正文）。
     """
     kind = classify_lark_url(url)
     if kind == "unknown":
@@ -117,17 +140,50 @@ async def fetch_lark_content(url: str, timeout: float | None = None) -> LarkCont
         raise LarkSheetUnsupported("飞书电子表格暂不支持，请将表格导出为 xlsx 后再上传。")
 
     settings = get_settings()
-    cli = settings.lark_cli_path or "lark-cli"
     timeout_sec = float(timeout if timeout is not None else settings.lark_cli_timeout_seconds)
 
-    # lark-cli v1 fetch-doc 已下线，现走 v2：能直接吃 docx/wiki/docs 三种 URL。
-    # --doc-format markdown：拿干净的 markdown 正文喂 LLM（默认是 DocxXML，不适合直接生成用例）。
-    # --as user：用个人授权身份（lark-cli auth login），否则默认 bot 身份需配 app_id/secret。
-    # 成功响应 shape 见 `_extract_title_and_text`：正文在 data.document.content，
-    # 标题以 <title>…</title> 前缀内嵌在正文里。
-    cmd = [cli, "docs", "+fetch", "--doc", url, "--as", settings.lark_cli_identity,
-           "--doc-format", "markdown", "--format", "json"]
     logger.info("lark fetch | kind=%s url=%s", kind, url[:120])
+    # --doc-format markdown：拿干净的 markdown 正文喂 LLM（默认是 DocxXML，不适合直接生成用例）。
+    payload = await _run_fetch(url, doc_format="markdown", timeout_sec=timeout_sec)
+
+    if payload.get("ok") is False:
+        err = payload.get("error") or {}
+        msg = str(err.get("message") or "未知错误")
+        _classify_and_raise(msg)
+
+    title, text = _extract_title_and_text(payload)
+
+    # ── 图片增强（可选）───────────────────────────────────────────────────────
+    # vision 开启时把文档配图识别成文字 append 到正文；纯图片文档（正文为空）也能靠
+    # 图片描述救回来。任何异常都 fail-open 退回原正文。
+    if settings.vision_enabled:
+        try:
+            enriched = await enrich_content_with_images(
+                url, base_text=text, timeout=timeout_sec,
+            )
+            if enriched and enriched.strip():
+                text = enriched
+        except Exception as exc:
+            logger.warning("image enrichment failed (fallback to text-only): %s", exc)
+
+    if not text or not text.strip():
+        raise LarkEmptyDoc("文档正文为空（可能仅含图片或图表，无法用于生成测试用例）。")
+
+    return LarkContent(title=title or "未命名文档", raw_text=text, kind=kind)
+
+
+async def _run_fetch(url: str, *, doc_format: str, timeout_sec: float) -> dict:
+    """跑一次 `lark-cli docs +fetch`，返回解析后的 payload dict。
+
+    doc_format: markdown（正文喂 LLM）| xml（保留 <img token url> 等结构化标签）。
+    仅在完全拿不到可解析 JSON 时抛 LarkFetchFailed；{"ok": false} 也照样返回给调用方判定。
+
+    --as user/bot：抓取身份，默认 bot（应用凭证），见 settings.lark_cli_identity。
+    """
+    settings = get_settings()
+    cli = settings.lark_cli_path or "lark-cli"
+    cmd = [cli, "docs", "+fetch", "--doc", url, "--as", settings.lark_cli_identity,
+           "--doc-format", doc_format, "--format", "json"]
 
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -167,16 +223,121 @@ async def fetch_lark_content(url: str, timeout: float | None = None) -> LarkCont
     if not payload or not isinstance(payload, dict):
         raise LarkFetchFailed("lark-cli 返回内容无法解析为 JSON")
 
-    if payload.get("ok") is False:
-        err = payload.get("error") or {}
-        msg = str(err.get("message") or "未知错误")
-        _classify_and_raise(msg)
+    return payload
 
-    title, text = _extract_title_and_text(payload)
-    if not text or not text.strip():
-        raise LarkEmptyDoc("文档正文为空（可能仅含图片或图表，无法用于生成测试用例）。")
 
-    return LarkContent(title=title or "未命名文档", raw_text=text, kind=kind)
+# ── 图片增强（图片 → 文字）──────────────────────────────────────────────────────
+
+
+def _enumerate_images_from_xml(xml_text: str) -> list[ImgRef]:
+    """按文档顺序扫出所有 <img token> 并给每张图归到就近的上一个 heading。
+
+    做法：把 heading 标签和 img 标签统一按出现位置排序，边扫边维护 current_heading。
+    """
+    events: list[tuple[int, str, str, str | None]] = []  # (pos, kind, value, mime)
+    for m in _HEADING_TAG_RE.finditer(xml_text):
+        head_txt = _XML_TAG_STRIP_RE.sub("", m.group(2)).strip()
+        events.append((m.start(), "heading", head_txt, None))
+    for m in _IMG_TAG_RE.finditer(xml_text):
+        tok_m = _TOKEN_ATTR_RE.search(m.group(0))
+        if tok_m:
+            mime_m = _MIME_ATTR_RE.search(m.group(0))
+            events.append((m.start(), "img", tok_m.group(1), mime_m.group(1) if mime_m else None))
+    events.sort(key=lambda e: e[0])
+
+    imgs: list[ImgRef] = []
+    current_heading: str | None = None
+    for _pos, kind, value, mime in events:
+        if kind == "heading":
+            current_heading = value or current_heading
+        else:
+            imgs.append(ImgRef(token=value, heading=current_heading, mime=mime))
+    return imgs
+
+
+async def enrich_content_with_images(url: str, *, base_text: str, timeout: float | None = None) -> str:
+    """枚举文档图片 → 逐张下载 + 视觉识别 → 把描述汇总 append 到 base_text。
+
+    全程 fail-open：任何一步失败就跳过（该图 / 整个增强），返回时至少不劣于 base_text。
+    仅在 settings.vision_enabled 时被 fetch_lark_content 调用。
+    """
+    # 延迟 import，避免未开启 vision 时也加载视觉/下载依赖
+    from app.agents.image_describer import describe_image
+    from app.tools.lark_media import download_lark_media, LarkMediaError
+
+    settings = get_settings()
+    timeout_sec = float(timeout if timeout is not None else settings.lark_cli_timeout_seconds)
+
+    # 再抓一次 XML 拿结构化 <img> 标签（markdown 格式丢 token）
+    try:
+        xml_payload = await _run_fetch(url, doc_format="xml", timeout_sec=timeout_sec)
+    except LarkFetchError as exc:
+        logger.warning("image enrichment: xml fetch failed: %s", exc)
+        return base_text
+    if xml_payload.get("ok") is False:
+        return base_text
+
+    _title, xml_text = _extract_title_and_text(xml_payload)
+    if not xml_text:
+        return base_text
+
+    imgs = _enumerate_images_from_xml(xml_text)
+    if not imgs:
+        logger.info("image enrichment: no <img> tags found | url=%s", url[:80])
+        return base_text
+
+    dropped = 0
+    if len(imgs) > settings.vision_max_images:
+        dropped = len(imgs) - settings.vision_max_images
+        imgs = imgs[: settings.vision_max_images]
+    logger.info(
+        "image enrichment: %d image(s) to process%s | url=%s",
+        len(imgs), f"（另丢弃 {dropped} 张，超出 VISION_MAX_IMAGES）" if dropped else "", url[:80],
+    )
+
+    sem = asyncio.Semaphore(max(1, settings.vision_concurrency))
+
+    async def _one(idx: int, ref: ImgRef) -> tuple[int, ImgRef, str]:
+        async with sem:
+            try:
+                data, mime = await download_lark_media(ref.token, timeout=timeout_sec)
+            except LarkMediaError as exc:
+                logger.warning("image enrichment: download failed token=%s: %s", ref.token[:12], exc)
+                return idx, ref, ""
+            # XML 标签自带的 mime 更可靠，优先用它；下载兜底猜的 mime 作后备
+            desc = await describe_image(data, ref.mime or mime, heading=ref.heading)
+            return idx, ref, desc
+
+    results = await asyncio.gather(
+        *[_one(i, ref) for i, ref in enumerate(imgs)], return_exceptions=True,
+    )
+
+    described: list[tuple[int, ImgRef, str]] = []
+    for r in results:
+        if isinstance(r, Exception):
+            logger.warning("image enrichment: task crashed: %s", r)
+            continue
+        idx, ref, desc = r
+        if desc and desc.strip():
+            described.append((idx, ref, desc.strip()))
+
+    if not described:
+        logger.info("image enrichment: no usable descriptions produced | url=%s", url[:80])
+        return base_text
+
+    described.sort(key=lambda t: t[0])
+    lines: list[str] = [f"\n\n## 文档配图（自动识别，共 {len(described)} 张）"]
+    for n, (_idx, ref, desc) in enumerate(described, start=1):
+        head = f" · 章节「{ref.heading}」" if ref.heading else ""
+        lines.append(f"\n### 配图 {n}{head}\n{desc}")
+    appendix = "\n".join(lines)
+
+    logger.info(
+        "image enrichment done | described=%d/%d appendix_chars=%d | url=%s",
+        len(described), len(imgs) + dropped, len(appendix), url[:80],
+    )
+    # base_text 可能为空（纯图片文档）——此时增强段落就是全部正文
+    return (base_text.rstrip() + appendix) if base_text and base_text.strip() else appendix.lstrip()
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────

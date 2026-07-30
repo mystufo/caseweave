@@ -301,6 +301,18 @@ def _entry_payload(e: KnowledgeEntry, *, distance: float | None = None) -> dict:
     }
 
 
+def _near_miss_payload(m) -> dict:
+    """未命中时"差一点入选"的候选（只读展示，带落选原因）。"""
+    return {
+        "id": m.id,
+        "knowledge_type": m.knowledge_type,
+        "content": m.content,
+        "confidence": float(m.confidence or 0.0),
+        "distance": m.distance,
+        "reason": m.reason,
+    }
+
+
 @router.get("/knowledge/preview")
 async def preview_knowledge_for_session(
     session_id: int = Query(..., description="目标会话 id；从其 ClarificationState 取 document"),
@@ -335,7 +347,7 @@ async def preview_knowledge_for_session(
             "knowledge preview[rest] project=%s session=%s | 无 ClarificationState 或 document_id 为空 → 面板显示未命中（未触发检索）",
             project_id, session_id,
         )
-        return {"document_id": None, "module_id": None, "hits": []}
+        return {"document_id": None, "module_id": None, "hits": [], "near_misses": []}
 
     doc_q = await db.execute(
         select(Document).where(Document.id == state.document_id, Document.project_id == project_id)
@@ -346,7 +358,7 @@ async def preview_knowledge_for_session(
             "knowledge preview[rest] project=%s session=%s doc=%s | 文档不存在或跨项目 → 面板显示未命中（未触发检索）",
             project_id, session_id, state.document_id,
         )
-        return {"document_id": None, "module_id": None, "hits": []}
+        return {"document_id": None, "module_id": None, "hits": [], "near_misses": []}
 
     # query 与生成时保持一致：raw_text 截断到 2000 字
     query = truncate_for_llm(doc.raw_text or "", limit=2000)
@@ -355,16 +367,19 @@ async def preview_knowledge_for_session(
             "knowledge preview[rest] project=%s module=%s doc=%s | 文档正文为空 → 面板显示未命中（未触发检索）",
             project_id, doc.module_id, doc.id,
         )
-        return {"document_id": doc.id, "module_id": doc.module_id, "hits": []}
+        return {"document_id": doc.id, "module_id": doc.module_id, "hits": [], "near_misses": []}
     hits = await search_relevant(
         db, project_id=project_id, module_id=doc.module_id, query=query, top_k=top_k,
     )
     if not hits:
-        await log_miss_diagnostics(
+        misses = await log_miss_diagnostics(
             db, project_id=project_id, module_id=doc.module_id,
             document_id=doc.id, query=query, top_k=top_k, context="rest",
         )
-        return {"document_id": doc.id, "module_id": doc.module_id, "hits": []}
+        return {
+            "document_id": doc.id, "module_id": doc.module_id, "hits": [],
+            "near_misses": [_near_miss_payload(m) for m in misses],
+        }
 
     # 重新拉详细字段（store 只返回精简版）
     hit_ids = [h.id for h in hits]
@@ -382,11 +397,15 @@ async def preview_knowledge_for_session(
     ]
     if not payload:
         # 检索到了条目、但全被同文档排除 → 前端面板仍显示未命中
-        await log_miss_diagnostics(
+        misses = await log_miss_diagnostics(
             db, project_id=project_id, module_id=doc.module_id,
             document_id=doc.id, query=query, top_k=top_k, context="rest",
         )
-    return {"document_id": doc.id, "module_id": doc.module_id, "hits": payload}
+        return {
+            "document_id": doc.id, "module_id": doc.module_id, "hits": [],
+            "near_misses": [_near_miss_payload(m) for m in misses],
+        }
+    return {"document_id": doc.id, "module_id": doc.module_id, "hits": payload, "near_misses": []}
 
 
 @router.get("/knowledge/stats")

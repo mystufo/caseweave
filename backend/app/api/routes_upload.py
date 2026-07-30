@@ -39,7 +39,7 @@ from app.agents.knowledge_dedup import classify_relations
 from app.agents.module_classifier import classify_module, ModuleSuggestion
 from app.knowledge.store import (
     store_entries, search_relevant, summarize_for_prompt, HitEntry,
-    find_similar_entries, log_miss_diagnostics,
+    find_similar_entries, log_miss_diagnostics, NearMiss,
 )
 from app.api._assistant_messages import record_knowledge_selection
 from app.config import get_settings
@@ -100,6 +100,18 @@ def _knowledge_hit_dict(e: KnowledgeEntry, distance: float | None) -> dict:
         "version": e.version,
         "created_at": e.created_at.isoformat() if e.created_at else None,
         "distance": distance,
+    }
+
+
+def _near_miss_dict(m: NearMiss) -> dict:
+    """SSE knowledge_preview 帧里"未命中但最接近"的条目 —— 只读展示，无 module/doc/version 等字段。"""
+    return {
+        "id": m.id,
+        "knowledge_type": m.knowledge_type,
+        "content": m.content,
+        "confidence": float(m.confidence or 0.0),
+        "distance": m.distance,
+        "reason": m.reason,
     }
 
 
@@ -219,10 +231,14 @@ async def _auto_classify_module_if_needed(
 async def _compute_knowledge_preview(
     *, project_id: int, module_id: int | None, document_id: int,
     raw_text: str, top_k: int | None = None,
-) -> list[dict]:
+) -> tuple[list[dict], list[dict]]:
     """跑一次 search_relevant 拿候选条目并补全字段；同文档抽取出的条目排除掉。
 
-    失败一律返回 [] —— 知识检索是辅助，断网/无 embedding 都不该阻塞主流程。
+    返回 (hits, near_misses)：
+    - hits：会被注入 prompt 的命中条目（可勾选）；
+    - near_misses：未命中时"差一点入选"的前 top_k 候选（只读展示，带落选原因）。命中非空时为 []。
+
+    失败一律返回 ([], []) —— 知识检索是辅助，断网/无 embedding 都不该阻塞主流程。
 
     top_k None → 用 settings.knowledge_preview_top_k
     """
@@ -234,7 +250,7 @@ async def _compute_knowledge_preview(
             "knowledge preview project=%s module=%s doc=%s | 文档正文为空 → 面板显示未命中（未触发检索）",
             project_id, module_id, document_id,
         )
-        return []
+        return [], []
     try:
         async with AsyncSessionLocal() as db:
             hits = await search_relevant(
@@ -246,11 +262,11 @@ async def _compute_knowledge_preview(
                     "knowledge preview project=%s module=%s doc=%s | search_relevant 返回 0 条 → 面板显示未命中",
                     project_id, module_id, document_id,
                 )
-                await log_miss_diagnostics(
+                misses = await log_miss_diagnostics(
                     db, project_id=project_id, module_id=module_id,
                     document_id=document_id, query=query, top_k=top_k, context="upload",
                 )
-                return []
+                return [], [_near_miss_dict(m) for m in misses]
             hit_ids = [h.id for h in hits]
             rows = (await db.execute(
                 select(KnowledgeEntry).where(KnowledgeEntry.id.in_(hit_ids))
@@ -269,14 +285,15 @@ async def _compute_knowledge_preview(
             )
             if not out:
                 # 检索到了条目、但全被同文档排除（或阈值过滤后本就为空）→ 面板仍显示未命中
-                await log_miss_diagnostics(
+                misses = await log_miss_diagnostics(
                     db, project_id=project_id, module_id=module_id,
                     document_id=document_id, query=query, top_k=top_k, context="upload",
                 )
-            return out
+                return [], [_near_miss_dict(m) for m in misses]
+            return out, []
     except Exception as exc:
         logger.warning("compute_knowledge_preview failed: %s", exc)
-        return []
+        return [], []
 
 
 async def _resolve_knowledge_brief_by_ids(
@@ -966,18 +983,7 @@ async def upload_document_stream(
 
         # Stage 2: 仅解析入库（不跑模块自动分类，那属于「开始生成」阶段的第一步）。
         # 用户在上传时若显式指定了 module_id 则沿用，否则留空待 /pipeline/start/stream 归类。
-        module_name: str | None = None
         async with AsyncSessionLocal() as db:
-            if module_id:
-                result = await db.execute(
-                    select(Module).where(
-                        Module.id == module_id,
-                        Module.project_id == project_id,
-                    )
-                )
-                module = result.scalar_one_or_none()
-                module_name = module.name if module else None
-
             ext = filename.rsplit(".", 1)[-1].lower()
             # 同 (project_id, sha256) 的 Document 可能已存在（上面 cache_hit 未命中 existing
             # 为 None 时才到这，但仍防御竞态）——已存在就复用并刷新，避免撞唯一约束。
@@ -1111,9 +1117,10 @@ async def upload_lark_stream(
             return
 
         # Stage 2: 调 lark-cli 抓正文
+        _vision_note = "（含图片识别，可能较慢）" if get_settings().vision_enabled else ""
         yield _sse("stage", {
             "stage": "fetching",
-            "message": f"正在通过 lark-cli 抓取飞书{ {'docx': '新版文档', 'wiki': '知识库', 'docs': '旧版文档'}.get(kind, '文档') }…",
+            "message": f"正在通过 lark-cli 抓取飞书{ {'docx': '新版文档', 'wiki': '知识库', 'docs': '旧版文档'}.get(kind, '文档') }{_vision_note}…",
         })
         try:
             content = await fetch_lark_content(url)
@@ -1214,14 +1221,6 @@ async def upload_lark_stream(
 
         # Stage 4: persist Document（source_type=lark）——只暂存，不做模块自动分类
         async with AsyncSessionLocal() as db:
-            module_name: str | None = None
-            if module_id:
-                result = await db.execute(
-                    select(Module).where(Module.id == module_id, Module.project_id == project_id)
-                )
-                module = result.scalar_one_or_none()
-                module_name = module.name if module else None
-
             # 同 (project_id, sha256) 的 Document 可能已存在——比如此前导入跑到一半崩了。
             # 若仍无条件 INSERT 会撞唯一约束 uq_documents_project_sha。这里改为：已存在
             # 就复用该行（刷新可变字段），不存在才新建。
@@ -1535,14 +1534,6 @@ async def upload_mindmap_stream(
 
         # Stage 2: persist Document(role="mindmap")（不做模块自动分类，留给「开始生成」阶段）
         async with AsyncSessionLocal() as db:
-            module_name: str | None = None
-            if module_id:
-                mr = await db.execute(
-                    select(Module).where(Module.id == module_id, Module.project_id == project_id)
-                )
-                module = mr.scalar_one_or_none()
-                module_name = module.name if module else None
-
             # 同 sha256 已存在就复用（上面的 cache_hit 只在 existing 命中时早返回；
             # 这里防御 fingerprint 检查与本次 INSERT 之间的竞态/残留，避免撞唯一约束）。
             existing_doc = (await db.execute(
@@ -1725,7 +1716,7 @@ async def pipeline_start_stream(
 
         # Stage 2: 知识库检索预览（同文档排除，防自反馈污染）
         yield _sse("stage", {"stage": "knowledge_lookup", "message": "正在检索项目知识库相关条目…"})
-        knowledge_hits = await _compute_knowledge_preview(
+        knowledge_hits, knowledge_near_misses = await _compute_knowledge_preview(
             project_id=project_id, module_id=module_id, document_id=primary_doc_id,
             raw_text=classify_src,
         )
@@ -1753,6 +1744,7 @@ async def pipeline_start_stream(
             },
             "module_name": module_name,
             "hits": knowledge_hits,
+            "near_misses": knowledge_near_misses,
         })
         yield _sse("done", {})
 

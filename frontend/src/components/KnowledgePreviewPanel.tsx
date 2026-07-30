@@ -1,10 +1,12 @@
 import { useEffect, useMemo, useState } from 'react'
-import { Loader2, BookOpen, Sparkles } from 'lucide-react'
-import type { KnowledgeHit } from '../api/client'
+import { Loader2, BookOpen, Sparkles, SearchX } from 'lucide-react'
+import type { KnowledgeHit, KnowledgeNearMiss } from '../api/client'
 
 interface Props {
   loading: boolean
   hits: KnowledgeHit[]
+  // 未命中时「差一点入选」的候选（只读展示，不可勾选注入）
+  nearMisses?: KnowledgeNearMiss[]
   onConfirm: (selectedIds: number[]) => void
   // 显示文案上的小提示（当前轮 N、模块、前缀），仅 UI 装饰
   moduleName?: string | null
@@ -31,7 +33,7 @@ function formatDistance(d: number | null): string {
 }
 
 export default function KnowledgePreviewPanel({
-  loading, hits, onConfirm, moduleName, casePrefix, phase = 'generate',
+  loading, hits, nearMisses, onConfirm, moduleName, casePrefix, phase = 'generate',
 }: Props) {
   // 默认全勾。每次 hits 变化（重新拉取）都重置一次。
   const [selected, setSelected] = useState<Set<number>>(new Set())
@@ -66,6 +68,16 @@ export default function KnowledgePreviewPanel({
     })
   }, [hits])
 
+  const sortedMisses = useMemo(() => {
+    const list = nearMisses ?? []
+    return [...list].sort((a, b) => {
+      if (a.distance == null && b.distance == null) return 0
+      if (a.distance == null) return 1
+      if (b.distance == null) return -1
+      return a.distance - b.distance
+    })
+  }, [nearMisses])
+
   const isClarify = phase === 'clarify'
   const headlineText = isClarify
     ? '确认要注入到澄清提示词的知识库内容'
@@ -97,8 +109,46 @@ export default function KnowledgePreviewPanel({
           正在检索项目知识库…
         </div>
       ) : hits.length === 0 ? (
-        <div className="text-xs text-emerald-700/80">
-          {emptyText}
+        <div className="space-y-2">
+          <div className="text-xs text-emerald-700/80">
+            {emptyText}
+          </div>
+          {sortedMisses.length > 0 && (
+            <div className="rounded-lg border border-emerald-200/70 bg-white/60 p-2.5 space-y-1.5">
+              <div className="flex items-center gap-1.5 text-xs font-medium text-gray-600">
+                <SearchX size={13} />
+                最接近但未采用的 {sortedMisses.length} 条（仅供参考，不会注入）
+              </div>
+              <ul className="space-y-1.5 max-h-60 overflow-auto pr-1">
+                {sortedMisses.map(m => {
+                  const typeLabel = TYPE_LABEL[m.knowledge_type] || m.knowledge_type
+                  return (
+                    <li
+                      key={m.id}
+                      className="px-2.5 py-1.5 rounded border border-gray-200 bg-gray-50/70 text-xs leading-relaxed"
+                    >
+                      <div className="flex items-center flex-wrap gap-1.5 mb-0.5">
+                        <span className="px-1.5 py-0.5 rounded bg-gray-200 text-gray-600 font-medium">
+                          {typeLabel}
+                        </span>
+                        <span className="text-gray-500">
+                          相关度 {formatDistance(m.distance)}
+                        </span>
+                        {m.reason && (
+                          <span className="px-1.5 py-0.5 rounded bg-amber-100 text-amber-700">
+                            {m.reason}
+                          </span>
+                        )}
+                      </div>
+                      <div className="text-gray-700 whitespace-pre-wrap break-words">
+                        {m.content}
+                      </div>
+                    </li>
+                  )
+                })}
+              </ul>
+            </div>
+          )}
         </div>
       ) : (
         <>

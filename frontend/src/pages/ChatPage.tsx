@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import type {
   ChatSession, ChatMessage as IChatMessage, TestCase, UploadResult,
   ClarificationQuestion, ClarificationRoundHistory, ClarificationStateDTO,
-  KnowledgeHit, KnowledgeDraft, ModuleSummary,
+  KnowledgeHit, KnowledgeNearMiss, KnowledgeDraft, ModuleSummary,
 } from '../api/client'
 import {
   fetchSessions, fetchMessages, createSession, renameSession, deleteSession,
@@ -102,6 +102,7 @@ interface SessionState {
     casePrefix: string | null
     loading: boolean
     hits: KnowledgeHit[]
+    nearMisses?: KnowledgeNearMiss[]
   } | {
     phase: 'generate'
     documentId: number | null
@@ -111,7 +112,12 @@ interface SessionState {
     rounds: ClarificationRoundHistory[]
     loading: boolean
     hits: KnowledgeHit[]
+    nearMisses?: KnowledgeNearMiss[]
   } | null
+  // 澄清阶段用户对知识注入的选择，生成时原样沿用（不再在生成前二次弹面板确认）。
+  // 与后端 /api/generate 的 knowledge_ids 三态对应：null=澄清阶段未表态(兜底自动检索)、
+  // []=选了不注入、[ids]=选了这些条目。由 startInitialClarification 落库。
+  clarifyKnowledgeIds: number[] | null
   // 后端把 state.status 标成 "generating"（澄清完成、待生成）但本会话用例仍为空——
   // 通常是上一次点了「生成」但请求被关屏/掉网中断了。带上这个字段让 UI 显示「继续生成」按钮。
   pendingGenerate: {
@@ -195,6 +201,7 @@ const emptyState = (mode: 'cases' | 'mindmap' = 'cases'): SessionState => ({
   mindmapResult: null,
   mindmapReadyToGenerate: false,
   knowledgePreview: null,
+  clarifyKnowledgeIds: null,
   pendingGenerate: null,
   prdDraftReview: null,
   mindmapDraftReview: null,
@@ -656,7 +663,7 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
           if (cancelled) return
           patchSession(activeSessionId, prev => (
             prev.knowledgePreview && prev.knowledgePreview.phase === 'clarify'
-              ? { knowledgePreview: { ...prev.knowledgePreview, loading: false, hits: preview.hits } }
+              ? { knowledgePreview: { ...prev.knowledgePreview, loading: false, hits: preview.hits, nearMisses: preview.near_misses ?? [] } }
               : {}
           ))
         }).catch(err => {
@@ -668,7 +675,7 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
           if (cancelled) return
           patchSession(activeSessionId, prev => (
             prev.knowledgePreview && prev.knowledgePreview.phase === 'clarify'
-              ? { knowledgePreview: { ...prev.knowledgePreview, loading: false, hits: [] } }
+              ? { knowledgePreview: { ...prev.knowledgePreview, loading: false, hits: [], nearMisses: [] } }
               : {}
           ))
         }).finally(() => setCancel(activeSessionId, null))
@@ -1496,6 +1503,7 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
           followupBuffer: '',
           knowledgePreview: null,
           pendingGenerate: null,
+          clarifyKnowledgeIds: null,
         }
       })
     } catch (err) {
@@ -1540,6 +1548,7 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
             followupBuffer: '',
             knowledgePreview: null,
             pendingGenerate: null,
+            clarifyKnowledgeIds: null,
             messages: prev.messages,
           }))
           // 顺便把 message 列表也重拉一次，把后端写的 generate_done 气泡补上
@@ -1608,54 +1617,6 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
     }
   }, [patchSession, active.confirmedModuleName, active.confirmedModuleId])
 
-  // 切到"生成前的知识库确认"阶段：先把面板挂出来（loading=true），
-  // 再异步去后端拉 preview。失败时直接退化为"无知识注入"流程，给用户开始生成的入口。
-  // 注意这是 phase='generate'；upload SSE 的 onKnowledgePreview 才是 phase='clarify'。
-  const startKnowledgePreview = useCallback(async (
-    sid: number,
-    documentId: number | null,
-    mindmapDocumentId: number | null,
-    rounds: ClarificationRoundHistory[],
-    moduleName: string,
-    casePrefix: string,
-  ) => {
-    patchSession(sid, {
-      followupActive: false,
-      currentQuestions: null,
-      knowledgePreview: {
-        phase: 'generate',
-        documentId, mindmapDocumentId, moduleName, casePrefix, rounds,
-        loading: true, hits: [],
-      },
-    })
-    // 注册取消器，让"停止任务"能中断这次预览检索请求。
-    const controller = new AbortController()
-    setCancel(sid, () => controller.abort())
-    try {
-      const preview = await fetchKnowledgePreview(sid, undefined, controller.signal)
-      patchSession(sid, prev => (
-        prev.knowledgePreview && prev.knowledgePreview.phase === 'generate'
-          ? { knowledgePreview: { ...prev.knowledgePreview, loading: false, hits: preview.hits } }
-          : {}
-      ))
-    } catch (err) {
-      // 用户主动点"停止任务" → axios 抛 CanceledError：不算错误，只把 loading 收掉，
-      // handleStopConfirm 的兜底已经把面板 loading 置 false，这里保持一致即可。
-      const aborted =
-        controller.signal.aborted
-        || (err as { name?: string; code?: string })?.name === 'CanceledError'
-        || (err as { code?: string })?.code === 'ERR_CANCELED'
-      if (!aborted) console.error('Knowledge preview failed:', err)
-      patchSession(sid, prev => (
-        prev.knowledgePreview && prev.knowledgePreview.phase === 'generate'
-          ? { knowledgePreview: { ...prev.knowledgePreview, loading: false, hits: [] } }
-          : {}
-      ))
-    } finally {
-      setCancel(sid, null)
-    }
-  }, [patchSession, setCancel])
-
   // clarify 阶段的确认：把用户勾选的知识 ids 传给 /api/clarify/initial/stream，
   // 走完整的 Clarifier 事件序列，落到 currentQuestions/currentSummary/currentRound。
   // 错误路径：把面板恢复成 loading=false 让用户重试，或直接进入"无澄清，直接预览生成"兜底。
@@ -1666,8 +1627,10 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
     knowledgeIds: number[] | null,
   ) => {
     // 把 knowledgePreview 关掉 + 切到一个"正在跑澄清"的 followupActive 视觉态（复用现有 amber loader）
+    // 同时记住澄清阶段对知识注入的选择，生成时原样沿用（不再在生成前二次确认）。
     patchSession(sid, {
       knowledgePreview: null,
+      clarifyKnowledgeIds: knowledgeIds,
       followupActive: true,
       followupBuffer: '',
       currentQuestions: null,
@@ -1705,8 +1668,8 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
           }))
 
           // 首轮澄清即"无遗留疑点/可直接生成"：与追问路径（handleClarificationConfirm）
-          // 保持一致——不再停在空的澄清面板（那会渲染不出、导致流程死在这里），而是切到
-          // 生成阶段的知识预览，让用户确认注入知识后生成用例。
+          // 保持一致——不再停在空的澄清面板（那会渲染不出、导致流程死在这里）。
+          // 生成前不再二次弹知识面板，直接沿用澄清阶段的知识选择（本闭包的 knowledgeIds）生成。
           if (readyNow) {
             const cur = taskMapRef.current[sid]
             const prdDocId = result.document_id ?? (cur?.uploadResult?.document_id ?? documentId)
@@ -1715,7 +1678,7 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
               cur?.confirmedModuleName ?? result.clarification?.module_detected ?? ''
             const casePrefix =
               cur?.confirmedCasePrefix ?? result.clarification?.case_prefix_suggestion ?? ''
-            void startKnowledgePreview(sid, prdDocId, mmDocId, cur?.clarificationRounds ?? [], moduleName, casePrefix)
+            void runGenerate(sid, prdDocId, mmDocId, cur?.clarificationRounds ?? [], moduleName, casePrefix, knowledgeIds)
           }
         },
         onAssistantMessage: (msg) => {
@@ -1733,7 +1696,7 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
       },
     )
     setCancel(sid, abort)
-  }, [patchSession, setCancel, startKnowledgePreview])
+  }, [patchSession, setCancel, runGenerate])
 
   // 「开始生成」闸门：把本会话已暂存的 PRD / 脑图推进到下游流程。
   // 后端 /pipeline/start/stream 会跑模块自动分类 + 知识检索预览，发 module_auto_classified /
@@ -1756,6 +1719,7 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
             casePrefix: null,
             loading: false,
             hits: preview.hits,
+            nearMisses: preview.near_misses ?? [],
           },
         }))
       },
@@ -1803,6 +1767,8 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
     // PRD 文档 id 可能因为脑图独立模式 / startInitialClarification 拼出 fakeUpload 而为 null
     const prdDocId = (cur.uploadResult && (cur.uploadResult.document_id ?? null)) ?? null
     const mindmapDocId = cur.uploadMindmap?.documentId ?? null
+    // 澄清阶段对知识注入的选择，生成时原样沿用（不再二次弹面板）。读最新 state 更稳。
+    const clarifyIds = taskMapRef.current[sid]?.clarifyKnowledgeIds ?? null
 
     patchSession(sid, {
       clarificationRounds: updatedRounds,
@@ -1810,9 +1776,9 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
       confirmedCasePrefix: lockedPrefix,
     })
 
-    // 已达上限：跳过追问直接进知识预览阶段
+    // 已达上限：跳过追问，直接沿用澄清阶段的知识选择生成（不再二次弹面板）
     if (updatedRounds.length >= MAX_ROUNDS) {
-      await startKnowledgePreview(sid, prdDocId, mindmapDocId, updatedRounds, lockedModule, lockedPrefix)
+      await runGenerate(sid, prdDocId, mindmapDocId, updatedRounds, lockedModule, lockedPrefix, clarifyIds)
       return
     }
 
@@ -1839,8 +1805,8 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
         onResult: (res) => {
           const newQs = res.clarification.questions || []
           if (res.clarification.ready_to_generate || newQs.length === 0) {
-            // 不再直接 runGenerate；切到知识预览面板，让用户确认要注入的条目
-            startKnowledgePreview(sid, prdDocId, mindmapDocId, updatedRounds, lockedModule, lockedPrefix)
+            // 澄清就绪：生成前不再二次弹面板，直接沿用澄清阶段的知识选择生成
+            runGenerate(sid, prdDocId, mindmapDocId, updatedRounds, lockedModule, lockedPrefix, clarifyIds)
           } else {
             patchSession(sid, {
               currentQuestions: newQs,
@@ -1855,8 +1821,8 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
         onError: (msg) => {
           console.error('Follow-up error:', msg)
           setCancel(sid, null)
-          // 追问出错也仍然给用户确认知识库的机会，避免静默直跑
-          startKnowledgePreview(sid, prdDocId, mindmapDocId, updatedRounds, lockedModule, lockedPrefix)
+          // 追问出错兜底：直接沿用澄清阶段的知识选择生成，避免流程卡死
+          runGenerate(sid, prdDocId, mindmapDocId, updatedRounds, lockedModule, lockedPrefix, clarifyIds)
         },
         onDone: () => {
           patchSession(sid, { followupActive: false })
@@ -1865,7 +1831,7 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
       },
     )
     setCancel(sid, abort)
-  }, [activeSessionId, taskMap, patchSession, startKnowledgePreview, setCancel])
+  }, [activeSessionId, taskMap, patchSession, runGenerate, setCancel])
 
   // ── 脑图模式澄清 ───────────────────────────────────────────────────────────
   // 与用例模式共用后端澄清端点（/clarify/initial|followup/stream），它本就支持知识库命中注入
@@ -1938,7 +1904,7 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
   const handleMindmapClarificationConfirm = useCallback((
     answers: Record<string, string>,
     moduleName: string,
-    _casePrefix: string,  // 脑图不用用例编号前缀
+    // 脑图不用用例编号前缀，故省略 ClarificationPanel 传来的第三个 casePrefix 参数
   ) => {
     if (activeSessionId == null) return
     const sid = activeSessionId
@@ -2474,11 +2440,14 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
           {/* 上传 SSE 里 knowledge_preview 帧先于产品知识抽取（knowledge_extract 阶段）到达，
               但抽取仍在跑（uploading 尚未 done）。此时不渲染预览面板，避免"开始澄清"按钮
               抢在抽取完成/草稿审核之前出现。抽取完成后 onDone 置 uploading=false，面板才亮。
-              phase='generate' 的预览由 startKnowledgePreview 触发（uploading 早已 false），不受影响。 */}
-          {active.mode !== 'mindmap' && active.knowledgePreview && !active.uploading && !active.extractingDrafts && !active.generating && !active.prdDraftReview && !active.mindmapDraftReview && !active.moduleDecision && (
+              注：本面板现仅在 phase='clarify'（澄清前）出现；生成前不再二次确认知识，
+              直接沿用澄清阶段的选择（见 handleClarificationConfirm / startInitialClarification 里
+              改调 runGenerate）。下面 onConfirm 的 generate 分支保留但已不可达。 */}
+          {active.mode !== 'mindmap' && active.knowledgePreview && !active.uploading && !active.extractingDrafts && !active.generating && !active.followupActive && !active.prdDraftReview && !active.mindmapDraftReview && !active.moduleDecision && (
             <KnowledgePreviewPanel
               loading={active.knowledgePreview.loading}
               hits={active.knowledgePreview.hits}
+              nearMisses={active.knowledgePreview.nearMisses}
               moduleName={active.knowledgePreview.moduleName}
               casePrefix={active.knowledgePreview.casePrefix}
               phase={active.knowledgePreview.phase}

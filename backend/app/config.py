@@ -46,6 +46,28 @@ class Settings(BaseSettings):
     embedding_dim: int = 1024                    # 必须与 model 实际输出维度一致；bge-m3=1024，OpenAI small=1536
     embedding_mode: str = "standard"             # standard | multimodal（火山方舟视觉版走 /embeddings/multimodal）
 
+    # ── Rerank（精排，检索第二阶段）─────────────────────────────────────────
+    # 单向量召回（bi-encoder）负责「捞得全」，精排把 query 与每条候选一起判定相关性负责「排得准」，
+    # 是修好「整篇文档 query vs 单句知识」不对称问题的关键一环。全程 fail-open：
+    # 开关关 / 未配置 / 服务未就绪 / 出错 → 自动降级回纯向量检索，绝不阻塞主流程。
+    #   provider=llm    → 默认。复用主 LLM（build_chat_model，即 llm_* 那套凭证）一次调用给候选打分，
+    #                     不需新服务/新鉴权；准确性略逊 cross-encoder，但零额外部署。
+    #   provider=local  → 本地 TEI cross-encoder 容器（BAAI/bge-reranker-v2-m3），走 http://reranker:80/rerank。
+    #   provider=openai → 远程兼容 /rerank 接口（TEI 格式），需 rerank_api_key。
+    rerank_enabled: bool = True                  # 精排总开关，默认开启
+    rerank_provider: str = "llm"                 # llm（复用主模型打分）| local（本地 TEI）| openai（远程 TEI）
+    rerank_model: str = "bge-reranker-v2-m3"     # 仅 local/openai 用；llm 走 llm_model
+    rerank_api_key: str = ""                     # provider=openai 必填；llm/local 无需
+    rerank_base_url: Optional[str] = None        # local 留空→http://reranker:80；openai 填实际地址
+    rerank_candidate_k: int = 30                 # 召回池大小（喂给精排的候选条数，放宽召回宁多勿漏）
+    rerank_score_threshold: float = 0.3          # 精排分数下限（保留 score≥该值）；0/负=不过滤
+
+    # ── 知识检索 query 分块（配合 max-sim 召回）───────────────────────────────
+    # 把文档 query 切成窗口分别 embed，对每条知识取「跨所有窗口的最小距离」，
+    # 避免长文平均向量把单句知识的相关度稀释掉。
+    knowledge_query_chunk_size: int = 256        # 单个分块窗口的目标最大字符数
+    knowledge_query_chunk_overlap: int = 48      # 相邻窗口重叠字符数（防关键句被边界劈开）
+
     # ── Knowledge retrieval (Phase 3) ─────────────────────────────────────────
     # 全局开关，覆盖所有项目所有模块。要按项目精细化配置请先升级到 ProjectSetting 表。
     # preview: 上传/生成前给前端 KnowledgePreviewPanel 的候选条数。给得多用户能看到更全的边缘条目，
@@ -81,6 +103,20 @@ class Settings(BaseSettings):
     # 抓取身份：user（个人授权，走 auth login）| bot（应用，需 app_id/secret）。
     # 默认 bot：应用凭证不过期、不依赖 OS keychain，适合容器/服务器无人值守部署。
     lark_cli_identity: str = "bot"
+
+    # ── 视觉模型（图片 → 文字）─────────────────────────────────────────────────
+    # 用于把飞书文档里的内嵌图片（UI 原型 / 流程图 / 架构图）识别成文字描述，
+    # append 进 Document.raw_text 一并喂给 Clarifier/Generator。默认关闭。
+    # 与主 LLM 解耦：vision_* 留空时逐项回退到对应的 llm_*（见 llm_factory.build_vision_model）。
+    # 要开启需 provider 侧模型支持多模态输入（如火山方舟 doubao-vision / Anthropic Claude）。
+    vision_enabled: bool = False
+    vision_provider: str = ""              # 空 → 回退 llm_provider（anthropic|openai）
+    vision_model: str = ""                 # 空 → 回退 llm_model；建议填视觉模型/接入点
+    vision_api_key: str = ""               # 空 → 回退 llm_api_key
+    vision_base_url: Optional[str] = None  # 空 → 回退 llm_base_url
+    vision_max_tokens: int = 1024          # 单张图描述的输出上限，够写一段结构化描述
+    vision_max_images: int = 20            # 单文档识别图片张数上限（控成本/耗时）；超出丢弃并记日志
+    vision_concurrency: int = 3            # 图片识别并发数（视觉接口通常限流，别开太大）
 
     # App
     debug: bool = False

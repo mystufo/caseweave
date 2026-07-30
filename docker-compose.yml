@@ -64,6 +64,20 @@ services:
       - embedding_data:/data
     restart: unless-stopped
 
+  # 本地开源精排（rerank）服务，同为 HuggingFace TEI，跑 cross-encoder 模型。
+  # 仅当 RERANK_PROVIDER=local 时需要启动本服务；默认 RERANK_PROVIDER=llm（复用主 LLM 打分）
+  # 时用不到它，可不起。知识检索第二阶段：把 query 与每条候选拼一起交互式打分，比单向量召回排得更准。
+  # backend 走内网 http://reranker:80/rerank（无需 key）；不 depends_on——TEI 冷启动慢，
+  # 靠 reranker.py 的 fail-open 兜底（未就绪时自动降级回纯向量检索）。
+  # 架构覆盖：x86 用默认 cpu-1.9；Apple Silicon/ARM 设 RERANK_IMAGE=...:cpu-arm64-1.9。
+  reranker:
+    image: ${RERANK_IMAGE:-ghcr.io/huggingface/text-embeddings-inference:cpu-1.9}
+    command: ["--model-id", "BAAI/bge-reranker-v2-m3", "--auto-truncate"]
+    volumes:
+      - reranker_data:/data
+    restart: unless-stopped
+
 volumes:
   pg_data:
   embedding_data:
+  reranker_data:

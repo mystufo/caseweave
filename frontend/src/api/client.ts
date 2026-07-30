@@ -335,6 +335,7 @@ export interface UploadKnowledgePreview {
   module_name: string | null
   stats: { chunks: number; tables: number; raw_text_length: number }
   hits: KnowledgeHit[]
+  near_misses?: KnowledgeNearMiss[]
   // 飞书路径还会带 source: "lark" + url，文件路径不带
   source?: string
   url?: string
@@ -908,10 +909,22 @@ export interface KnowledgeHit {
   distance: number | null  // 余弦距离，越小越相关；fallback 路径为 null
 }
 
+// 「未命中但最接近」的候选：知识库检索没命中时，后端以 distance_threshold=0 重跑近邻
+// 拿到的前 top_k 条，附落选原因（超阈值 / 同文档排除）。仅供前端只读展示，不可勾选注入。
+export interface KnowledgeNearMiss {
+  id: number
+  knowledge_type: string
+  content: string
+  confidence: number
+  distance: number | null
+  reason: string  // "超阈值>0.45" / "同文档排除" / "本应入选"，可用｜分隔多个
+}
+
 export interface KnowledgePreview {
   document_id: number | null
   module_id: number | null
   hits: KnowledgeHit[]
+  near_misses?: KnowledgeNearMiss[]
 }
 
 export const fetchKnowledgePreview = (sessionId: number, topK = 8, signal?: AbortSignal) =>
