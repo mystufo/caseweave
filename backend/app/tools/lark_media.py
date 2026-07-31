@@ -3,7 +3,7 @@
 复用 lark_fetcher 的子进程脚手架思路：调 `lark-cli docs +media-download` 把某个
 media token 下载到临时文件，读回字节 + 猜 mime，用完删临时文件。
 
-只服务于「图片 → 文字」增强链路（见 lark_fetcher.enrich_content_with_images），
+只服务于「图片 → 文字」增强链路（见 lark_fetcher.enrich_content_with_media），
 所有失败都抛轻量的 LarkMediaError，由调用方 fail-open 吞掉、跳过该图。
 """
 from __future__ import annotations
@@ -57,11 +57,15 @@ def _guess_mime(path: str, data: bytes) -> str:
 
 async def download_lark_media(
     token: str, *, timeout: float | None = None, identity: str | None = None,
+    media_type: str = "media",
 ) -> tuple[bytes, str]:
     """下载单个 media token，返回 (图片字节, mime)。
 
     走 `lark-cli docs +media-download --token <token> --output <相对名> --as <identity>`
     （cwd 设到临时目录），复用本机 lark-cli 登录态。identity 留空则用 settings.lark_cli_identity。
+
+    media_type: "media"（默认，普通图片/文件素材，token 为 file_token）
+                "whiteboard"（文档内嵌画板缩略图，token 为 whiteboard_id）——追加 `--type whiteboard`。
     失败抛 LarkMediaError。
     """
     if not token or not token.strip():
@@ -86,6 +90,9 @@ async def download_lark_media(
             "--as", ident,
             "--format", "json",
         ]
+        # 画板缩略图走 --type whiteboard（token 是 whiteboard_id，不是 file_token）
+        if media_type and media_type != "media":
+            cmd += ["--type", media_type]
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,

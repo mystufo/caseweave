@@ -36,6 +36,8 @@ _LARK_URL_RE = re.compile(
 
 # lark-cli v2 fetch-doc 把文档标题内嵌成 `<title>…</title>` 前缀（markdown/xml 皆如此）
 _TITLE_TAG_RE = re.compile(r"<title>(?P<title>.*?)</title>", re.IGNORECASE | re.DOTALL)
+# markdown 正文的首行一级标题（`# 文档标题`）——lark-cli markdown 模式的标题落点。
+_MD_H1_RE = re.compile(r"#[ \t]+(?P<title>[^\n]+)")
 
 # XML 正文里图片以 <img .../> 出现。注意 lark-cli 实测输出（v1.x）与官方 skill 文档不一致：
 # 文档写的是 <img token="..." url="..."/>，实际输出是 <img name="x.png" href="下载URL"
@@ -44,6 +46,15 @@ _TITLE_TAG_RE = re.compile(r"<title>(?P<title>.*?)</title>", re.IGNORECASE | re.
 _IMG_TAG_RE = re.compile(r"<img\b[^>]*?/?>", re.IGNORECASE)
 _TOKEN_ATTR_RE = re.compile(r'\b(?:src|token)="([^"]+)"', re.IGNORECASE)
 _MIME_ATTR_RE = re.compile(r'\bmime="([^"]+)"', re.IGNORECASE)
+# 内嵌画板：XML 正文里以 <whiteboard token="wbcn..." .../> 出现（token 为 whiteboard_id）。
+# 画板没有独立 file_token，只能通过 `+media-download --type whiteboard` 拿缩略图，再走视觉识别。
+_WHITEBOARD_TAG_RE = re.compile(r"<whiteboard\b[^>]*?/?>", re.IGNORECASE)
+# markdown 正文里残留的画板标签（实测是成对形式 `<whiteboard token="…"></whiteboard>`，
+# 也兜住自闭合写法），用于替换成中文占位。
+_WHITEBOARD_MD_RE = re.compile(
+    r"<whiteboard\b[^>]*?(?:/>|>\s*</whiteboard\s*>)", re.IGNORECASE,
+)
+_WB_TOKEN_ATTR_RE = re.compile(r'\btoken="([^"]+)"', re.IGNORECASE)
 # 标题标签 <h1..h6 ...>文字</h1..>；用来给每张图归类章节上下文。
 _HEADING_TAG_RE = re.compile(r"<h([1-6])\b[^>]*>(.*?)</h\1>", re.IGNORECASE | re.DOTALL)
 # 去 XML 标签取纯文本（heading 文字里可能套 <text> 等子标签）。
@@ -59,10 +70,16 @@ class LarkContent:
 
 @dataclass
 class ImgRef:
-    """XML 正文里枚举到的一张图片：token + mime + 所在章节标题（就近的上一个 heading）。"""
+    """XML 正文里枚举到的一张图片：token + mime + 所在章节标题（就近的上一个 heading）。
+
+    kind 区分素材来源：
+    - "media"      普通图片素材（<img>），token 是 file_token，走 --type media 下载；
+    - "whiteboard" 内嵌画板（<whiteboard>），token 是 whiteboard_id，走 --type whiteboard 下载缩略图。
+    """
     token: str
     heading: str | None
     mime: str | None = None
+    kind: str = "media"
 
 
 # ── 异常族 ────────────────────────────────────────────────────────────────────
@@ -130,8 +147,8 @@ async def fetch_lark_content(url: str, timeout: float | None = None) -> LarkCont
 
     抛出对应的 LarkFetchError 子类，由调用方映射成 SSE error 消息。
 
-    开启 settings.vision_enabled 时，抓完正文再枚举文档内图片、用视觉模型识别成文字
-    描述 append 到正文（全程 fail-open，识别失败退回纯正文）。
+    抓完正文后按开关做媒体增强：内嵌画板走结构化提取（lark_whiteboard_enabled，默认开），
+    配图走视觉模型识别（vision_enabled），结果 append 到正文。全程 fail-open，失败退回纯正文。
     """
     kind = classify_lark_url(url)
     if kind == "unknown":
@@ -152,19 +169,22 @@ async def fetch_lark_content(url: str, timeout: float | None = None) -> LarkCont
         _classify_and_raise(msg)
 
     title, text = _extract_title_and_text(payload)
+    # markdown 正文里画板会原样留下 `<whiteboard token="…"></whiteboard>` —— 对 LLM 是纯噪声
+    # （token 无意义），但「这里有张图」这个信号有用，换成中文占位；画板内容走文末增强段落。
+    text = _WHITEBOARD_MD_RE.sub("（此处为文档内嵌画板，内容见文末「文档配图与画板」）", text)
 
-    # ── 图片增强（可选）───────────────────────────────────────────────────────
-    # vision 开启时把文档配图识别成文字 append 到正文；纯图片文档（正文为空）也能靠
-    # 图片描述救回来。任何异常都 fail-open 退回原正文。
-    if settings.vision_enabled:
+    # ── 配图 / 画板增强（可选）─────────────────────────────────────────────────
+    # 把文档配图（需 vision）和内嵌画板（结构化提取，不需要 vision）识别成文字 append 到
+    # 正文；纯图片/纯画板文档（正文为空）也能靠这段救回来。异常一律 fail-open 退回原正文。
+    if settings.vision_enabled or settings.lark_whiteboard_enabled:
         try:
-            enriched = await enrich_content_with_images(
+            enriched = await enrich_content_with_media(
                 url, base_text=text, timeout=timeout_sec,
             )
             if enriched and enriched.strip():
                 text = enriched
         except Exception as exc:
-            logger.warning("image enrichment failed (fallback to text-only): %s", exc)
+            logger.warning("media enrichment failed (fallback to text-only): %s", exc)
 
     if not text or not text.strip():
         raise LarkEmptyDoc("文档正文为空（可能仅含图片或图表，无法用于生成测试用例）。")
@@ -230,9 +250,10 @@ async def _run_fetch(url: str, *, doc_format: str, timeout_sec: float) -> dict:
 
 
 def _enumerate_images_from_xml(xml_text: str) -> list[ImgRef]:
-    """按文档顺序扫出所有 <img token> 并给每张图归到就近的上一个 heading。
+    """按文档顺序扫出所有 <img> 与 <whiteboard> 并给每张图归到就近的上一个 heading。
 
-    做法：把 heading 标签和 img 标签统一按出现位置排序，边扫边维护 current_heading。
+    做法：把 heading / img / whiteboard 标签统一按出现位置排序，边扫边维护 current_heading。
+    画板（<whiteboard token=.../>）当作一种特殊「图片」纳入同一识别链路：下载其缩略图后走视觉识别。
     """
     events: list[tuple[int, str, str, str | None]] = []  # (pos, kind, value, mime)
     for m in _HEADING_TAG_RE.finditer(xml_text):
@@ -243,6 +264,11 @@ def _enumerate_images_from_xml(xml_text: str) -> list[ImgRef]:
         if tok_m:
             mime_m = _MIME_ATTR_RE.search(m.group(0))
             events.append((m.start(), "img", tok_m.group(1), mime_m.group(1) if mime_m else None))
+    for m in _WHITEBOARD_TAG_RE.finditer(xml_text):
+        tok_m = _WB_TOKEN_ATTR_RE.search(m.group(0))
+        if tok_m:
+            # 画板缩略图统一按 PNG 处理（media-download 缩略图为位图），mime 交给下载兜底
+            events.append((m.start(), "whiteboard", tok_m.group(1), None))
     events.sort(key=lambda e: e[0])
 
     imgs: list[ImgRef] = []
@@ -250,20 +276,27 @@ def _enumerate_images_from_xml(xml_text: str) -> list[ImgRef]:
     for _pos, kind, value, mime in events:
         if kind == "heading":
             current_heading = value or current_heading
+        elif kind == "whiteboard":
+            imgs.append(ImgRef(token=value, heading=current_heading, mime=mime, kind="whiteboard"))
         else:
-            imgs.append(ImgRef(token=value, heading=current_heading, mime=mime))
+            imgs.append(ImgRef(token=value, heading=current_heading, mime=mime, kind="media"))
     return imgs
 
 
-async def enrich_content_with_images(url: str, *, base_text: str, timeout: float | None = None) -> str:
-    """枚举文档图片 → 逐张下载 + 视觉识别 → 把描述汇总 append 到 base_text。
+async def enrich_content_with_media(url: str, *, base_text: str, timeout: float | None = None) -> str:
+    """枚举文档配图与内嵌画板 → 转成文字 → 汇总 append 到 base_text。
+
+    两条支线：
+    - 画板（<whiteboard>）：先走 `whiteboard +query` 结构化提取（Mermaid 源码 / 节点+连线
+      大纲，纯文本、零 LLM 成本）；拿不到再退回缩略图 + 视觉识别（需 vision_enabled）。
+    - 配图（<img>）：下载 + 视觉识别，仅在 vision_enabled 时处理。
 
     全程 fail-open：任何一步失败就跳过（该图 / 整个增强），返回时至少不劣于 base_text。
-    仅在 settings.vision_enabled 时被 fetch_lark_content 调用。
     """
     # 延迟 import，避免未开启 vision 时也加载视觉/下载依赖
     from app.agents.image_describer import describe_image
     from app.tools.lark_media import download_lark_media, LarkMediaError
+    from app.tools.lark_whiteboard import fetch_whiteboard_text
 
     settings = get_settings()
     timeout_sec = float(timeout if timeout is not None else settings.lark_cli_timeout_seconds)
@@ -272,7 +305,7 @@ async def enrich_content_with_images(url: str, *, base_text: str, timeout: float
     try:
         xml_payload = await _run_fetch(url, doc_format="xml", timeout_sec=timeout_sec)
     except LarkFetchError as exc:
-        logger.warning("image enrichment: xml fetch failed: %s", exc)
+        logger.warning("media enrichment: xml fetch failed: %s", exc)
         return base_text
     if xml_payload.get("ok") is False:
         return base_text
@@ -283,7 +316,17 @@ async def enrich_content_with_images(url: str, *, base_text: str, timeout: float
 
     imgs = _enumerate_images_from_xml(xml_text)
     if not imgs:
-        logger.info("image enrichment: no <img> tags found | url=%s", url[:80])
+        logger.info("media enrichment: no <img>/<whiteboard> tags found | url=%s", url[:80])
+        return base_text
+
+    # 按开关过滤：画板要 lark_whiteboard_enabled（或 vision 走缩略图兜底）；配图只认 vision。
+    def _wanted(ref: ImgRef) -> bool:
+        if ref.kind == "whiteboard":
+            return settings.lark_whiteboard_enabled or settings.vision_enabled
+        return settings.vision_enabled
+
+    imgs = [ref for ref in imgs if _wanted(ref)]
+    if not imgs:
         return base_text
 
     dropped = 0
@@ -291,21 +334,38 @@ async def enrich_content_with_images(url: str, *, base_text: str, timeout: float
         dropped = len(imgs) - settings.vision_max_images
         imgs = imgs[: settings.vision_max_images]
     logger.info(
-        "image enrichment: %d image(s) to process%s | url=%s",
-        len(imgs), f"（另丢弃 {dropped} 张，超出 VISION_MAX_IMAGES）" if dropped else "", url[:80],
+        "media enrichment: %d item(s) to process%s | url=%s",
+        len(imgs), f"（另丢弃 {dropped} 个，超出 VISION_MAX_IMAGES）" if dropped else "", url[:80],
     )
 
     sem = asyncio.Semaphore(max(1, settings.vision_concurrency))
 
     async def _one(idx: int, ref: ImgRef) -> tuple[int, ImgRef, str]:
         async with sem:
+            # 画板优先走结构化提取（拿到的是原文节点/连线，比看图更准，也不花 LLM token）
+            if ref.kind == "whiteboard" and settings.lark_whiteboard_enabled:
+                try:
+                    text = await fetch_whiteboard_text(ref.token, timeout=timeout_sec)
+                except Exception as exc:  # noqa: BLE001 — 结构化提取绝不该拖垮导入
+                    logger.warning("whiteboard extract crashed token=%s: %s", ref.token[:12], exc)
+                    text = None
+                if text:
+                    return idx, ref, text
+                if not settings.vision_enabled:
+                    return idx, ref, ""
+
             try:
-                data, mime = await download_lark_media(ref.token, timeout=timeout_sec)
+                data, mime = await download_lark_media(
+                    ref.token, timeout=timeout_sec, media_type=ref.kind,
+                )
             except LarkMediaError as exc:
-                logger.warning("image enrichment: download failed token=%s: %s", ref.token[:12], exc)
+                logger.warning(
+                    "media enrichment: download failed kind=%s token=%s: %s",
+                    ref.kind, ref.token[:12], exc,
+                )
                 return idx, ref, ""
             # XML 标签自带的 mime 更可靠，优先用它；下载兜底猜的 mime 作后备
-            desc = await describe_image(data, ref.mime or mime, heading=ref.heading)
+            desc = await describe_image(data, ref.mime or mime, heading=ref.heading, kind=ref.kind)
             return idx, ref, desc
 
     results = await asyncio.gather(
@@ -315,25 +375,31 @@ async def enrich_content_with_images(url: str, *, base_text: str, timeout: float
     described: list[tuple[int, ImgRef, str]] = []
     for r in results:
         if isinstance(r, Exception):
-            logger.warning("image enrichment: task crashed: %s", r)
+            logger.warning("media enrichment: task crashed: %s", r)
             continue
         idx, ref, desc = r
         if desc and desc.strip():
             described.append((idx, ref, desc.strip()))
 
     if not described:
-        logger.info("image enrichment: no usable descriptions produced | url=%s", url[:80])
+        logger.info("media enrichment: no usable descriptions produced | url=%s", url[:80])
         return base_text
 
     described.sort(key=lambda t: t[0])
-    lines: list[str] = [f"\n\n## 文档配图（自动识别，共 {len(described)} 张）"]
+    n_wb = sum(1 for _i, ref, _d in described if ref.kind == "whiteboard")
+    n_img = len(described) - n_wb
+    summary = "、".join(
+        p for p in (f"配图 {n_img} 张" if n_img else "", f"画板 {n_wb} 个" if n_wb else "") if p
+    )
+    lines: list[str] = [f"\n\n## 文档配图与画板（自动识别，共{summary}）"]
     for n, (_idx, ref, desc) in enumerate(described, start=1):
         head = f" · 章节「{ref.heading}」" if ref.heading else ""
-        lines.append(f"\n### 配图 {n}{head}\n{desc}")
+        label = "画板" if ref.kind == "whiteboard" else "配图"
+        lines.append(f"\n### {label} {n}{head}\n{desc}")
     appendix = "\n".join(lines)
 
     logger.info(
-        "image enrichment done | described=%d/%d appendix_chars=%d | url=%s",
+        "media enrichment done | described=%d/%d appendix_chars=%d | url=%s",
         len(described), len(imgs) + dropped, len(appendix), url[:80],
     )
     # base_text 可能为空（纯图片文档）——此时增强段落就是全部正文
@@ -446,6 +512,14 @@ def _extract_title_and_text(payload: dict) -> tuple[str, str]:
             if not title and embedded:
                 title = embedded
             text = text.lstrip()[m.end():].lstrip()
+
+    # markdown 模式下 lark-cli（实测 1.0.69）不发 <title> 标签，而是把文档标题写成首行 H1
+    # （`# 风控识别`）—— 此时用首行 H1 回填标题，否则整篇会落成「未命名文档」。
+    # 只认首个非空行、且正文里保留该 H1（它同时是正文的一级标题，删了反而丢结构）。
+    if not title and text:
+        m = _MD_H1_RE.match(text.lstrip())
+        if m:
+            title = m.group("title").strip()
 
     if not text:
         # 接到未识别 shape 时打印 keys，方便适配

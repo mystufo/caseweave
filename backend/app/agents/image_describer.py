@@ -30,9 +30,27 @@ _SYSTEM_PROMPT = (
     "只回一句「（该图无可用于测试的有效信息）」。不要臆造图中没有的内容，不要输出前言。"
 )
 
+# 画板（whiteboard）多为流程图/架构图/时序图/思维导图，识别时更强调节点与走向的完整还原。
+_WHITEBOARD_SYSTEM_PROMPT = (
+    "你是测试分析专家。用户会给你一张来自产品需求文档的**画板（流程图/架构图/时序图/"
+    "状态图/思维导图等）**截图，请把图中对「设计测试用例」有价值的信息用简洁中文完整还原。重点关注：\n"
+    "1. 节点与连线：逐个列出图中的节点（框/圆/泳道）文字，并写清箭头指向与走向，还原完整流程；\n"
+    "2. 分支与条件：判断节点的每个分支条件及其后续路径（含正常路径与异常/失败路径）；\n"
+    "3. 状态流转：状态机各状态、触发事件与流转关系；\n"
+    "4. 角色与泳道：若有泳道/角色，写清各角色负责的步骤；\n"
+    "5. 规则与约束：图中标注的规则、边界、提示文案。\n"
+    "尽量按「起点→…→终点」的顺序线性描述，覆盖所有分支。不要臆造图中没有的内容，不要输出前言。"
+    "若画板信息太少或无关，只回一句「（该画板无可用于测试的有效信息）」。"
+)
 
-async def describe_image(image_bytes: bytes, mime: str, *, heading: str | None = None) -> str:
-    """识别单张图片，返回中文描述；任何失败返回 ""。"""
+
+async def describe_image(
+    image_bytes: bytes, mime: str, *, heading: str | None = None, kind: str = "media",
+) -> str:
+    """识别单张图片，返回中文描述；任何失败返回 ""。
+
+    kind="whiteboard" 时用更强调流程/节点还原的画板专用提示词；其余走通用配图提示词。
+    """
     if not image_bytes:
         return ""
     settings = get_settings()
@@ -43,10 +61,13 @@ async def describe_image(image_bytes: bytes, mime: str, *, heading: str | None =
         logger.warning("image base64 encode failed: %s", exc)
         return ""
 
-    hint = f"这张图出现在文档章节「{heading}」附近。\n" if heading else ""
+    is_wb = kind == "whiteboard"
+    system_prompt = _WHITEBOARD_SYSTEM_PROMPT if is_wb else _SYSTEM_PROMPT
+    what = "画板" if is_wb else "图"
+    hint = f"这张{what}出现在文档章节「{heading}」附近。\n" if heading else ""
     data_url = f"data:{mime};base64,{b64}"
     human = HumanMessage(content=[
-        {"type": "text", "text": hint + "请描述这张图中与测试用例相关的信息。"},
+        {"type": "text", "text": hint + f"请描述这张{what}中与测试用例相关的信息。"},
         {"type": "image_url", "image_url": {"url": data_url}},
     ])
 
@@ -58,7 +79,7 @@ async def describe_image(image_bytes: bytes, mime: str, *, heading: str | None =
 
     start = time.perf_counter()
     try:
-        resp = await llm.ainvoke([SystemMessage(content=_SYSTEM_PROMPT), human])
+        resp = await llm.ainvoke([SystemMessage(content=system_prompt), human])
     except Exception as exc:
         logger.warning("vision LLM call failed (heading=%s): %s", heading, exc)
         return ""
@@ -67,8 +88,8 @@ async def describe_image(image_bytes: bytes, mime: str, *, heading: str | None =
     text = raw if isinstance(raw, str) else _flatten_content(raw)
     text = (text or "").strip()
     logger.info(
-        "image described | heading=%s bytes=%d chars=%d (%.0fms)",
-        heading, len(image_bytes), len(text), (time.perf_counter() - start) * 1000,
+        "image described | kind=%s heading=%s bytes=%d chars=%d (%.0fms)",
+        kind, heading, len(image_bytes), len(text), (time.perf_counter() - start) * 1000,
     )
     return text
 

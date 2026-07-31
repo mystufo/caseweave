@@ -103,6 +103,11 @@ class Settings(BaseSettings):
     # 抓取身份：user（个人授权，走 auth login）| bot（应用，需 app_id/secret）。
     # 默认 bot：应用凭证不过期、不依赖 OS keychain，适合容器/服务器无人值守部署。
     lark_cli_identity: str = "bot"
+    # 文档内嵌画板（流程图/架构图/思维导图）→ 文字。走 `whiteboard +query` 直接拿
+    # Mermaid 代码或节点结构，纯文本、不花 LLM token，故默认开启且不依赖 vision。
+    # 结构化提取失败时，若 vision_enabled 才退回「下载缩略图 + 视觉识别」。
+    lark_whiteboard_enabled: bool = True
+    lark_whiteboard_max_chars: int = 4000   # 单个画板注入正文的字数上限，防超大画板挤爆上下文
 
     # ── 视觉模型（图片 → 文字）─────────────────────────────────────────────────
     # 用于把飞书文档里的内嵌图片（UI 原型 / 流程图 / 架构图）识别成文字描述，

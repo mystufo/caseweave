@@ -267,6 +267,76 @@ CaseWeave（纬策） — 开发进度记录
 ================================================================================
 变更 / 修复记录（倒序，最新在上）
 ================================================================================
+■ 2026-07-31 — 画板改走「结构化提取优先」（Mermaid 源码 / 节点+连线大纲），缩略图降为兜底
+  背景：上一条把画板并入了视觉链路，但那条路是「下载缩略图 → 让视觉模型看图猜」——流程图上
+        的小字容易糊、分支容易漏，且强依赖 VISION_ENABLED。核查 lark-cli 能力后发现
+        `whiteboard +query` 能直接把画板取成文本（同一后端接口 GET /open-apis/board/v1/
+        whiteboards/:id/nodes），比看图准得多，且不花 LLM token。
+  方案：画板取文优先级 code → raw → 缩略图+视觉。
+    ├─ tools/lark_whiteboard.py（新）：fetch_whiteboard_text(token)
+    │   • `+query --output_as code`：画板内有且仅有一个 Mermaid/PlantUML 图时导出源码，
+    │     按 @start* 判定语言并包成代码块；用关键字白名单挡掉「不存在代码节点」之类的提示语；
+    │   • `+query --output_as raw`：飞书原生节点数组 → 渲染成「层级树 → 节点清单 → 连线走向」；
+    │     连线取 connector.start_object/end_object（兼容 attached_object_id 与平铺形态），连线
+    │     自身文字作为分支条件标注在箭头后；
+    │   • 思维导图（无 connector，层级在 mind_map.parent_id）单独走**缩进树**渲染：真实画板里
+    │     「不做任何处理」出现 5 次、「c端或者b端有过付费行为」3 次，拍平成 "A → B" 后端点靠
+    │     文字匹配会彻底失去指向性；缩进树既保住从属关系又天然消歧。子节点顺序优先取
+    │     mind_map_node.children（画板真实顺序），缺失回退按 (y,x)；带 visited + 深度上限防环；
+    │   • 各版本包裹层不一致，故 code/nodes 都用保守的递归搜索定位，拿不到一律返回 None。
+    ├─ tools/lark_fetcher.py：enrich_content_with_images → enrich_content_with_media；
+    │   画板先试结构化提取，失败才下缩略图；配图仍只在 vision_enabled 时处理；调用门槛从
+    │   「vision_enabled」放宽为「vision_enabled or lark_whiteboard_enabled」。
+    ├─ config.py / .env.example：新增 LARK_WHITEBOARD_ENABLED（默认 true，不依赖 vision）
+    │   与 LARK_WHITEBOARD_MAX_CHARS（默认 4000，单画板注入上限）。
+  验证：离线用例覆盖 raw→大纲（含分支条件/连线不混入节点清单）、attached_object_id 平铺连线、
+        思维导图层级、code 提取与提示语误判、截断、XML 里 img/whiteboard 混排的 heading 归属、
+        code→raw→None 降级链。
+  真实文档实测（mathmagic wiki/UXSswdQzoiOB…，含 1 个画板 token=AdYewyTgYhxiwGbrzLKccIOHnZb）：
+        ✅ 全链路跑通：30 个节点文本 100% 进入正文，标题/占位/增强段落均正确。
+        踩坑记录（部署到新环境会再遇上）：
+        ├─ 权限：需要 `board:whiteboard:node:read`，且必须开在**应用身份（tenant）**那一列；
+        │   只开「用户身份」时 bot 调用照样报 99991672 app_scope_not_applied。开通后需发版。
+        │   `lark-cli auth scopes` 只回 userScopes，看不到应用身份权限，别拿它当判据。
+        │   缩略图 `+media-download --type whiteboard` 打的是同一个 board 接口、要同一个权限——
+        │   即上一版「缩略图 + 视觉」方案在权限开通前从未真正跑通过。
+        └─ 该画板 token 是 `AdYe…` 而非文档示例里的 `wbcn…` 前缀，正则没写死前缀，正常匹配。
+        实测响应形状（据此修正了实现）：
+        ├─ code 模式：无代码块时返回 {"ok":true,"data":{"msg":"no code blocks found in whiteboard"}}
+        │   —— msg 不在 _CODE_KEYS 里，天然不会被误当源码，已补测试固化。
+        └─ raw 模式：{"data":{"nodes":[…]}}，30 个节点 type 全是 mind_map，层级在
+            mind_map.parent_id / mind_map_node.parent_id，子节点顺序在 mind_map_node.children，
+            文字在 text.text。
+  顺带修复：
+    ├─ markdown 正文里画板残留 `<whiteboard token="…"></whiteboard>` 原样喂给了 LLM
+    │   （token 纯噪声），改为替换成中文占位「此处为文档内嵌画板，内容见文末…」。
+    └─ 文档标题落成「未命名文档」：lark-cli（实测 1.0.69）markdown 模式不发 <title> 标签，
+        改把标题写成首行 H1（`# 风控识别`）。_extract_title_and_text 增加首行 H1 回填，
+        优先级排在显式 title 字段与 <title> 标签之后；正文保留该 H1（它也是正文结构的一部分）。
+        用例覆盖 H2 不误取、`#话题`（无空格）不误取、标题不在首行不误取。真实文档实测标题已正确。
+  已知遗留（未处理）：正文里的 <cite doc-id=… title="【Hi3D】风险识别策略 v1"> 引用子文档不会被
+        跟进抓取，而 PRD 正文往往就在被引文档里。
+  影响面：仅飞书导入链路；全程 fail-open。无 DB / 前端 / 接口改动。
+
+■ 2026-07-30 — 飞书文档内嵌画板（whiteboard）识别（画板 → 文字，注入正文）
+  背景：图片增强链路此前只扫 <img> 素材，文档里内嵌的「画板」（流程图/架构图/时序图/
+        状态图/思维导图）被整体漏掉——而画板恰恰承载核心流程与分支，对生成用例价值极高。
+        画板在 fetch 的 XML 正文里以 <whiteboard token="wbcn..." .../> 出现，且没有独立
+        file_token，只能用 `lark-cli docs +media-download --type whiteboard` 拿缩略图。
+  方案：把画板当作一种特殊「图片」并入已有视觉识别链路，复用 vision_* 全套配置与并发/上限。
+    ├─ tools/lark_media.py：download_lark_media 增加 media_type 参数（默认 "media"），
+    │   为 "whiteboard" 时给命令追加 `--type whiteboard`（token 是 whiteboard_id）。
+    ├─ tools/lark_fetcher.py：
+    │   • ImgRef 新增 kind 字段（"media" | "whiteboard"）；
+    │   • 新增 <whiteboard> 标签正则，_enumerate_images_from_xml 同时扫 img 与 whiteboard，
+    │     按文档位置与 heading 归类（复用原 heading 就近算法）；
+    │   • enrich 下载时按 ref.kind 传 media_type；正文追加段落改为「配图与画板」并分别计数、
+    │     每条按「配图 N / 画板 N」打标。
+    ├─ agents/image_describer.py：describe_image 增加 kind 参数；画板走专用提示词
+    │   （强调节点+连线+分支+状态流转的完整线性还原），普通配图仍用原提示词。
+  影响面：仅飞书导入 + vision_enabled 时生效；全程 fail-open，单个画板下载/识别失败仅跳过该
+        画板、不影响其余内容与正文。无 DB / 前端 / 接口改动。
+
 ■ 2026-07-30 — 生成前不再二次弹知识确认面板，沿用澄清阶段的知识选择
   现象：澄清前已在「确认要注入到澄清提示词的知识库内容」面板选了「不注入」，走完澄清、生成
         用例前又弹出「确认要注入到生成 prompt 的知识库内容」面板，要求二次确认。
