@@ -23,8 +23,11 @@ export default function LarkUrlDialog({ open, onClose, onSubmit, loading, mindma
   const [mindmapUrl, setMindmapUrl] = useState('')
   const [error, setError] = useState<string | null>(null)
 
+  // 关闭时清空表单。规则本意是防级联渲染，这里只在 open 翻转时跑一次且组件随后返回 null，
+  // 代价可忽略；彻底修法是父组件用 key 重挂载，留待后续统一处理。
   useEffect(() => {
     if (!open) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setPrdUrl('')
       setMindmapUrl('')
       setError(null)

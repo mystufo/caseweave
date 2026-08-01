@@ -9,6 +9,7 @@ dist/
 
 # Env
 .env
+backend/.env
 *.env.local
 
 # Node
@@ -16,10 +17,13 @@ node_modules/
 frontend/dist/
 frontend/.env
 
-# IDE
+# IDE / 工具缓存
 .idea/
 .vscode/
 *.swp
+.ruff_cache/
+.pytest_cache/
+.claude/
 
 # OS
 .DS_Store
@@ -35,3 +39,8 @@ backend/logs/
 
 # DB dumps / backups
 backup_*.sql
+
+# 本地样例/内部需求文档（不入库，避免把业务文档带进公开仓库）
+*.docx
+*.pdf
+!docs/**/*.pdf

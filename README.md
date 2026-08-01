@@ -58,7 +58,9 @@ make dev-frontend  # Vite on :5173
 
 ## 贡献
 
-欢迎提 Issue 反馈问题或需求，也欢迎提交 Pull Request。
+欢迎提 Issue 反馈问题或需求，也欢迎提交 Pull Request。开发环境搭建、提交约定见 **[CONTRIBUTING.md](CONTRIBUTING.md)**。
+
+安全问题请不要走公开 Issue，见 **[SECURITY.md](SECURITY.md)**。自建部署上线前，务必按其中的清单设好 `JWT_SECRET`、关掉 `DEBUG`、改掉数据库默认账密。
 
 ## License
 

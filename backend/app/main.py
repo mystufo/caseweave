@@ -73,6 +73,12 @@ async def _prompt_suggestion_loop() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Starting CaseWeave | provider=%s model=%s", settings.llm_provider, settings.llm_model)
+    if settings.jwt_secret_is_ephemeral:
+        logger.warning(
+            "未配置 JWT_SECRET，已生成进程内随机密钥：本次重启后所有登录态失效，"
+            "多 worker 部署下登录会直接不可用。生产请在 .env 设置 "
+            "JWT_SECRET（openssl rand -hex 32）",
+        )
     await init_db()
     logger.info("Database initialized")
 

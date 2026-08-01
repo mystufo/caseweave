@@ -280,7 +280,7 @@ CaseWeave（纬策） — 开发进度记录
     │     连线取 connector.start_object/end_object（兼容 attached_object_id 与平铺形态），连线
     │     自身文字作为分支条件标注在箭头后；
     │   • 思维导图（无 connector，层级在 mind_map.parent_id）单独走**缩进树**渲染：真实画板里
-    │     「不做任何处理」出现 5 次、「c端或者b端有过付费行为」3 次，拍平成 "A → B" 后端点靠
+    │     同一句节点文案（如「不做任何处理」）能重复出现 5 次，拍平成 "A → B" 后端点靠
     │     文字匹配会彻底失去指向性；缩进树既保住从属关系又天然消歧。子节点顺序优先取
     │     mind_map_node.children（画板真实顺序），缺失回退按 (y,x)；带 visited + 深度上限防环；
     │   • 各版本包裹层不一致，故 code/nodes 都用保守的递归搜索定位，拿不到一律返回 None。
@@ -292,7 +292,7 @@ CaseWeave（纬策） — 开发进度记录
   验证：离线用例覆盖 raw→大纲（含分支条件/连线不混入节点清单）、attached_object_id 平铺连线、
         思维导图层级、code 提取与提示语误判、截断、XML 里 img/whiteboard 混排的 heading 归属、
         code→raw→None 降级链。
-  真实文档实测（mathmagic wiki/UXSswdQzoiOB…，含 1 个画板 token=AdYewyTgYhxiwGbrzLKccIOHnZb）：
+  真实文档实测（某飞书 wiki 文档，正文内嵌 1 个画板）：
         ✅ 全链路跑通：30 个节点文本 100% 进入正文，标题/占位/增强段落均正确。
         踩坑记录（部署到新环境会再遇上）：
         ├─ 权限：需要 `board:whiteboard:node:read`，且必须开在**应用身份（tenant）**那一列；
@@ -311,10 +311,10 @@ CaseWeave（纬策） — 开发进度记录
     ├─ markdown 正文里画板残留 `<whiteboard token="…"></whiteboard>` 原样喂给了 LLM
     │   （token 纯噪声），改为替换成中文占位「此处为文档内嵌画板，内容见文末…」。
     └─ 文档标题落成「未命名文档」：lark-cli（实测 1.0.69）markdown 模式不发 <title> 标签，
-        改把标题写成首行 H1（`# 风控识别`）。_extract_title_and_text 增加首行 H1 回填，
+        改把标题写成首行 H1（`# 某某功能`）。_extract_title_and_text 增加首行 H1 回填，
         优先级排在显式 title 字段与 <title> 标签之后；正文保留该 H1（它也是正文结构的一部分）。
         用例覆盖 H2 不误取、`#话题`（无空格）不误取、标题不在首行不误取。真实文档实测标题已正确。
-  已知遗留（未处理）：正文里的 <cite doc-id=… title="【Hi3D】风险识别策略 v1"> 引用子文档不会被
+  已知遗留（未处理）：正文里的 <cite doc-id=… title="【某产品】xx 策略 v1"> 引用子文档不会被
         跟进抓取，而 PRD 正文往往就在被引文档里。
   影响面：仅飞书导入链路；全程 fail-open。无 DB / 前端 / 接口改动。
 

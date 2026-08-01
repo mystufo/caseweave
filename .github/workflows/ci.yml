@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  backend:
+    name: 后端 lint + import 自检
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: 安装依赖（锁定版本）
+        run: pip install -r backend/requirements.lock.txt
+
+      - name: ruff check
+        run: ruff check backend/app/
+
+      # 仓库暂无测试，用「能否导入」兜住语法错误与循环依赖。
+      # 不连数据库、不发 LLM 请求，仅 import 阶段。
+      - name: import 自检
+        working-directory: backend
+        env:
+          LLM_API_KEY: dummy-key-for-ci
+        run: python -c "import app.main"
+
+  frontend:
+    name: 前端 lint + build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - run: npm ci
+        working-directory: frontend
+
+      - run: npm run lint
+        working-directory: frontend
+
+      # build 里已经串了 `tsc -b`，类型错误会在这里挂掉
+      - run: npm run build
+        working-directory: frontend

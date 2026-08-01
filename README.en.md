@@ -59,7 +59,9 @@ For production deployment (Docker Compose, or bare metal + systemd/Nginx), see *
 
 ## Contributing
 
-Issues for bug reports and feature requests are welcome, as are pull requests.
+Issues for bug reports and feature requests are welcome, as are pull requests. See **[CONTRIBUTING.md](CONTRIBUTING.md)** (in Chinese) for local setup and commit conventions.
+
+Please do not file security problems as public issues — see **[SECURITY.md](SECURITY.md)**. Before exposing a self-hosted deployment, work through its checklist: set `JWT_SECRET`, turn `DEBUG` off, and change the default database credentials.
 
 ## License
 

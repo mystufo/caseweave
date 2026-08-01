@@ -81,8 +81,10 @@ export default function KnowledgeDraftReviewPanel({
   // "加入哪个模块"选中值——默认取上一步确认的模块 id（null=不归入模块）。
   const [targetModuleId, setTargetModuleId] = useState<number | null>(defaultModuleId ?? null)
 
+  // drafts 由父组件异步送达，到达/变化时重算默认勾选与冲突处置；按 props 派生 state。
   useEffect(() => {
     const plain = drafts.map((_, i) => i).filter(i => !draftNeedsDecision(drafts[i]))
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setSelected(new Set(plain))
     const init: Record<number, Record<number, Resolution>> = {}
     drafts.forEach((d, i) => {

@@ -514,7 +514,7 @@ def _extract_title_and_text(payload: dict) -> tuple[str, str]:
             text = text.lstrip()[m.end():].lstrip()
 
     # markdown 模式下 lark-cli（实测 1.0.69）不发 <title> 标签，而是把文档标题写成首行 H1
-    # （`# 风控识别`）—— 此时用首行 H1 回填标题，否则整篇会落成「未命名文档」。
+    # （`# 某某功能`）—— 此时用首行 H1 回填标题，否则整篇会落成「未命名文档」。
     # 只认首个非空行、且正文里保留该 H1（它同时是正文的一级标题，删了反而丢结构）。
     if not title and text:
         m = _MD_H1_RE.match(text.lstrip())

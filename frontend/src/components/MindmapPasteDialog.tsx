@@ -22,8 +22,10 @@ export default function MindmapPasteDialog({ open, onClose, onSubmit, loading }:
   const [filename, setFilename] = useState('粘贴的脑图')
   const [error, setError] = useState<string | null>(null)
 
+  // 关闭时清空表单，同 LarkUrlDialog：只在 open 翻转时跑一次，组件随后返回 null。
   useEffect(() => {
     if (!open) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setText('')
       setFilename('粘贴的脑图')
       setError(null)

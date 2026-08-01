@@ -31,6 +31,8 @@ export default function App() {
     })
 
     const token = getToken()
+    // 启动引导：无 token 直接进登录态。同步 setState 在这里只发生一次（挂载时）。
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     if (!token) { setPhase('login'); return }
 
     void (async () => {

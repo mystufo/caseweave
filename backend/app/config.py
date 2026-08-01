@@ -1,6 +1,12 @@
+import secrets
+
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings
 from functools import lru_cache
 from typing import Optional
+
+# .env.example 里的占位值：出现在配置中即视为「没配」，见 Settings._harden_jwt_secret
+DEV_JWT_SECRET = "dev-secret-change-me"
 
 
 class Settings(BaseSettings):
@@ -137,9 +143,24 @@ class Settings(BaseSettings):
 
     # Auth
     admin_emails: str = ""  # comma-separated list of admin emails (case-insensitive)
-    jwt_secret: str = "dev-secret-change-me"
+    jwt_secret: str = DEV_JWT_SECRET
     jwt_algorithm: str = "HS256"
     jwt_expire_hours: int = 24 * 7  # 7 days
+    # 由 _harden_jwt_secret 置位，不从环境读；main.py 启动时据此打警告。
+    jwt_secret_is_ephemeral: bool = Field(default=False, exclude=True)
+
+    @model_validator(mode="after")
+    def _harden_jwt_secret(self) -> "Settings":
+        """JWT_SECRET 留空或照抄默认占位值时，改用进程内随机密钥。
+
+        仓库是公开的，占位值人人可见——直接拿它签发 token 等于没有鉴权。
+        这里选择「默认安全」而不是启动失败，代价是重启后登录态失效（启动日志会警告）；
+        多 worker 部署下各 worker 密钥不同，登录同样不可用。生产务必显式配置。
+        """
+        if not self.jwt_secret.strip() or self.jwt_secret == DEV_JWT_SECRET:
+            self.jwt_secret = secrets.token_hex(32)
+            self.jwt_secret_is_ephemeral = True
+        return self
 
     @property
     def cors_origins_list(self) -> list[str]:

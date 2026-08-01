@@ -38,7 +38,9 @@ export default function KnowledgePreviewPanel({
   // 默认全勾。每次 hits 变化（重新拉取）都重置一次。
   const [selected, setSelected] = useState<Set<number>>(new Set())
 
+  // hits 是父组件异步拉取的结果，到达时需要重置勾选；属于"按 props 派生 state"的合理用法。
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setSelected(new Set(hits.map(h => h.id)))
   }, [hits])
 

@@ -1,0 +1,48 @@
+name: Bug 报告
+description: 报告一个功能异常
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: 问题描述
+      description: 发生了什么？期望的行为是什么？
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: 复现步骤
+      placeholder: |
+        1. 上传 xxx 文档
+        2. 点击「生成用例」
+        3. 报错 ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志片段
+      description: 后端日志（backend/logs/app.log）或浏览器 Console 报错。请自行去掉密钥等敏感信息。
+      render: text
+
+  - type: input
+    id: llm
+    attributes:
+      label: LLM provider / 模型
+      placeholder: anthropic / claude-opus-4-6，或 openai 兼容网关 + 模型名
+    validations:
+      required: true
+
+  - type: dropdown
+    id: deploy
+    attributes:
+      label: 运行方式
+      options:
+        - Docker (make up)
+        - 本地开发 (make dev-backend / dev-frontend)
+        - 服务器裸机部署
+    validations:
+      required: true
