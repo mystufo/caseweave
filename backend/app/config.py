@@ -32,6 +32,12 @@ class Settings(BaseSettings):
     clarifier_max_tokens: int = 8192
     knowledge_max_tokens: int = 8192
 
+    # 文档正文喂给 LLM 前的字符上限（truncate_for_llm 的默认 limit）。超过则保留开头 70% +
+    # 结尾，中间换成省略提示。注意这是**输入侧**上限，与上面的 *_max_tokens（输出侧）无关。
+    # 30000 字中文 ≈ 20000 token；往上调时记得给 prompt + PRD/脑图两份 + 知识注入 +
+    # 多轮澄清历史留够余量，别把上下文窗口撑爆。
+    doc_max_chars: int = 30000
+
     # ── Phase 4.2 二阶段：系统给 generator 提示词的改进建议 ────────────────────
     # 定期后台任务只生成 pending 草稿、绝不激活；采用仍靠人工走版本化 API。
     # interval_hours ≤ 0 关闭后台巡检（仅保留网页端手动按钮）。

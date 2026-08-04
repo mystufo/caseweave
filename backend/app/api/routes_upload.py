@@ -15,7 +15,7 @@ from app.models.knowledge import Document, Module, KnowledgeEntry
 from app.models.session import Session, Message
 from app.models.clarification import ClarificationState
 from app.models.user import User
-from app.tools.doc_parser import parse_document, truncate_for_llm
+from app.tools.doc_parser import doc_stats, parse_document, truncate_for_llm
 from app.tools.mindmap_parser import parse_mindmap_md
 from app.tools.lark_fetcher import (
     classify_lark_url,
@@ -798,11 +798,11 @@ async def upload_document(
         "document_id": doc_record.id,
         "filename": filename,
         "module_id": module_id,
-        "stats": {
-            "chunks": len(parsed["chunks"]),
-            "tables": len(parsed["tables"]),
-            "raw_text_length": len(parsed["raw_text"]),
-        },
+        "stats": doc_stats(
+            chunks=len(parsed["chunks"]),
+            tables=len(parsed["tables"]),
+            raw_text_length=len(parsed["raw_text"]),
+        ),
         "clarification": clarification,
     }
 
@@ -920,11 +920,11 @@ async def upload_document_stream(
                 "Upload(stream) cache hit | sha=%s document_id=%d filename=%s",
                 sha256[:12], existing.id, existing.filename,
             )
-            stats = {
-                "chunks": len(existing.parsed_content or []),
-                "tables": 0,  # tables aren't persisted yet
-                "raw_text_length": len(existing.raw_text or ""),
-            }
+            stats = doc_stats(
+                chunks=len(existing.parsed_content or []),
+                tables=0,  # tables aren't persisted yet
+                raw_text_length=len(existing.raw_text or ""),
+            )
             yield _sse("stage", {
                 "stage": "cache_hit",
                 "message": f"识别到同一份文档（曾以《{existing.filename}》上传过），复用解析结果，跳过重复解析。",
@@ -974,11 +974,11 @@ async def upload_document_stream(
         yield _sse("stage", {
             "stage": "parsed",
             "message": f"解析完成：{len(parsed['chunks'])} 段 / {len(parsed['tables'])} 表 / {len(parsed['raw_text'])} 字（{parse_ms:.0f}ms）",
-            "stats": {
-                "chunks": len(parsed["chunks"]),
-                "tables": len(parsed["tables"]),
-                "raw_text_length": len(parsed["raw_text"]),
-            },
+            "stats": doc_stats(
+                chunks=len(parsed["chunks"]),
+                tables=len(parsed["tables"]),
+                raw_text_length=len(parsed["raw_text"]),
+            ),
         })
 
         # Stage 2: 仅解析入库（不跑模块自动分类，那属于「开始生成」阶段的第一步）。
@@ -1019,11 +1019,11 @@ async def upload_document_stream(
 
         # 新流程：上传只暂存文档，不跑模块分类 / 知识检索 / 知识抽取 / 澄清。
         # 用户备齐资料后点「开始生成」→ POST /pipeline/start/stream 统一触发下游流程。
-        stats = {
-            "chunks": len(parsed["chunks"]),
-            "tables": len(parsed["tables"]),
-            "raw_text_length": len(parsed["raw_text"]),
-        }
+        stats = doc_stats(
+            chunks=len(parsed["chunks"]),
+            tables=len(parsed["tables"]),
+            raw_text_length=len(parsed["raw_text"]),
+        )
         await _upsert_clarification_state(
             session_id, project_id,
             document_id=document_id,
@@ -1166,11 +1166,11 @@ async def upload_lark_stream(
         if existing:
             # 新流程：无论 PRD 还是脑图，命中缓存都只做「暂存」（复用已解析的 Document 行），
             # 不再直接跳澄清；模块归类 / 知识 / 澄清统一由 /pipeline/start/stream 触发。
-            stats = {
-                "chunks": len(existing.parsed_content or []),
-                "tables": 0,
-                "raw_text_length": len(existing.raw_text or ""),
-            }
+            stats = doc_stats(
+                chunks=len(existing.parsed_content or []),
+                tables=0,
+                raw_text_length=len(existing.raw_text or ""),
+            )
             cache_hit_msg = (
                 f"识别到同一份脑图（曾以《{existing.filename}》导入过），复用解析结果。"
                 if is_mindmap_role else
@@ -1295,17 +1295,17 @@ async def upload_lark_stream(
             document_id = doc_record.id
 
         if is_mindmap_role:
-            stats = {
-                "chunks": len(doc_record.parsed_content or []),
-                "tables": 0,
-                "raw_text_length": len(doc_record.raw_text or ""),
-            }
+            stats = doc_stats(
+                chunks=len(doc_record.parsed_content or []),
+                tables=0,
+                raw_text_length=len(doc_record.raw_text or ""),
+            )
         else:
-            stats = {
-                "chunks": 1,
-                "tables": 0,
-                "raw_text_length": len(raw_text),
-            }
+            stats = doc_stats(
+                chunks=1,
+                tables=0,
+                raw_text_length=len(raw_text),
+            )
         logger.info(
             "Lark document persisted | document_id=%d title=%s role=%s",
             document_id, title[:60], role,
@@ -1472,11 +1472,11 @@ async def upload_mindmap_stream(
             existing = r.scalar_one_or_none()
 
         if existing:
-            stats = {
-                "chunks": len(existing.parsed_content or []),
-                "tables": 0,
-                "raw_text_length": len(existing.raw_text or ""),
-            }
+            stats = doc_stats(
+                chunks=len(existing.parsed_content or []),
+                tables=0,
+                raw_text_length=len(existing.raw_text or ""),
+            )
             yield _sse("stage", {
                 "stage": "cache_hit",
                 "message": f"识别到同一份脑图（曾以《{existing.filename}》上传过），复用解析结果。",
@@ -1517,11 +1517,11 @@ async def upload_mindmap_stream(
                 yield ev
             return
         parse_ms = (time.perf_counter() - parse_start) * 1000
-        stats = {
-            "chunks": len(parsed["chunks"]),
-            "tables": 0,
-            "raw_text_length": len(parsed["raw_text"]),
-        }
+        stats = doc_stats(
+            chunks=len(parsed["chunks"]),
+            tables=0,
+            raw_text_length=len(parsed["raw_text"]),
+        )
         logger.info(
             "Mindmap parsed(stream) | nodes=%d raw_text_len=%d (%.0fms)",
             stats["chunks"], stats["raw_text_length"], parse_ms,
@@ -1737,11 +1737,11 @@ async def pipeline_start_stream(
             "mindmap_document_id": mindmap_document_id,
             "module_id": module_id,
             "filename": (prd_doc.filename if prd_doc else (mm_doc.filename if mm_doc else "")),
-            "stats": {
-                "chunks": len((prd_doc or mm_doc).parsed_content or []),
-                "tables": 0,
-                "raw_text_length": len(classify_src),
-            },
+            "stats": doc_stats(
+                chunks=len((prd_doc or mm_doc).parsed_content or []),
+                tables=0,
+                raw_text_length=len(classify_src),
+            ),
             "module_name": module_name,
             "hits": knowledge_hits,
             "near_misses": knowledge_near_misses,
@@ -1852,19 +1852,19 @@ async def clarify_initial_stream(
     prd_filename = prd_doc.filename if prd_doc else None
     mindmap_filename = mindmap_doc.filename if mindmap_doc else None
     prd_stats = (
-        {
-            "chunks": len(prd_doc.parsed_content or []),
-            "tables": 0,
-            "raw_text_length": len(prd_raw_text),
-        }
+        doc_stats(
+            chunks=len(prd_doc.parsed_content or []),
+            tables=0,
+            raw_text_length=len(prd_raw_text),
+        )
         if prd_doc else None
     )
     mindmap_stats = (
-        {
-            "chunks": len(mindmap_doc.parsed_content or []),
-            "tables": 0,
-            "raw_text_length": len(mindmap_raw_text),
-        }
+        doc_stats(
+            chunks=len(mindmap_doc.parsed_content or []),
+            tables=0,
+            raw_text_length=len(mindmap_raw_text),
+        )
         if mindmap_doc else None
     )
 

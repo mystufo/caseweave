@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import type {
-  ChatSession, ChatMessage as IChatMessage, TestCase, UploadResult,
+  ChatSession, ChatMessage as IChatMessage, TestCase, UploadResult, DocStats,
   ClarificationQuestion, ClarificationRoundHistory, ClarificationStateDTO,
   KnowledgeHit, KnowledgeNearMiss, KnowledgeDraft, ModuleSummary,
 } from '../api/client'
@@ -35,10 +35,6 @@ interface PageProps {
 
 const MAX_ROUNDS = 5
 
-// 文档正文喂给 LLM 前的截断阈值（字符数），与后端 doc_parser.DEFAULT_DOC_LIMIT 保持一致。
-// 超过则 chip 显示"已截断"提示。
-const DOC_PREVIEW_LIMIT = 30000
-
 // ── Per-session state ────────────────────────────────────────────────────────
 // 每个会话有一份独立的运行态。切换会话只是换"视角"，不取消任何在跑的任务。
 // 流式回调通过启动时捕获的 sid 写回对应 slot，所以切走再切回来能看到最新结果。
@@ -68,7 +64,7 @@ interface SessionState {
   uploadMindmap: {
     documentId: number
     filename: string
-    stats: { chunks: number; tables: number; raw_text_length: number }
+    stats: DocStats
   } | null
   confirmedModuleName: string | null
   // 上一步「模块确认卡」拍板的模块 id（null=无模块）。草稿审核面板据此默认选中同一模块，
@@ -2192,12 +2188,14 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
           )}
 
           {/* 已上传 PRD / 脑图 chips —— 让用户随时感知本会话两个 slot 各自的状态。
-              附带正文总字符数 + 是否超过预览截断阈值（与后端 DEFAULT_DOC_LIMIT=30000 一致）。 */}
+              附带正文总字符数 + 是否被截断——truncated / doc_char_limit 由后端按 DOC_MAX_CHARS 下发，
+              前端不再自己算阈值。 */}
           {!active.uploading && !active.generating && (active.uploadResult || active.uploadMindmap) && (
             <div className="flex flex-wrap gap-2">
               {active.uploadResult && active.uploadResult.filename && (() => {
                 const len = active.uploadResult.stats?.raw_text_length ?? 0
-                const truncated = len > DOC_PREVIEW_LIMIT
+                const truncated = active.uploadResult.stats?.truncated ?? false
+                const limit = active.uploadResult.stats?.doc_char_limit
                 return (
                   <span className="inline-flex items-center gap-1 px-2 py-1 rounded-full bg-blue-50 border border-blue-200 text-xs text-blue-700">
                     <FileText size={12} />
@@ -2208,7 +2206,7 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
                     {truncated && (
                       <span
                         className="px-1 py-0.5 rounded bg-amber-100 text-amber-700 border border-amber-200"
-                        title={`正文超过预览上限（${DOC_PREVIEW_LIMIT.toLocaleString()} 字），喂给大模型时会保留开头与结尾、省略中间部分`}
+                        title={`正文超过上限${limit ? `（${limit.toLocaleString()} 字）` : ''}，喂给大模型时会保留开头与结尾、省略中间部分`}
                       >
                         已截断
                       </span>
@@ -2218,7 +2216,8 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
               })()}
               {active.uploadMindmap && (() => {
                 const len = active.uploadMindmap.stats?.raw_text_length ?? 0
-                const truncated = len > DOC_PREVIEW_LIMIT
+                const truncated = active.uploadMindmap.stats?.truncated ?? false
+                const limit = active.uploadMindmap.stats?.doc_char_limit
                 return (
                   <span className="inline-flex items-center gap-1 px-2 py-1 rounded-full bg-emerald-50 border border-emerald-200 text-xs text-emerald-700">
                     <FileText size={12} />
@@ -2229,7 +2228,7 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
                     {truncated && (
                       <span
                         className="px-1 py-0.5 rounded bg-amber-100 text-amber-700 border border-amber-200"
-                        title={`正文超过预览上限（${DOC_PREVIEW_LIMIT.toLocaleString()} 字），喂给大模型时会保留开头与结尾、省略中间部分`}
+                        title={`正文超过上限${limit ? `（${limit.toLocaleString()} 字）` : ''}，喂给大模型时会保留开头与结尾、省略中间部分`}
                       >
                         已截断
                       </span>

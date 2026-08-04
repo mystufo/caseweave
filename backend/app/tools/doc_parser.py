@@ -211,15 +211,23 @@ def parse_document(filename: str, file_bytes: bytes) -> dict[str, Any]:
 
 # ── 智能截断（给 LLM 用）─────────────────────────────────────────────────────
 
-# Claude Opus 上下文 ~200k token，文档实际占用 token 约 = 字符数 / 1.5（中文偏多）
-# 我们留出充足空间给 prompt + history + LLM 回复，把文档上限定在 ~30000 字
-DEFAULT_DOC_LIMIT = 30000
+def get_doc_limit() -> int:
+    """当前生效的文档字符上限，来自 .env 的 DOC_MAX_CHARS（默认 30000）。
+
+    每次调用现取，不在 import 期固化——测试里 monkeypatch settings 才能生效。
+    """
+    from app.config import get_settings
+    return get_settings().doc_max_chars
 
 
-def truncate_for_llm(raw_text: str, limit: int = DEFAULT_DOC_LIMIT) -> str:
+def truncate_for_llm(raw_text: str, limit: int | None = None) -> str:
     """超过 limit 时保留开头 + 末尾，中间用占位符提示被截断。
     需求文档的"验收标准/边界场景"经常在末尾，比单纯截前 N 字更靠谱。
+
+    limit 缺省时取 DOC_MAX_CHARS；知识检索 query 那类场景由调用方显式传（如 limit=2000）。
     """
+    if limit is None:
+        limit = get_doc_limit()
     if len(raw_text) <= limit:
         return raw_text
     head_budget = int(limit * 0.7)
@@ -234,3 +242,19 @@ def truncate_for_llm(raw_text: str, limit: int = DEFAULT_DOC_LIMIT) -> str:
         f"…（中间省略 {omitted} 字，原文共 {len(raw_text)} 字，请基于开头与末尾的内容做澄清/生成）…\n\n"
         f"{tail}"
     )
+
+
+def doc_stats(*, chunks: int, tables: int, raw_text_length: int) -> dict[str, Any]:
+    """上传/暂存接口回给前端的文档统计。
+
+    `truncated` / `doc_char_limit` 在这里算好，前端直接用——不要在前端复制一份阈值常量，
+    否则改了 DOC_MAX_CHARS 后端截断了、前端还不提示。
+    """
+    limit = get_doc_limit()
+    return {
+        "chunks": chunks,
+        "tables": tables,
+        "raw_text_length": raw_text_length,
+        "truncated": raw_text_length > limit,
+        "doc_char_limit": limit,
+    }

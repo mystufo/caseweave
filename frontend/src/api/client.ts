@@ -152,13 +152,24 @@ export interface ClarificationQuestion {
   options?: string[]
 }
 
+// 文档解析统计。truncated / doc_char_limit 由后端按 DOC_MAX_CHARS 算好回传——
+// 前端不要再复制一份阈值常量，否则改了后端配置会两边对不上。
+// 二者可选：前端在没有 stats 的场景（如澄清状态复原的兜底）会自造零值对象。
+export interface DocStats {
+  chunks: number
+  tables: number
+  raw_text_length: number
+  truncated?: boolean
+  doc_char_limit?: number
+}
+
 export interface UploadResult {
   document_id: number | null
   // 当用户走 /upload/mindmap/stream 上传脑图时，document_id 可能为 null，由
   // mindmap_document_id 承载；/clarify/initial/stream 的结果帧也带这两个字段。
   mindmap_document_id?: number | null
   filename: string
-  stats: { chunks: number; tables: number; raw_text_length: number }
+  stats: DocStats
   // PRD-only / 飞书路径会带 clarification；脑图独立 result 帧不带 clarification（脑图只算预览阶段）
   clarification?: {
     summary: string
@@ -192,9 +203,9 @@ export interface ClarificationStateDTO {
   document_id: number | null
   mindmap_document_id: number | null
   prd_filename: string | null
-  prd_stats: { chunks: number; tables: number; raw_text_length: number } | null
+  prd_stats: DocStats | null
   mindmap_filename: string | null
-  mindmap_stats: { chunks: number; tables: number; raw_text_length: number } | null
+  mindmap_stats: DocStats | null
   // 抽取出尚未审核确认入库的知识草稿；null 表示已 settle（无草稿待审），
   // [] 表示抽取完成但没产出条目（前端按"无草稿"处理）。
   prd_pending_drafts: KnowledgeDraft[] | null
@@ -333,7 +344,7 @@ export interface UploadKnowledgePreview {
   module_id: number | null
   filename: string
   module_name: string | null
-  stats: { chunks: number; tables: number; raw_text_length: number }
+  stats: DocStats
   hits: KnowledgeHit[]
   near_misses?: KnowledgeNearMiss[]
   // 飞书路径还会带 source: "lark" + url，文件路径不带
@@ -350,7 +361,7 @@ export interface StagedPayload {
   role: 'prd' | 'mindmap'
   filename: string
   module_id: number | null
-  stats: { chunks: number; tables: number; raw_text_length: number }
+  stats: DocStats
   source?: string
   url?: string
   cached?: boolean
