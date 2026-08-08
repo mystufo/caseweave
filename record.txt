@@ -267,6 +267,67 @@ CaseWeave（纬策） — 开发进度记录
 ================================================================================
 变更 / 修复记录（倒序，最新在上）
 ================================================================================
+■ 2026-08-08 — 飞书文档评论解析（评论 → 正文，默认开启）+ 顺带修复 lark-cli 错误分类失效
+  背景：飞书导入此前只取正文与配图/画板，评论区被整体漏掉。而需求的模糊点往往不写在正文里，
+        而在评论的追问里（「超时是 15 还是 30 分钟？」），且局部评论自带 quote 能锚定到具体
+        原文，对 Clarifier 判定歧义、Generator 补边界用例价值很高。
+  方案：`lark-cli drive +list-comments` 取回评论 → 按 quote 分组渲染 → append 到正文末尾。
+    ├─ tools/lark_comments.py（新增）：翻页取全部评论；从 content.elements[] 抽文本；
+    │   按「### 针对原文「…」（已确认/讨论中）」渲染；全程 fail-open 返回 None。
+    ├─ tools/lark_fetcher.py：fetch_lark_content 加评论增强步骤；新增 _extract_document_id()。
+    ├─ config.py / .env.example：LARK_COMMENTS_ENABLED（默认 true）/ _PAGE_SIZE（50）/
+    │   _MAX_PAGES（3，防超多评论淹没正文）。
+    └─ 空文档判定挪到评论增强之前：配图/画板能把纯图片文档「救回来」（图本就是正文的一部分），
+        但没有正文的文档不该靠评论凑数——评论是对需求的批注，不是需求本身。
+
+  三个「原方案是错的」，都是真实文档实测打脸后改的：
+    ├─ ❶ 权限：原以为 bot 要补 wiki:wiki / wiki:node:read + docs:document.comment:read。
+    │   实际那几个 scope 是 lark-cli 把 wiki URL 解析成 docx token 那一步要的，与读评论无关。
+    │   正文抓取的返回里本就带 data.document.document_id，直接传 `--token <id> --type docx`
+    │   即可绕开整个 wiki 解析 —— bot 身份零补授权可用。故走 token 路径，URL 仅作兜底。
+    ├─ ❷ 已解决评论不该过滤。原按 `--solved-status false` 只取未解决，理由是「已解决说明结论
+    │   已回写正文」。实测证伪：某文档两条已解决评论「完成邮箱验证：同时覆盖注册和登录」
+    │   「不区分注册和登录 都算作操作」，其结论在正文中出现 0 次（正文里同名文字只是邮件模板
+    │   文案，即被评论锚定的对象）。「已解决」= 讨论有结论了，≠ 结论已同步到正文，而这类恰恰是
+    │   确定性最高的需求决策，漏掉会直接导致用例拆错路径。改为 `--solved-status all` 全取，
+    │   用「已确认 / 讨论中」标注状态，把权重判断交给 LLM。
+    └─ ❸ docs_link 不能降级成占位符。原把链接渲染成「[链接]」，实测大量评论是「按钮跳转：<url>」，
+        抹掉 URL 后整条只剩「按钮跳转：」。改为保留原 URL —— 它本身就是可测的跳转目标。
+
+  注入格式（头部附读法说明，解决「结论在最后一条回复」的时序反转问题）：
+    ## 文档评论（共 15 条讨论，其中已确认 3 条）
+    > 说明：评论中的结论未必已同步到上方正文，应与正文同等对待。「已确认」表示该讨论已有定论；
+    >「讨论中」的分歧点适合作为澄清问题。同一讨论内按时间先后排列，若前后结论冲突，以最后一条为准。
+    ### 针对原文「登录｜login-notification.html」（讨论中）
+    - 邮件验证码一键注册登录，发的是这个邮件吗
+    - …（6 条）… 嗯 2.3合为一个
+
+  顺带修复（既有 bug，非本功能引入，但同一批发现）：
+    ├─ lark-cli 失败时 stdout 为空，{"ok":false,...} envelope 连同进度行一起写 **stderr**。
+    │   而 _run_fetch（lark_fetcher）/ create（lark_writer）都只解析 stdout，导致
+    │   _classify_and_raise 永远拿不到 error.message —— 未登录等错误退化成
+    │   「returncode=3」+ 一坨 JSON 原文。改为 stdout / stderr 两路都试。
+    └─ 修完发现分类器的文案匹配本身也是坏的，两条最常见错误串一条都匹配不上：
+        • `need_user_authorization` —— 实际是 authorization，匹不上 "unauthorized"；
+          也没有 "expir"，`"auth" and "expir"` 不成立。
+        • `access denied: …` —— "denied" 不含 "deny"，`"access" and "deny"` 不成立。
+        改为优先用 envelope 的结构化 error.type（authentication / authorization），文案匹配
+        仅作兜底并修正子串（authorization / denied / scope）。fetcher 与 writer 两份同步改。
+        效果：未登录场景由「LarkFetchFailed: …returncode=3…{JSON}」变为
+        「LarkCliNotLoggedIn: lark-cli 未登录或 token 已过期，请执行 lark-cli auth login」。
+        routes_upload / routes_mindmap 里对这两个异常的专门分支至此才真正能走到。
+
+  验证（真实飞书 wiki 文档，15 条评论 = 12 未解决 + 3 已解决）：
+    ├─ 服务端过滤口径核对：false→12 / true→3 / all→15，与页面一致。
+    ├─ elements 结构核对：定长三 key（text_run / person / docs_link），不匹配的为 null，
+    │   靠 type 区分；isinstance 判断正好兜住 null。
+    ├─ fail-open 六种失败模式逐个实测均降级返回 None、只打 WARNING、不抛异常：
+    │   lark-cli 不存在 / 超时 / 无权限 / token 非法 / token+url 全空 / 正常对照。
+    ├─ 整条链路：正文 19673 字、含评论段，评论耗时约 0.8s。
+    └─ 错误分类：结构化 + 文案兜底两条路径 × fetcher/writer 两份实现，6 组用例归类全部正确。
+  影响面：飞书导入链路 + 飞书文档创建的错误提示。无 DB / 前端 / 接口改动。
+  注：仓库无测试框架（CI 用 import 自检兜底），上述验证以脚本形式跑在 scratchpad，未入库。
+
 ■ 2026-07-31 — 画板改走「结构化提取优先」（Mermaid 源码 / 节点+连线大纲），缩略图降为兜底
   背景：上一条把画板并入了视觉链路，但那条路是「下载缩略图 → 让视觉模型看图猜」——流程图上
         的小字容易糊、分支容易漏，且强依赖 VISION_ENABLED。核查 lark-cli 能力后发现

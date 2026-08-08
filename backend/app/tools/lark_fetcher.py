@@ -147,8 +147,10 @@ async def fetch_lark_content(url: str, timeout: float | None = None) -> LarkCont
 
     抛出对应的 LarkFetchError 子类，由调用方映射成 SSE error 消息。
 
-    抓完正文后按开关做媒体增强：内嵌画板走结构化提取（lark_whiteboard_enabled，默认开），
-    配图走视觉模型识别（vision_enabled），结果 append 到正文。全程 fail-open，失败退回纯正文。
+    抓完正文后按开关做增强，结果一律 append 到正文；全程 fail-open，失败退回纯正文：
+    - 内嵌画板：结构化提取（lark_whiteboard_enabled，默认开）
+    - 配图：视觉模型识别（vision_enabled）
+    - 未解决评论：`drive +list-comments`（lark_comments_enabled，默认关，需额外 scope）
     """
     kind = classify_lark_url(url)
     if kind == "unknown":
@@ -166,7 +168,7 @@ async def fetch_lark_content(url: str, timeout: float | None = None) -> LarkCont
     if payload.get("ok") is False:
         err = payload.get("error") or {}
         msg = str(err.get("message") or "未知错误")
-        _classify_and_raise(msg)
+        _classify_and_raise(msg, err)
 
     title, text = _extract_title_and_text(payload)
     # markdown 正文里画板会原样留下 `<whiteboard token="…"></whiteboard>` —— 对 LLM 是纯噪声
@@ -186,8 +188,26 @@ async def fetch_lark_content(url: str, timeout: float | None = None) -> LarkCont
         except Exception as exc:
             logger.warning("media enrichment failed (fallback to text-only): %s", exc)
 
+    # 空文档判定必须在评论增强之前：配图/画板能把纯图片文档「救回来」（那本就是正文的一部分），
+    # 但一篇没有正文的文档不该靠评论凑数 —— 评论是对需求的批注，不是需求本身。
     if not text or not text.strip():
         raise LarkEmptyDoc("文档正文为空（可能仅含图片或图表，无法用于生成测试用例）。")
+
+    # ── 评论增强（可选）────────────────────────────────────────────────────────
+    # 评论区常藏着需求歧义的直接线索，且结论未必回写正文。fail-open：拿不到只记日志，
+    # 不影响正文导入。
+    if settings.lark_comments_enabled:
+        try:
+            from app.tools.lark_comments import fetch_document_comments
+
+            # 带上 document_id：让评论接口跳过 wiki 链接解析，省掉 bot 身份没有的 wiki:* scope
+            comments = await fetch_document_comments(
+                url, doc_token=_extract_document_id(payload), timeout=timeout_sec,
+            )
+            if comments and comments.strip():
+                text = text.rstrip() + comments
+        except Exception as exc:
+            logger.warning("comment enrichment failed (fallback to text-only): %s", exc)
 
     return LarkContent(title=title or "未命名文档", raw_text=text, kind=kind)
 
@@ -228,12 +248,17 @@ async def _run_fetch(url: str, *, doc_format: str, timeout_sec: float) -> dict:
     stdout = (stdout_b or b"").decode("utf-8", errors="replace")
     stderr = (stderr_b or b"").decode("utf-8", errors="replace")
 
-    # lark-cli 即使出错也会用 stdout 输出一份 {"ok": false, "error": ...}，所以不能只看 returncode
+    # lark-cli 出错时会输出一份 {"ok": false, "error": ...} envelope，所以不能只看 returncode。
+    # 注意：实测成功时 envelope 打在 stdout，**失败时 stdout 为空、envelope 连同进度行一起写
+    # stderr**。只解析 stdout 会让下面的 _classify_and_raise 永远拿不到 error.message —— 未登录
+    # 之类的错误就退化成「returncode=3」+ 一坨 JSON 原文，而不是「请先 lark-cli auth login」。
     payload: dict | None = None
-    try:
-        payload = _extract_json(stdout)
-    except ValueError:
-        payload = None
+    for stream in (stdout, stderr):
+        try:
+            payload = _extract_json(stream)
+            break
+        except ValueError:
+            continue
 
     if proc.returncode != 0 and payload is None:
         # 完全没拿到 JSON —— 可能是 npm 包损坏或者环境问题
@@ -409,11 +434,15 @@ async def enrich_content_with_media(url: str, *, base_text: str, timeout: float 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 
-def _extract_json(stdout: str) -> dict:
-    """lark-cli 偶尔会在 JSON 前打印 deprecation/notice 行，兜底从第一个 `{` 抠出来。"""
-    s = stdout.strip()
+def _extract_json(text: str) -> dict:
+    """从 lark-cli 的一路输出（stdout 或 stderr）里抠 JSON envelope。
+
+    lark-cli 会在 JSON 前打印 deprecation/notice/进度行（如 `Resolving wiki node: …`），
+    兜底从第一个 `{` 开始解析。
+    """
+    s = text.strip()
     if not s:
-        raise ValueError("empty stdout")
+        raise ValueError("empty output")
     # 直接尝试整体解析
     try:
         return json.loads(s)
@@ -429,16 +458,43 @@ def _extract_json(stdout: str) -> dict:
         raise ValueError(f"json decode failed: {exc}") from exc
 
 
-def _classify_and_raise(message: str) -> None:
-    """把 lark-cli 的错误消息归类成具体异常 —— 文案匹配，宽松一点。"""
-    m = message.lower()
-    if "未登录" in message or "login" in m or "unauthorized" in m or "auth" in m and "expir" in m:
+def _classify_and_raise(message: str, error: dict | None = None) -> None:
+    """把 lark-cli 的错误归类成具体异常。
+
+    优先用 envelope 里的结构化 `error.type`（authentication / authorization），文案匹配只作
+    兜底 —— 实测文案匹配单独用并不可靠：`need_user_authorization` 匹不上 "unauthorized"，
+    `access denied` 也匹不上 "deny"（"denied" 不含 "deny"），两类最常见的错误全落到通用分支。
+    """
+    etype = str((error or {}).get("type") or "").lower()
+    if etype == "authentication":
         raise LarkCliNotLoggedIn("lark-cli 未登录或 token 已过期，请在容器内执行 `lark-cli auth login`。")
-    if "权限" in message or "permission" in m or "forbidden" in m or "access" in m and "deny" in m:
+    if etype == "authorization":
+        raise LarkPermissionDenied("没有该飞书文档的访问权限，请在飞书侧给本应用/账号开通读取权限。")
+
+    m = message.lower()
+    if "未登录" in message or "login" in m or "authorization" in m or "unauthorized" in m:
+        raise LarkCliNotLoggedIn("lark-cli 未登录或 token 已过期，请在容器内执行 `lark-cli auth login`。")
+    if "权限" in message or "permission" in m or "forbidden" in m or "denied" in m or "scope" in m:
         raise LarkPermissionDenied("没有该飞书文档的访问权限，请在飞书侧给本应用/账号开通读取权限。")
     if "not found" in m or "不存在" in message or "404" in m:
         raise LarkFetchFailed("文档不存在或链接已失效。")
     raise LarkFetchFailed(f"飞书抓取失败：{message}")
+
+
+def _extract_document_id(payload: dict) -> str | None:
+    """抠出 docx 的 document_id（成功 shape 里在 data.document.document_id）。
+
+    用于评论接口：直接给 token 就不必让 lark-cli 去解析 wiki 链接（那需要额外 scope）。
+    """
+    for root in (payload.get("data"), payload):
+        if not isinstance(root, dict):
+            continue
+        for holder in (root.get("document"), root):
+            if isinstance(holder, dict):
+                v = holder.get("document_id")
+                if isinstance(v, str) and v.strip():
+                    return v.strip()
+    return None
 
 
 def _extract_title_and_text(payload: dict) -> tuple[str, str]:

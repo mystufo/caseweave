@@ -79,11 +79,15 @@ async def create_lark_doc(title: str, markdown: str, timeout: float | None = Non
     stdout = (stdout_b or b"").decode("utf-8", errors="replace")
     stderr = (stderr_b or b"").decode("utf-8", errors="replace")
 
+    # 失败时 lark-cli 把 {"ok": false, "error": ...} envelope 写在 stderr（stdout 为空），
+    # 只解析 stdout 会让下面的 _classify_and_raise 拿不到 error.message。两路都试。
     payload: dict | None = None
-    try:
-        payload = _extract_json(stdout)
-    except ValueError:
-        payload = None
+    for stream in (stdout, stderr):
+        try:
+            payload = _extract_json(stream)
+            break
+        except ValueError:
+            continue
 
     if proc.returncode != 0 and payload is None:
         logger.error(
@@ -101,7 +105,7 @@ async def create_lark_doc(title: str, markdown: str, timeout: float | None = Non
     if payload.get("ok") is False:
         err = payload.get("error") or {}
         msg = str(err.get("message") or "未知错误")
-        _classify_and_raise(msg)
+        _classify_and_raise(msg, err)
 
     doc_url, doc_token = _extract_doc_url_and_token(payload)
     if not doc_token and not doc_url:
@@ -122,12 +126,21 @@ async def create_lark_doc(title: str, markdown: str, timeout: float | None = Non
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 
-def _classify_and_raise(message: str) -> None:
-    """把 lark-cli 的错误消息归类成具体异常（与 fetcher 的分类口径一致）。"""
-    m = message.lower()
-    if "未登录" in message or "login" in m or "unauthorized" in m or ("auth" in m and "expir" in m):
+def _classify_and_raise(message: str, error: dict | None = None) -> None:
+    """把 lark-cli 的错误归类成具体异常（与 fetcher 的分类口径一致）。
+
+    优先结构化 error.type，文案匹配兜底 —— 理由同 fetcher 的同名函数。
+    """
+    etype = str((error or {}).get("type") or "").lower()
+    if etype == "authentication":
         raise LarkCliNotLoggedIn("lark-cli 未登录或 token 已过期，请执行 `lark-cli auth login`。")
-    if "权限" in message or "permission" in m or "forbidden" in m or ("access" in m and "deny" in m):
+    if etype == "authorization":
+        raise LarkPermissionDenied("没有创建飞书文档的权限，请在飞书侧给本应用/账号开通权限。")
+
+    m = message.lower()
+    if "未登录" in message or "login" in m or "authorization" in m or "unauthorized" in m:
+        raise LarkCliNotLoggedIn("lark-cli 未登录或 token 已过期，请执行 `lark-cli auth login`。")
+    if "权限" in message or "permission" in m or "forbidden" in m or "denied" in m or "scope" in m:
         raise LarkPermissionDenied("没有创建飞书文档的权限，请在飞书侧给本应用/账号开通权限。")
     raise LarkFetchFailed(f"飞书创建文档失败：{message}")
 

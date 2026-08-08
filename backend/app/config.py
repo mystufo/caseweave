@@ -120,6 +120,11 @@ class Settings(BaseSettings):
     # 结构化提取失败时，若 vision_enabled 才退回「下载缩略图 + 视觉识别」。
     lark_whiteboard_enabled: bool = True
     lark_whiteboard_max_chars: int = 4000   # 单个画板注入正文的字数上限，防超大画板挤爆上下文
+    # 文档评论 → 正文。评论区的追问常是需求歧义的直接线索，且结论未必回写正文。
+    # 走 docx token 直查，无需额外 scope，故默认开启；失败一律 fail-open 不影响正文导入。
+    lark_comments_enabled: bool = True
+    lark_comments_page_size: int = 50       # 单页评论数（CLI 限 1-100）
+    lark_comments_max_pages: int = 3        # 翻页上限；评论过多的文档取前几页足够，防淹没正文
 
     # ── 视觉模型（图片 → 文字）─────────────────────────────────────────────────
     # 用于把飞书文档里的内嵌图片（UI 原型 / 流程图 / 架构图）识别成文字描述，
