@@ -428,7 +428,7 @@ function ModuleDetailCard({
               type="text"
               value={nameDraft}
               onChange={e => setNameDraft(e.target.value)}
-              placeholder="模块中文名"
+              placeholder="模块名"
               disabled={savingModule}
               className="w-full px-2 py-1 text-sm font-medium border border-gray-200 rounded focus:outline-none focus:ring-2 focus:ring-amber-200"
               autoFocus

@@ -22,7 +22,6 @@ const importanceIcon = {
   low: <Info size={14} className="text-gray-400 flex-shrink-0" />,
 }
 
-const CHINESE_ONLY_RE = /^[一-鿿·、（）()【】\-_/\s]+$/
 const PREFIX_RE = /^[A-Z][A-Z0-9-]{0,39}$/
 
 // 用户在某个问题上的选择状态：要么选中某个候选选项，要么走自定义文本输入
@@ -54,7 +53,7 @@ export default function ClarificationPanel({
 
   const allAnswered = questions.every(q => answers[String(q.id)])
   const trimmedModule = moduleName.trim()
-  const moduleReady = trimmedModule.length > 0 && CHINESE_ONLY_RE.test(trimmedModule)
+  const moduleReady = trimmedModule.length > 0
   // 脑图模式隐藏前缀 → 就绪校验不看前缀
   const prefixReady = hideCasePrefix ? true : PREFIX_RE.test(casePrefix)
   const ready = allAnswered && moduleReady && prefixReady
@@ -79,17 +78,14 @@ export default function ClarificationPanel({
         <div className="bg-white rounded-lg p-3 border border-amber-100 space-y-2">
           <div className="flex items-center gap-1.5 text-xs font-medium text-amber-800">
             <Layers size={14} />
-            模块名（中文，将作为本次所有用例的统一模块）
+            模块名（将作为本次所有用例的统一模块）
           </div>
           <input
             className="w-full text-sm border border-gray-200 rounded-lg px-2 py-1.5 outline-none focus:border-amber-400"
             value={moduleName}
             onChange={e => setModuleName(e.target.value)}
-            placeholder="请输入模块名（仅中文）"
+            placeholder="请输入模块名"
           />
-          {trimmedModule && !moduleReady && (
-            <p className="text-xs text-red-500">模块名仅允许中文（可含常见标点）。</p>
-          )}
           {suggestedModule && (
             <p className="text-xs text-gray-400">
               大模型建议：<span className="text-gray-500">{suggestedModule}</span>
@@ -251,7 +247,7 @@ export default function ClarificationPanel({
       >
         <CheckCircle size={16} />
         {!moduleReady
-          ? '请填写有效的模块名（中文）'
+          ? '请填写模块名'
           : !prefixReady
             ? '请填写有效的用例编号前缀'
             : !allAnswered

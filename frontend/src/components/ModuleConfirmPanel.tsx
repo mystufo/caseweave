@@ -98,7 +98,7 @@ export default function ModuleConfirmPanel({
         <div className="space-y-2 rounded-lg border border-teal-200 bg-white/60 p-2.5">
           <div className="grid grid-cols-2 gap-2">
             <label className="text-xs text-gray-600 space-y-1">
-              <span>中文名</span>
+              <span>模块名</span>
               <input
                 type="text"
                 value={createName}

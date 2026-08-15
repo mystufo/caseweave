@@ -61,7 +61,7 @@ SYSTEM_PROMPT = """你是一位资深的测试工程师，正在分析产品需�
 输出格式（JSON）：
 {
   "summary": "文档内容简要摘要",
-  "module_detected": "检测到的功能模块名称，必须为纯中文，不允许含英文/拼音",
+  "module_detected": "检测到的功能模块名称（沿用文档中的原始叫法即可，中英文皆可）",
   "case_prefix_suggestion": "建议的用例编号前缀（必须为大写英文，多个单词以短横线连接，例如 USER-LOGIN / VIP-RENEWAL）",
   "questions": [
     {
@@ -111,7 +111,7 @@ FOLLOWUP_SYSTEM_PROMPT = """你是一位资深的测试工程师，正在与产�
 输出格式（JSON，字段含义与第一轮一致）：
 {
   "summary": "结合用户回答后的最新理解",
-  "module_detected": "纯中文模块名（保持与之前一致即可）",
+  "module_detected": "模块名（保持与之前一致即可）",
   "case_prefix_suggestion": "保持与之前一致（大写英文+短横线）",
   "questions": [
     {

@@ -53,7 +53,7 @@ SYSTEM_PROMPT = """你是一名产品经理助手，正在帮测试团队归档�
 
 输出格式（必须是单个 JSON 对象，不要解释、不要 ```fenced```）：
 {"module_id": <int 或 null>, "confidence": <float>, "reasoning": "<不超过 60 字>",
- "proposed_module": {"name": "<新模块中文名>", "code": "<英文名/编号前缀>", "description": "<一句话>"} 或 null}
+ "proposed_module": {"name": "<新模块名>", "code": "<英文名/编号前缀>", "description": "<一句话>"} 或 null}
 """
 
 

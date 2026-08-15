@@ -26,7 +26,6 @@ from app.tools.excel_export import export_test_cases
 router = APIRouter()
 
 CASE_PREFIX_RE = re.compile(r"^[A-Z][A-Z0-9-]{0,39}$")
-CHINESE_ONLY_RE = re.compile(r"^[一-鿿A-Za-z0-9·、（）()【】\-_/\s]+$")  # tolerant
 VALID_PRIORITIES = {"P1", "P2", "P3"}
 
 
