@@ -48,23 +48,39 @@
 sudo apt-get update
 sudo apt-get install -y ca-certificates curl gnupg
 
-# 添加 Docker 官方源
+# 添加 Docker 官方源（这一步不能跳过：docker-ce 等包不在 Ubuntu 自带源里，
+# 跳过后直接装会报 "Package docker-ce has no installation candidate"）
 sudo install -m 0755 -d /etc/apt/keyrings
 curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
 sudo chmod a+r /etc/apt/keyrings/docker.gpg
+CODENAME=$(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}")
+echo "codename = $CODENAME"     # 应为 focal / jammy / noble，为空或非这三者见下方说明框
 echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
-  https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+  https://download.docker.com/linux/ubuntu $CODENAME stable" | \
   sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
 
 sudo apt-get update
+apt-cache policy docker-ce      # 能看到候选版本号 = 源已生效，否则见下方说明框
 sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+# 启动 docker 守护进程并设为开机自启（装完不会自动起，漏了会在后面 up 时报
+# "Cannot connect to the Docker daemon at unix:///var/run/docker.sock"）
+sudo systemctl enable --now docker
+sudo systemctl status docker --no-pager
 
 # 可选：把当前用户加入 docker 组，免 sudo（需重新登录生效）
 sudo usermod -aG docker $USER
 
 # 验证
 docker --version && docker compose version
+docker info | head -20        # 能输出 Server 段信息即守护进程正常
 ```
+
+> **装不上 docker-ce（`no installation candidate` / `Unable to locate package containerd.io`）**：说明 Docker 源没生效，两个常见原因：
+> - **发行代号不对**。上面用 `${UBUNTU_CODENAME:-$VERSION_CODENAME}` 而非直接用 `$VERSION_CODENAME`，是因为基于 Ubuntu 的衍生版（麒麟、Deepin、部分云厂商定制镜像）的 `VERSION_CODENAME` 是它自己的代号，Docker 源里没有对应目录，而 `UBUNTU_CODENAME` 才是 `jammy`/`noble`。纯 Ubuntu 上两者结果相同。若系统是 Debian，把两处 URL 的 `/ubuntu` 换成 `/debian`。
+> - **连不上 `download.docker.com`**（国内服务器常见）。换阿里云镜像即可，包内容一致：把上面两处 `https://download.docker.com/linux/ubuntu` 换成 `https://mirrors.aliyun.com/docker-ce/linux/ubuntu`（GPG 与 deb 行都要换），重跑 `sudo apt-get update`。
+>
+> 实在都不通，可用发行版自带包兜底：`sudo apt-get install -y docker.io docker-compose-v2`（20.04/22.04 若无 `docker-compose-v2`，改用 `docker.io docker-buildx docker-compose-plugin`）。版本较旧但足够跑本项目；注意若只装到 v1 的 `docker-compose`，会踩 A.1.1 的 `ContainerConfig` 问题。
 
 > **国内服务器拉镜像 / 构建慢**：`docker compose up --build` 会拉 `python:3.11-slim`、`node:20-alpine`、`nginx:alpine`、`pgvector/pgvector:pg16` 四个基础镜像，并在构建时装 apt/pip/npm 依赖。国内访问 Docker Hub 与官方源常超时，两处已做处理：
 > - **基础镜像**：给 Docker 配国内加速器。编辑 `/etc/docker/daemon.json`（用你云厂商的加速地址最稳；公共站可用 `https://docker.m.daocloud.io`），改完 `sudo systemctl daemon-reload && sudo systemctl restart docker`。若加速器仍连不上官方，可带前缀显式拉取再打回原 tag，例如 `docker pull docker.m.daocloud.io/library/python:3.11-slim && docker tag docker.m.daocloud.io/library/python:3.11-slim python:3.11-slim`。
@@ -141,8 +157,7 @@ echo "VITE_API_URL=http://SERVER_IP:8001" > frontend/.env
 ```bash
 docker compose up --build -d
 # 老版本用连字符：docker-compose up --build -d（若报 ContainerConfig 错，见 A.1.1）
-# 或（项目提供了 Makefile 快捷方式）
-make up
+# 等价快捷方式（Makefile 里就是上面这条命令，二选一即可，不必重复执行）：make up
 ```
 
 查看状态与日志：
@@ -425,7 +440,7 @@ Docker 数据卷为 `pg_data`（`docker volume ls` 可见），删除 compose �
 
 ### 为什么 Docker 下要特殊处理
 
-后端跑在容器里，而 `lark-cli` 是宿主机上用 nvm 装的 Node 程序，且它的凭证不是普通文件——容器默认既找不到二进制、也读不到凭证。要点：
+后端跑在容器里，而 `lark-cli` 是**宿主机上**的 Node 程序，且它的凭证不是普通文件——容器默认既找不到二进制、也读不到凭证。要点：
 
 - **二进制**：`lark-cli` 依赖整个 Node 运行时，光拷二进制没用。做法是把宿主机的 Node 目录挂进容器。
 - **身份**：`lark-cli` 支持 `user`（个人授权，`auth login`）和 `bot`（应用，app_id+secret）两种身份。
@@ -440,29 +455,52 @@ Docker 数据卷为 `pg_data`（`docker volume ls` 可见），删除 compose �
 - 权限管理里开通文档读取权限（至少 `docx:document:readonly`，导入知识库 wiki 链接还需 wiki 节点读取权限），**发布应用版本**才生效。
 - 把要导入的文档 / 知识库**共享给该应用**（bot 是独立机器人，默认看不到你的文档）。
 
-**2. 挂载宿主机 Node 运行时**（`docker-compose.yml` 已配好，按你的机器核对路径）
+**2. 在宿主机安装 Node 与 lark-cli**（新服务器必做；机器上已有 lark-cli 可跳到第 3 步）
+
+容器挂的是宿主机的 Node 目录，所以 Node 必须装在**宿主机**上，且要是一个自带 `bin/`、`lib/` 的完整目录（nvm 装出来的、或官方 tarball 解压出来的都符合）。用 apt / NodeSource 装的 Node 分散在 `/usr/bin` 与 `/usr/lib`，**不能**用于这里的挂载。
+
+推荐直接解压官方 tarball（走阿里云镜像，避免 nvm 脚本从 GitHub 拉不动）：
+
 ```bash
-which lark-cli                       # 反查 → /root/.nvm/versions/node/vX.Y.Z/bin/lark-cli
+uname -m          # x86_64 → 用下面的 x64 包；aarch64 → 把 x64 换成 arm64
+
+cd /opt
+curl -fsSLO https://mirrors.aliyun.com/nodejs-release/v22.11.0/node-v22.11.0-linux-x64.tar.xz
+tar -xf node-v22.11.0-linux-x64.tar.xz
+export PATH=/opt/node-v22.11.0-linux-x64/bin:$PATH    # 想长期生效就写进 ~/.bashrc
+node -v
+
+# 装 lark-cli（npm 换国内源）
+npm config set registry https://registry.npmmirror.com
+npm i -g @larksuite/cli
+which lark-cli    # → /opt/node-v22.11.0-linux-x64/bin/lark-cli
 ```
-在 `.env` 里设：
+
+**3. 把 Node 目录写进 `.env`**（`docker-compose.yml` 的挂载已配好，只需给对路径）
+
+`LARK_NODE_DIR` 填 `which lark-cli` 结果**去掉末尾 `/bin/lark-cli`** 的那段：
+
 ```ini
-LARK_NODE_DIR=/root/.nvm/versions/node/v24.14.0   # 上面反查到的 node 版本目录
+LARK_NODE_DIR=/opt/node-v22.11.0-linux-x64        # 用 nvm 装的则形如 /root/.nvm/versions/node/v24.14.0
 LARK_CLI_HOME=/root/.lark-cli                     # lark-cli 配置目录
 ```
 
-**3. 填 bot 凭证到 `.env`**
+**4. 填 bot 凭证到 `.env`**
+
+`LARK_CLI_IDENTITY=bot` 不能漏——缺了会走 user 身份，在容器里必然失败（user token 存在 OS keychain，容器读不到）。
+
 ```ini
 LARK_CLI_IDENTITY=bot
 LARK_APP_ID=cli_xxxxxxxxxxxxxxxx
 LARK_APP_SECRET=你的AppSecret
 ```
 
-**4. 重建后端**（Dockerfile / 挂载变更，需 `--build`）
+**5. 重建后端**（Dockerfile / 挂载变更，需 `--build`）
 ```bash
 docker compose down && docker compose up -d --build
 ```
 
-**5. 验证**
+**6. 验证**
 ```bash
 # 看 entrypoint 是否成功自动 init
 docker compose logs backend | grep entrypoint
@@ -477,7 +515,7 @@ docker compose exec backend lark-cli docs +fetch --doc "https://xxx.feishu.cn/wi
 
 | 现象 | 原因 / 处理 |
 |------|-------------|
-| `lark-cli 未安装：No such file or directory` | 容器没挂到 Node。核对 `.env` 的 `LARK_NODE_DIR` 路径、`which lark-cli` 反查是否一致；`docker compose exec backend lark-cli --version` 验证 |
+| `lark-cli 未安装：No such file or directory` | 容器没挂到 Node。常见于新机器压根没装（见第 2 步），或 `.env` 的 `LARK_NODE_DIR` 指向了不存在的路径——**路径不存在时 Docker 会静默挂成空目录**，没有任何报错。用 `ls $LARK_NODE_DIR/bin/lark-cli` 确认宿主机侧存在，再 `docker compose exec backend lark-cli --version` 验证容器侧 |
 | `invalid_client` / `The auth method is not supported` | bot 凭证没生效。看 `docker compose logs backend \| grep entrypoint`；确认 `.env` 的 `LARK_APP_ID/LARK_APP_SECRET` 已填、且容器已 `--build` 重建 |
 | `token_missing` + `identity: user` | 后端仍走 user 身份。确认 `LARK_CLI_IDENTITY=bot` 且容器已重启读到新配置 |
 | 抓取报无权限 / 读不到文档内容 | 应用权限没开全或没发布，或目标文档没共享给应用。回开放平台补权限、发版本、共享文档 |
