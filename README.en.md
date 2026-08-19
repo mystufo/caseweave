@@ -64,6 +64,13 @@ Issues for bug reports and feature requests are welcome, as are pull requests. S
 
 Please do not file security problems as public issues — see **[SECURITY.md](SECURITY.md)**. Before exposing a self-hosted deployment, work through its checklist: set `JWT_SECRET`, turn `DEBUG` off, and change the default database credentials.
 
+## Contact
+
+If you'd like to discuss the project, test case generation, or agent-related practices, feel free to reach out:
+
+- WeChat: **mystufo** (please mention "CaseWeave" in the request)
+- Email: **mystufo@aliyun.com**
+
 ## License
 
 Released under the [MIT License](LICENSE).

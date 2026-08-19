@@ -63,6 +63,13 @@ make dev-frontend  # Vite on :5173
 
 安全问题请不要走公开 Issue，见 **[SECURITY.md](SECURITY.md)**。自建部署上线前，务必按其中的清单设好 `JWT_SECRET`、关掉 `DEBUG`、改掉数据库默认账密。
 
+## 交流
+
+对项目感兴趣、想交流测试用例生成或 Agent 相关实践的，欢迎联系我：
+
+- 微信：**mystufo**（加好友请注明「CaseWeave」）
+- 邮箱：**mystufo@aliyun.com**
+
 ## License
 
 本项目采用 [MIT License](LICENSE) 开源。
