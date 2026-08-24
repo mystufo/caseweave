@@ -1,5 +1,6 @@
 # CaseWeave 纬策
 
+[![Release](https://img.shields.io/github/v/release/mystufo/caseweave)](https://github.com/mystufo/caseweave/releases/latest)
 [![CI](https://github.com/mystufo/caseweave/actions/workflows/ci.yml/badge.svg)](https://github.com/mystufo/caseweave/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
