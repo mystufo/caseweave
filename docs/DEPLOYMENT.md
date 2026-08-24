@@ -51,6 +51,10 @@ sudo apt-get install -y ca-certificates curl gnupg
 # 添加 Docker 官方源（这一步不能跳过：docker-ce 等包不在 Ubuntu 自带源里，
 # 跳过后直接装会报 "Package docker-ce has no installation candidate"）
 sudo install -m 0755 -d /etc/apt/keyrings
+
+# 国内服务器把下面两处 https://download.docker.com/linux/ubuntu 换成
+# https://mirrors.aliyun.com/docker-ce/linux/ubuntu（GPG 与 deb 行都要换，包内容一致）。
+# 直连官方站常报 curl: (35) Recv failure: Connection reset by peer
 curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
 sudo chmod a+r /etc/apt/keyrings/docker.gpg
 CODENAME=$(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}")
@@ -80,13 +84,57 @@ docker info | head -20        # 能输出 Server 段信息即守护进程正常
 > - **发行代号不对**。上面用 `${UBUNTU_CODENAME:-$VERSION_CODENAME}` 而非直接用 `$VERSION_CODENAME`，是因为基于 Ubuntu 的衍生版（麒麟、Deepin、部分云厂商定制镜像）的 `VERSION_CODENAME` 是它自己的代号，Docker 源里没有对应目录，而 `UBUNTU_CODENAME` 才是 `jammy`/`noble`。纯 Ubuntu 上两者结果相同。若系统是 Debian，把两处 URL 的 `/ubuntu` 换成 `/debian`。
 > - **连不上 `download.docker.com`**（国内服务器常见）。换阿里云镜像即可，包内容一致：把上面两处 `https://download.docker.com/linux/ubuntu` 换成 `https://mirrors.aliyun.com/docker-ce/linux/ubuntu`（GPG 与 deb 行都要换），重跑 `sudo apt-get update`。
 >
-> 实在都不通，可用发行版自带包兜底：`sudo apt-get install -y docker.io docker-compose-v2`（20.04/22.04 若无 `docker-compose-v2`，改用 `docker.io docker-buildx docker-compose-plugin`）。版本较旧但足够跑本项目；注意若只装到 v1 的 `docker-compose`，会踩 A.1.1 的 `ContainerConfig` 问题。
+> 实在都不通，可用发行版自带包兜底：`sudo apt-get install -y docker.io docker-compose-v2`（20.04/22.04 若无 `docker-compose-v2`，改用 `docker.io docker-buildx docker-compose-plugin`）。版本较旧但足够跑本项目；注意若只装到 v1 的 `docker-compose`，会踩 A.1.2 的 `ContainerConfig` 问题。
 
-> **国内服务器拉镜像 / 构建慢**：`docker compose up --build` 会拉 `python:3.11-slim`、`node:20-alpine`、`nginx:alpine`、`pgvector/pgvector:pg16` 四个基础镜像，并在构建时装 apt/pip/npm 依赖。国内访问 Docker Hub 与官方源常超时，两处已做处理：
-> - **基础镜像**：给 Docker 配国内加速器。编辑 `/etc/docker/daemon.json`（用你云厂商的加速地址最稳；公共站可用 `https://docker.m.daocloud.io`），改完 `sudo systemctl daemon-reload && sudo systemctl restart docker`。若加速器仍连不上官方，可带前缀显式拉取再打回原 tag，例如 `docker pull docker.m.daocloud.io/library/python:3.11-slim && docker tag docker.m.daocloud.io/library/python:3.11-slim python:3.11-slim`。
-> - **构建期依赖**：`backend/Dockerfile` 已把 apt 换阿里云 Debian 源、pip 换阿里云 PyPI 源；`frontend/Dockerfile` 已把 npm 换 npmmirror 源。无需额外配置。
+> **构建期依赖已内置国内源**：`backend/Dockerfile` 已把 apt 换阿里云 Debian 源、pip 换阿里云 PyPI 源；`frontend/Dockerfile` 已把 npm 换 npmmirror 源。无需额外配置。基础镜像的拉取加速见下一节。
 
-### A.1.1 关于 docker compose 版本
+### A.1.1 配置镜像加速器（国内服务器必做）
+
+`docker compose up --build` 需要拉 `pgvector/pgvector:pg16`、`python:3.11-slim`、`node:20-alpine`、`nginx:alpine` 等基础镜像。国内直连 Docker Hub 基本拉不动，典型报错是域名被解析到无关 IP 后超时：
+
+```
+Error response from daemon: failed to resolve reference "docker.io/pgvector/pgvector:pg16":
+failed to do request: Head "https://registry-1.docker.io/v2/...": dial tcp 31.13.76.65:443: i/o timeout
+```
+
+**装完 Docker 立刻配好加速器，别等 `up` 报错再回头配**：
+
+```bash
+# 注意：daemon.json 必须是合法 JSON，写坏会导致 dockerd 起不来（见下方说明框）
+echo '{"registry-mirrors":["https://docker.m.daocloud.io","https://dockerproxy.net"]}' \
+  | sudo tee /etc/docker/daemon.json
+
+python3 -m json.tool /etc/docker/daemon.json    # 校验：能回显 JSON 即格式正确
+
+sudo systemctl daemon-reload
+sudo systemctl restart docker
+docker info | grep -A3 "Registry Mirrors"       # 能列出镜像地址 = 已生效
+```
+
+> **阿里云 ECS 优先用专属加速地址**：控制台 → 容器镜像服务 → 镜像加速器，形如 `https://<你的ID>.mirror.aliyuncs.com`，走内网比公共站稳得多，把它放 `registry-mirrors` 数组第一位。公共加速站会挂、会限流。
+
+> **加速器仍拉不到某个镜像**：带前缀显式拉取再打回原 tag，compose 就会直接用本地镜像：
+> ```bash
+> docker pull docker.m.daocloud.io/pgvector/pgvector:pg16
+> docker tag  docker.m.daocloud.io/pgvector/pgvector:pg16 pgvector/pgvector:pg16
+> ```
+> 官方镜像要补 `library/`，如 `docker.m.daocloud.io/library/python:3.11-slim`。
+
+> **改完 daemon.json 后 `systemctl restart docker` 失败**（`Job for docker.service failed` / `Start request repeated too quickly`）：几乎都是 daemon.json 不是合法 JSON——用 heredoc 写文件时若结束标记 `EOF` 前面带了空格，shell 会一直停在 `>` 续行提示符，容易把多余内容写进文件（所以上面用单行 `echo` 写法）。排查与修复：
+> ```bash
+> cat /etc/docker/daemon.json
+> journalctl -u docker.service -n 50 --no-pager | grep -i "level=fatal\|unable to configure"
+>
+> # 重写为合法 JSON 后，必须先清失败计数再启动，
+> # 否则 systemd 会因「重启太频繁」直接拒绝，即使配置已经改对
+> sudo systemctl reset-failed docker
+> sudo systemctl start docker
+> ```
+> 想先把 Docker 拉起来排除干扰：`sudo rm /etc/docker/daemon.json && sudo systemctl reset-failed docker && sudo systemctl start docker`。
+
+> **embedding / rerank 镜像走的是 ghcr.io**（`ghcr.io/huggingface/text-embeddings-inference`，各约 1~2 GB），不受 Docker Hub 加速器影响。若 ghcr 也不通，`docker-compose.yml` 已把地址变量化，在 `.env` 里设 `EMBEDDING_IMAGE` / `RERANK_IMAGE` 指向可达的镜像源即可，不用改 compose 文件。
+
+### A.1.2 关于 docker compose 版本
 
 本文命令用 **v2 语法 `docker compose`（带空格）**。若服务器上是老的 **v1 `docker-compose`（带连字符，如 1.29.2）**，用它 `up`/`recreate` 时可能报 `KeyError: 'ContainerConfig'`——这是 v1 与新版 Docker 镜像格式不兼容的已知 bug，触发点是"就地重建旧容器"。绕过办法：**先 `docker-compose down` 删掉旧容器，再 `docker-compose up -d` 全新创建**（`down` 不删 `pg_data` 卷，数据安全）。长期建议装 v2 插件（`sudo apt-get install -y docker-compose-plugin`）改用 `docker compose`。
 
@@ -156,7 +204,7 @@ echo "VITE_API_URL=http://SERVER_IP:8001" > frontend/.env
 
 ```bash
 docker compose up --build -d
-# 老版本用连字符：docker-compose up --build -d（若报 ContainerConfig 错，见 A.1.1）
+# 老版本用连字符：docker-compose up --build -d（若报 ContainerConfig 错，见 A.1.2）
 # 等价快捷方式（Makefile 里就是上面这条命令，二选一即可，不必重复执行）：make up
 ```
 
@@ -427,9 +475,11 @@ Docker 数据卷为 `pg_data`（`docker volume ls` 可见），删除 compose �
 | 后端日志 `alembic upgrade failed` | 非致命（服务仍会起），但需关注；通常是数据库连接或历史 schema 问题，查 `journalctl` / `docker compose logs backend` |
 | 上传大文档超时 | 调大 `LLM_TIMEOUT_SECONDS`；确认 Nginx `proxy_read_timeout` 足够（已给 300s） |
 | SSE 流式（聊天/生成进度）不流式、一次性返回 | 反代必须 `proxy_buffering off`（本文的 Nginx 配置已包含） |
-| `docker-compose up` 报 `KeyError: 'ContainerConfig'` | v1 与新版镜像不兼容的已知 bug。先 `docker-compose down` 再 `up -d`；或改用 v2 `docker compose`。见 A.1.1 |
+| `docker-compose up` 报 `KeyError: 'ContainerConfig'` | v1 与新版镜像不兼容的已知 bug。先 `docker-compose down` 再 `up -d`；或改用 v2 `docker compose`。见 A.1.2 |
 | 启动报 `bind: address already in use`（5432/8001/3001） | 宿主机端口被占用（常见于同机已跑另一套项目）。db 可用 `.env` 的 `DB_HOST_PORT` 改宿主机端口；其他服务改 `docker-compose.yml` 里 `ports` 左侧的宿主机端口 |
-| 拉基础镜像超时 / 构建极慢 | 配 Docker 国内加速器，或带前缀显式 `docker pull` 再打 tag。见 A.1 的说明框 |
+| 拉基础镜像超时 / `failed to resolve reference "docker.io/..."` | 未配国内镜像加速器。见 A.1.1；ghcr.io 的 embedding/rerank 镜像另用 `.env` 的 `EMBEDDING_IMAGE` / `RERANK_IMAGE` 换源 |
+| 装 Docker 时 `curl: (35) Recv failure` / `gpg: no valid OpenPGP data found` | 连不上 `download.docker.com`。两处 URL 换成 `https://mirrors.aliyun.com/docker-ce/linux/ubuntu`。见 A.1 |
+| 改完 `daemon.json` 后 dockerd 起不来 | daemon.json 不是合法 JSON。`python3 -m json.tool` 校验，重写后 `systemctl reset-failed docker` 再 `start`。见 A.1.1 |
 | 飞书导入报 `lark-cli 未安装` / `invalid_client` / `token_missing` | 见「附录：飞书文档导入（lark-cli）配置」 |
 
 ---
