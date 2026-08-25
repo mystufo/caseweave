@@ -8,7 +8,7 @@ import {
   fetchSessions, fetchMessages, createSession, renameSession, deleteSession,
   generateCases, generateMindmap, fetchSessionCases, fetchClarificationState, fetchKnowledgePreview,
   streamChat, streamUpload, streamLarkImport, streamLarkMindmapImport, streamFollowupClarification,
-  streamInitialClarification, streamMindmapUpload, streamPipelineStart,
+  streamInitialClarification, streamMindmapUpload, streamPipelineStart, isRejection,
   confirmPendingKnowledge, extractCombinedDrafts,
   createModule, updateDocumentModule, fetchModules,
   exportSessionUrl,
@@ -23,10 +23,12 @@ import ModuleConfirmPanel from '../components/ModuleConfirmPanel'
 import FlowSteps from '../components/FlowSteps'
 import TestCaseTable from '../components/TestCaseTable'
 import LarkUrlDialog, { type LarkUrlSubmit } from '../components/LarkUrlDialog'
+import { toast } from '../lib/toast'
+import { showGateBlocked } from '../lib/alertDialog'
 import MindmapPasteDialog from '../components/MindmapPasteDialog'
 import StopConfirmDialog from '../components/StopConfirmDialog'
 import TabBar, { type ViewKey } from '../components/TabBar'
-import { FileText, Loader2, Square, Brain, ExternalLink, Upload, Network, Pencil, Link as LinkIcon } from 'lucide-react'
+import { FileText, Loader2, Square, Brain, ExternalLink, Upload, Network, Pencil, Link as LinkIcon, AlertTriangle, RotateCcw, X } from 'lucide-react'
 
 interface PageProps {
   view: ViewKey
@@ -124,6 +126,14 @@ interface SessionState {
     rounds: ClarificationRoundHistory[]
   } | null
 
+  // 澄清面板被「请求根本没发出去」的失败（并发闸门 429）打断时，用户填过的答案暂存在这里，
+  // 面板重新挂载时回填，避免重答一遍。收到新一轮问题就清空。
+  restoredAnswers: Record<string, string> | null
+
+  // 飞书导入失败提示条（带「重试」按钮）。聊天区那条 ❌ 消息是历史留痕、翻上去才看得到；
+  // 这一条是停在眼前的可操作入口——尤其并发闸门 429 这种「原地重试就好」的失败。
+  larkFailure: { message: string; urls: LarkUrlSubmit; rejected: boolean } | null
+
   // 上传后由 LLM 抽取出的"产品知识草稿"——用户审核后才决定哪些条目写入 knowledge_entries。
   // 两个 slot 与 uploadResult / uploadMindmap 平行；任一未 settle（!= null）就阻塞澄清入口。
   // settled 字段表示是否调过 confirm 接口（避免幂等重复）；后端清空 pending_knowledge 后我们就把 slot 置 null。
@@ -203,6 +213,8 @@ const emptyState = (mode: 'cases' | 'mindmap' = 'cases'): SessionState => ({
   mindmapDraftReview: null,
   extractingDrafts: false,
   moduleDecision: null,
+  larkFailure: null,
+  restoredAnswers: null,
 })
 
 const isBusy = (s: SessionState) =>
@@ -423,6 +435,7 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
   // 同理：脑图模式上传处理器在前定义，而 startMindmapClarification 在后；用 ref 桥接，
   // 让上传 onDone 能在脑图模式下自动触发首轮澄清。
   const startMindmapClarificationRef = useRef<((sid: number, documentId: number) => void) | null>(null)
+  const handleLarkImportRef = useRef<((urls: LarkUrlSubmit) => Promise<void>) | null>(null)
 
   // Helper: update a single session's state by id. Idempotent — if the session
   // has been deleted from the map (shouldn't happen, but defensive), no-op.
@@ -1005,6 +1018,7 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
       },
       onError: (msg) => {
         console.error('Upload error:', msg)
+        toast.error(`上传失败：${msg}`)
         patchSession(startSid, {
           uploading: false,
           uploadStage: null,
@@ -1133,6 +1147,7 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
       },
       onError: (msg) => {
         console.error('Mindmap upload error:', msg)
+        toast.error(`脑图上传失败：${msg}`)
         patchSession(startSid, {
           uploading: false,
           uploadStage: null,
@@ -1165,6 +1180,15 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
     setLarkDialogOpen(false)
     const { prdUrl, mindmapUrl } = urls
     if (!prdUrl && !mindmapUrl) return
+
+    // 导入失败时统一从这里发提示，都带「重试」（点了就原样重跑这次导入）：
+    // 被闸门挡下 → 模态框，必须点确认才消失；真的流中断 → toast。
+    // 两种情况会话内都会留一条 larkFailure 提示条，提示消失后仍能重试。
+    const notifyLarkFailure = (msg: string, rejected: boolean) => {
+      const retry = { label: '重试', onClick: () => { void handleLarkImportRef.current?.(urls) } }
+      if (rejected) showGateBlocked(msg, retry)
+      else toast.error(`飞书导入中断：${msg}`, { action: retry })
+    }
 
     // 用 PRD URL（优先）或脑图 URL 末段做临时标题占位
     const seedUrl = prdUrl || mindmapUrl || ''
@@ -1214,6 +1238,7 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
         uploading: true,
         uploadStage: 'starting',
         uploadProgress: '',
+        larkFailure: null,
         uploadResult: null,
         confirmedModuleName: null,
         confirmedCasePrefix: null,
@@ -1301,9 +1326,13 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
         onAssistantMessage: (msg) => {
           patchSession(startSid, prev => ({ messages: [...prev.messages, msg] }))
         },
-        onError: (msg) => {
+        onError: (msg, meta) => {
           console.error('Lark import error:', msg)
           setCancel(startSid, null)
+          // 闸门/配额把请求挡在门外 vs 跑到一半流断了，是两种失败：前者原地重试就好，
+          // 不该再劝用户"可能是后端重启或网络中断"——那句话在这里纯属误导。
+          const rejected = isRejection(meta)
+          notifyLarkFailure(msg, rejected)
           // 这次是为导入新建的空会话、全程没收到任何内容、且后面没有脑图阶段要跑
           // → 直接删掉这个孤儿会话，避免反复重试在左侧堆积同名空会话。
           if (createdNewSid && !gotContent && !mindmapUrl) {
@@ -1318,13 +1347,15 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
             resolve()
             return
           }
-          // 流被中断（后端重启 / 网络断）时给用户一条可见提示，避免聊天区静默变空白。
           patchSession(startSid, prev => ({
             uploading: false, uploadStage: null, uploadProgress: '',
+            larkFailure: { message: msg, urls, rejected },
             messages: [...prev.messages, {
               id: Date.now(),
               role: 'assistant',
-              content: `❌ 飞书导入中断：${msg}\n\n可能是后端重启或网络中断，请重新点击导入重试。`,
+              content: rejected
+                ? `❌ 飞书导入未开始：${msg}`
+                : `❌ 飞书导入中断：${msg}\n\n可能是后端重启或网络中断，请重新点击导入重试。`,
               created_at: new Date().toISOString(),
             }],
           }))
@@ -1357,6 +1388,7 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
         uploading: true,
         uploadStage: 'starting',
         uploadProgress: '',
+        larkFailure: null,
         uploadMindmap: null,
         confirmedModuleName: null,
         confirmedCasePrefix: null,
@@ -1425,14 +1457,19 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
         onAssistantMessage: (msg) => {
           patchSession(startSid, prev => ({ messages: [...prev.messages, msg] }))
         },
-        onError: (msg) => {
+        onError: (msg, meta) => {
           console.error('Lark mindmap import error:', msg)
+          const rejected = isRejection(meta)
+          notifyLarkFailure(msg, rejected)
           patchSession(startSid, prev => ({
             uploading: false, uploadStage: null, uploadProgress: '',
+            larkFailure: { message: msg, urls, rejected },
             messages: [...prev.messages, {
               id: Date.now(),
               role: 'assistant',
-              content: `❌ 飞书脑图导入中断：${msg}\n\n可能是后端重启或网络中断，请重新点击导入重试。`,
+              content: rejected
+                ? `❌ 飞书脑图导入未开始：${msg}`
+                : `❌ 飞书脑图导入中断：${msg}\n\n可能是后端重启或网络中断，请重新点击导入重试。`,
               created_at: new Date().toISOString(),
             }],
           }))
@@ -1452,6 +1489,9 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
     if (prdUrl) await runPrd(prdUrl)
     if (mindmapUrl) await runMindmap(mindmapUrl)
   }, [activeSessionId, sessions, patchSession, setCancel, handleModuleAutoClassified])
+
+  // 失败 toast / 提示条里的「重试」要重新跑 handleLarkImport 自己，靠 ref 打破自引用。
+  handleLarkImportRef.current = handleLarkImport
 
   const runGenerate = useCallback(async (
     sid: number,
@@ -1514,6 +1554,24 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
         patchSession(sid, {
           pendingGenerate: { documentId, mindmapDocumentId, moduleName, casePrefix, rounds },
         })
+        return
+      }
+
+      // 并发闸门 / 每日配额拦下（429）：这不是"可能已经跑完"，是压根没开跑。
+      // 直接把后端给的原因告诉用户，并保留入参让他稍后点「继续生成」重试。
+      const status = (err as { response?: { status?: number } })?.response?.status
+      if (status === 429) {
+        const detail = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail
+        showGateBlocked(detail ?? '当前使用人数较多，请稍后再试。')
+        patchSession(sid, prev => ({
+          pendingGenerate: { documentId, mindmapDocumentId, moduleName, casePrefix, rounds },
+          messages: [...prev.messages, {
+            id: -Date.now(),
+            role: 'assistant',
+            content: `⏳ ${detail ?? '当前使用人数较多，请稍后再试。'}`,
+            created_at: new Date().toISOString(),
+          } as IChatMessage],
+        }))
         return
       }
 
@@ -1622,6 +1680,10 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
     mindmapDocumentId: number | null,
     knowledgeIds: number[] | null,
   ) => {
+    // 闸门可能把这次澄清直接挡回来（429，任务根本没开始跑）。那种情况要把下面刚关掉的
+    // 知识审核面板原样放回去——否则 UI 会掉回「资料已就绪」，用户等于被打回起点重走一遍。
+    const previewSnapshot = taskMapRef.current[sid]?.knowledgePreview ?? null
+
     // 把 knowledgePreview 关掉 + 切到一个"正在跑澄清"的 followupActive 视觉态（复用现有 amber loader）
     // 同时记住澄清阶段对知识注入的选择，生成时原样沿用（不再在生成前二次确认）。
     patchSession(sid, {
@@ -1661,6 +1723,7 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
             currentRound: 1,
             followupActive: false,
             followupBuffer: '',
+            restoredAnswers: null,
           }))
 
           // 首轮澄清即"无遗留疑点/可直接生成"：与追问路径（handleClarificationConfirm）
@@ -1680,10 +1743,19 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
         onAssistantMessage: (msg) => {
           patchSession(sid, prev => ({ messages: [...prev.messages, msg] }))
         },
-        onError: (msg) => {
+        onError: (msg, meta) => {
           console.error('Initial clarification error:', msg)
-          patchSession(sid, { followupActive: false, followupBuffer: '' })
           setCancel(sid, null)
+          if (isRejection(meta)) {
+            // 原地还原到「知识审核」这一步，用户再点一次确认就能重试，不用从头传文档。
+            showGateBlocked(msg)
+            patchSession(sid, {
+              followupActive: false, followupBuffer: '', knowledgePreview: previewSnapshot,
+            })
+            return
+          }
+          toast.error(`澄清失败：${msg}`)
+          patchSession(sid, { followupActive: false, followupBuffer: '' })
         },
         onDone: () => {
           patchSession(sid, { followupActive: false })
@@ -1722,10 +1794,14 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
       onAssistantMessage: (msg) => {
         patchSession(sid, prev => ({ messages: [...prev.messages, msg] }))
       },
-      onError: (msg) => {
+      onError: (msg, meta) => {
         console.error('Pipeline start error:', msg)
+        // 之前这里只是把 loading 关掉，界面转完圈原样回到「资料已就绪」——用户完全看不出
+        // 发生了什么（尤其被并发闸门挡回来时）。必须给一条明确的提示。
         patchSession(sid, { pipelineStarting: false })
         setCancel(sid, null)
+        if (isRejection(meta)) showGateBlocked(msg)
+        else toast.error(`开始生成失败：${msg}`)
       },
       onDone: () => {
         patchSession(sid, { pipelineStarting: false })
@@ -1808,16 +1884,31 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
               currentQuestions: newQs,
               currentSummary: res.clarification.summary || '',
               currentRound: res.round,
+              restoredAnswers: null,
             })
           }
         },
         onAssistantMessage: (msg) => {
           patchSession(sid, prev => ({ messages: [...prev.messages, msg] }))
         },
-        onError: (msg) => {
+        onError: (msg, meta) => {
           console.error('Follow-up error:', msg)
           setCancel(sid, null)
-          // 追问出错兜底：直接沿用澄清阶段的知识选择生成，避免流程卡死
+          if (isRejection(meta)) {
+            // 闸门挡回来 = 这一轮追问根本没跑。不能走下面的「兜底直接生成」——那等于
+            // 拿一次 429 换掉用户还没提的追问轮。把这一轮回滚，面板带着已填答案放回来。
+            showGateBlocked(msg)
+            patchSession(sid, {
+              followupActive: false,
+              followupBuffer: '',
+              clarificationRounds: cur.clarificationRounds,
+              currentQuestions: cur.currentQuestions,
+              restoredAnswers: newRound.answers,
+            })
+            return
+          }
+          // 追问真出错（模型/网络）时的兜底：直接沿用澄清阶段的知识选择生成，避免流程卡死
+          toast.error(`追问失败，已跳过追问直接生成：${msg}`)
           runGenerate(sid, prdDocId, mindmapDocId, updatedRounds, lockedModule, lockedPrefix, clarifyIds)
         },
         onDone: () => {
@@ -1871,6 +1962,7 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
             currentRound: 1,
             followupActive: false,
             followupBuffer: '',
+            restoredAnswers: null,
             // 首轮即无疑点 → 直接就绪，露出生成卡；否则等用户答完澄清面板
             mindmapReadyToGenerate: readyNow,
           }))
@@ -1878,11 +1970,23 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
         onAssistantMessage: (msg) => {
           patchSession(sid, prev => ({ messages: [...prev.messages, msg] }))
         },
-        onError: (msg) => {
+        onError: (msg, meta) => {
           console.error('Mindmap initial clarification error:', msg)
-          // 澄清失败不该卡死流程：退化为"跳过澄清，允许直接生成"
-          patchSession(sid, { followupActive: false, followupBuffer: '', mindmapReadyToGenerate: true })
           setCancel(sid, null)
+          if (isRejection(meta)) {
+            // 被闸门挡回来 ≠ 澄清跑不出来。不能退化成"跳过澄清直接生成"——那是拿一次
+            // 429 把整个澄清环节吞掉。停在原地，并给一个「重试」入口：脑图模式下这一步
+            // 没有别的按钮可点，不给入口用户就卡死在这儿了。
+            showGateBlocked(msg, {
+              label: '重试澄清',
+              onClick: () => startMindmapClarificationRef.current?.(sid, documentId),
+            })
+            patchSession(sid, { followupActive: false, followupBuffer: '' })
+            return
+          }
+          // 澄清失败不该卡死流程：退化为"跳过澄清，允许直接生成"
+          toast.error(`澄清失败，已跳过澄清：${msg}`)
+          patchSession(sid, { followupActive: false, followupBuffer: '', mindmapReadyToGenerate: true })
         },
         onDone: () => {
           patchSession(sid, { followupActive: false })
@@ -1955,16 +2059,29 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
               currentSummary: res.clarification.summary || '',
               currentRound: res.round,
               followupActive: false,
+              restoredAnswers: null,
             })
           }
         },
         onAssistantMessage: (msg) => {
           patchSession(sid, prev => ({ messages: [...prev.messages, msg] }))
         },
-        onError: (msg) => {
+        onError: (msg, meta) => {
           console.error('Mindmap follow-up error:', msg)
           setCancel(sid, null)
+          if (isRejection(meta)) {
+            // 同上：闸门挡回来就把这一轮放回去，别把追问吞掉
+            showGateBlocked(msg)
+            patchSession(sid, {
+              followupActive: false,
+              clarificationRounds: cur.clarificationRounds,
+              currentQuestions: cur.currentQuestions,
+              restoredAnswers: newRound.answers,
+            })
+            return
+          }
           // 追问出错也允许生成，避免静默卡住
+          toast.error(`追问失败，已跳过追问：${msg}`)
           patchSession(sid, { followupActive: false, currentQuestions: null, mindmapReadyToGenerate: true })
         },
         onDone: () => {
@@ -2239,6 +2356,51 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
             </div>
           )}
 
+          {/* 飞书导入失败提示条。弹框/toast 关掉之后这条留在原地，用户随时能点「重试」；
+              被并发闸门挡下（rejected）时不提"网络中断"，那句话在这种失败下是误导。 */}
+          {active.larkFailure && (
+            <div className={`rounded-xl border p-4 flex items-start gap-3 ${
+              active.larkFailure.rejected
+                ? 'border-amber-200 bg-amber-50/70'
+                : 'border-red-200 bg-red-50/70'
+            }`}>
+              <AlertTriangle
+                size={16}
+                className={`flex-shrink-0 mt-0.5 ${active.larkFailure.rejected ? 'text-amber-500' : 'text-red-500'}`}
+              />
+              <div className="flex-1 min-w-0">
+                <p className="text-sm font-medium text-gray-800 mb-0.5">
+                  {active.larkFailure.rejected ? '飞书导入未开始' : '飞书导入中断'}
+                </p>
+                <p className="text-xs text-gray-600 leading-relaxed">
+                  {active.larkFailure.message}
+                  {!active.larkFailure.rejected && '（可能是后端重启或网络中断）'}
+                </p>
+              </div>
+              <div className="flex items-center gap-2 flex-shrink-0">
+                <button
+                  type="button"
+                  onClick={() => {
+                    const f = active.larkFailure
+                    if (!f) return
+                    void handleLarkImport(f.urls)
+                  }}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs text-white bg-gray-800 rounded-full hover:bg-gray-700"
+                >
+                  <RotateCcw size={12} /> 重试
+                </button>
+                <button
+                  type="button"
+                  onClick={() => { if (activeSessionId != null) patchSession(activeSessionId, { larkFailure: null }) }}
+                  className="text-gray-400 hover:text-gray-600"
+                  aria-label="关闭"
+                >
+                  <X size={14} />
+                </button>
+              </div>
+            </div>
+          )}
+
           {/* 「开始生成」闸门：上传只暂存文档，用户备齐资料后点它才进入下游流程
               （模块归类 → 知识审核 → 澄清 → 生成用例）。只在"有暂存文档、且下游流程尚未启动"时显示。 */}
           {active.mode !== 'mindmap' && (active.uploadResult || active.uploadMindmap)
@@ -2283,6 +2445,7 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
                   ? '提交回答并生成测试用例'
                   : '提交回答，让大模型判断是否还需要继续澄清'
               }
+              initialAnswers={active.restoredAnswers ?? undefined}
               onConfirm={handleClarificationConfirm}
             />
           )}
@@ -2395,6 +2558,7 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
                   ? '提交回答并生成测试脑图'
                   : '提交回答，让大模型判断是否还需要继续澄清'
               }
+              initialAnswers={active.restoredAnswers ?? undefined}
               onConfirm={handleMindmapClarificationConfirm}
             />
           )}

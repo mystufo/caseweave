@@ -461,7 +461,21 @@ Docker 数据卷为 `pg_data`（`docker volume ls` 可见），删除 compose �
 - **数据库密码**：默认 `caseweave/caseweave` 仅供开发，生产请改强密码，并同步更新 `docker-compose.yml` 的 `POSTGRES_PASSWORD` 与 `.env` 的 `DATABASE_URL`。
 - **后端热重载**：当前 `backend/Dockerfile` 的启动命令带 `--reload` 且 compose 挂载了源码目录（便于开发）。生产环境建议：
   - 去掉 `docker-compose.yml` 中 backend 的 `volumes` 挂载（`./backend:/app` 等）；
-  - 把 Dockerfile 的 `CMD` 改为不带 `--reload`，并可加 `--workers 2`（如 `uvicorn app.main:app --host 0.0.0.0 --port 8001 --workers 2`）。
+  - 把 Dockerfile 的 `CMD` 改为不带 `--reload`（如 `uvicorn app.main:app --host 0.0.0.0 --port 8001`）。
+  - ⚠️ **别加 `--workers`**：并发闸门（见下条）是进程内信号量，多 worker 下每个进程各有一份，
+    实际全局并发会变成 `LLM_MAX_CONCURRENCY × worker 数`，闸门形同虚设。真要多 worker，
+    先把 `LLM_MAX_CONCURRENCY` 除以 worker 数，或把 `app/limits.py` 的 `LLMGate` 换成 Redis 实现。
+    （另：多 worker 还要求 `JWT_SECRET` 必须显式配置，否则各 worker 密钥不同、登录直接不可用。）
+- **并发与成本控制**（公网开放给同事用时必看）：`.env` 里有三层管控，默认值偏保守，按实际情况调：
+  - `LLM_MAX_CONCURRENCY=3` — 全局同时在跑的大模型任务数，压的是**峰值**（服务器资源 + provider 侧限流）。
+  - `LLM_MAX_CONCURRENCY_PER_USER=1` — 单账号同时最多一个任务，超了立刻 429。防一个人开多标签页霸占名额。
+  - `DAILY_TOKEN_QUOTA=0` — 单账号每日 token 上限，**0 = 不限**。⚠️ 只有这层能真正封顶成本，
+    并发只压峰值不压总量。建议先留 0 跑几天，用 `GET /api/limits/usage?days=7`（管理员）
+    看真实分布再定值。参考量级：一次「30000 字 PRD → 澄清 + 生成」约 5~8 万 token。
+  - 调参依据：`curl http://<host>:8001/health` 看 `gate.waiting`，长期 >0 说明卡在全局并发可以上调；
+    provider 开始返 429/超时说明调过头了。
+  - 用 OpenAI 兼容网关（火山方舟/DeepSeek 等）时保持 `LLM_STREAM_USAGE=true`，否则流式调用的
+    token 统计不到、配额会漏算；个别网关不认 `stream_options` 参数会直接报错，那就置 false。
 - **防火墙**：仅对外开放需要的端口。走 A.7/B.6 的统一 Nginx 时，只需放行 80/443，把 8001、5432 限制在本机。
 - **LLM 超时**：文档较长、用思考型模型时，若出现「正在抽取产品知识…」一直转圈，调大 `.env` 的 `LLM_TIMEOUT_SECONDS`。
 - **飞书文档导入**（可选功能）：依赖 `lark-cli`。Docker 部署下后端在容器里，配置较特殊，见下方「附录：飞书文档导入（lark-cli）配置」。不使用该功能可忽略。

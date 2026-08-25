@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.agents.skill_generator import generate_skill_for_module
 from app.agents.clarifier import _sanitize_case_prefix
 from app.auth import get_current_user, require_project
+from app.limits import Ticket, llm_slot
 from app.database import get_db
 from app.knowledge.store import search_relevant, store_entries, KnowledgeDraft, log_miss_diagnostics
 from app.config import get_settings
@@ -1076,7 +1077,7 @@ class SkillRegenerateRequest(BaseModel):
 async def regenerate_skill(
     body: SkillRegenerateRequest,
     project_id: int = Depends(require_project),
-    _user: User = Depends(get_current_user),
+    _slot: Ticket = Depends(llm_slot),  # 并发闸门 + 每日配额（Skill 归纳要调 LLM）
     db: AsyncSession = Depends(get_db),
 ):
     """根据该模块最近的 edit 反馈分析 + 用户反馈衍生的知识条目，LLM 归纳一份 Skill。

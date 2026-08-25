@@ -13,6 +13,9 @@ interface Props {
   lockedCasePrefix?: string  // when present (round > 1), prefix input is hidden
   hideCasePrefix?: boolean   // 脑图模式：用例编号前缀无意义，隐藏该输入并从就绪校验中剔除
   confirmLabel?: string  // e.g. "继续澄清" vs "生成测试用例"
+  // 回填上一次已填的答案（qid → 答案文本）。用于「提交后被并发闸门 429 挡回来」这种
+  // 请求根本没跑的情况：面板重新挂载时把用户填过的内容原样放回去，不用重答一遍。
+  initialAnswers?: Record<string, string>
   onConfirm: (answers: Record<string, string>, moduleName: string, casePrefix: string) => void
 }
 
@@ -32,9 +35,22 @@ type ChoiceState = { selected: string | null; custom: string }
 export default function ClarificationPanel({
   questions, summary, suggestedModule, suggestedPrefix,
   round, maxRounds, lockedModuleName, lockedCasePrefix, hideCasePrefix, confirmLabel,
+  initialAnswers,
   onConfirm,
 }: Props) {
-  const [choices, setChoices] = useState<Record<string, ChoiceState>>({})
+  // 回填：答案文本命中该题候选项就当"选中候选"，否则当"自定义输入"。
+  const [choices, setChoices] = useState<Record<string, ChoiceState>>(() => {
+    if (!initialAnswers) return {}
+    const restored: Record<string, ChoiceState> = {}
+    questions.forEach(q => {
+      const text = initialAnswers[String(q.id)]
+      if (!text) return
+      restored[String(q.id)] = (q.options ?? []).includes(text)
+        ? { selected: text, custom: '' }
+        : { selected: null, custom: text }
+    })
+    return restored
+  })
   const [moduleName, setModuleName] = useState(lockedModuleName ?? suggestedModule ?? '')
   const [casePrefix, setCasePrefix] = useState((lockedCasePrefix ?? suggestedPrefix ?? '').toUpperCase())
 

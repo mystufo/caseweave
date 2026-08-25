@@ -1377,8 +1377,56 @@ CaseWeave（纬策） — 开发进度记录
   POST   /api/prompts/suggestions/{id}/dismiss    忽略建议
   （采用建议无独立端点：走 POST /prompts/{key}/versions，可带 from_suggestion_id 标 adopted）
 
+  — 并发闸门 / 用量（控成本）—
+  GET    /api/limits/status         当前用户配额余量 + 全局闸门实时状态
+  GET    /api/limits/usage?days=N   近 N 天 token 用量（按用户 / 按天聚合，仅管理员）
+
   — 系统 —
-  GET    /health                    健康检查
+  GET    /health                    健康检查（附带 gate 实时状态：running / waiting / limit）
+
+================================================================================
+并发闸门与每日配额（公网部署控成本）
+================================================================================
+  背景：服务部署到公网后访问量上来，大模型调用是成本大头。三层管控，从外到内：
+
+  1) 每账号并发（LLM_MAX_CONCURRENCY_PER_USER，默认 1）
+     同一账号同时最多跑 N 个重任务，超了**立刻 429**、不排队。
+     防的是「一个人开五个标签页把全局名额占满」，直接报错比让他自己排自己更直观。
+
+  2) 全局并发（LLM_MAX_CONCURRENCY，默认 3）
+     整台机器同时最多 M 个重任务在调 LLM，超了进 FIFO 队列。
+     队列满（LLM_QUEUE_SIZE）或等待超时（LLM_QUEUE_TIMEOUT_SECONDS）才 429。
+     SSE 接口排队期间持续推 `queued` 帧，前端显示「前面还有 N 个任务」。
+
+  3) 每日 token 配额（DAILY_TOKEN_QUOTA，默认 0=不限）
+     按 daily_usage 表当天已用 token 判定。**并发只压峰值、不压总量，这层才真正封顶成本。**
+     判定在任务开始前 → 软封顶，最后一个任务可能小幅超出。管理员默认豁免
+     （QUOTA_EXEMPT_ADMINS）。按 QUOTA_RESET_UTC_OFFSET_HOURS 的自然日翻篇（默认北京时间 00:00）。
+
+  实现：backend/app/limits.py（闸门）+ backend/app/usage.py（记账）
+  - 进程内信号量，不引 Redis：后端是单进程 uvicorn，进程内状态就是全局状态。
+    将来要开 --workers，把 LLMGate 换成 Redis 实现即可，调用方不用改。
+  - 记账挂在 agents/llm_factory 的 LangChain 回调上 → 所有 LLM 调用自动计入，
+    新增 agent 不需要额外接线。归属靠 ContextVar，在 auth.get_current_user 里统一设置，
+    请求派生的后台任务（反馈 diff 分析等）自动记到同一个人头上。
+  - 后台任务（反馈分析、prompt 建议巡检）走 background_slot 虚拟账号：受全局并发约束、
+    排在真实用户后面，但不占真人的单账号名额；取不到名额就跳过本轮（fail-open）。
+
+  受管控的接口（其余纯读接口不受影响）：
+    /api/chat  /api/generate  /api/upload  /api/upload/lark/stream
+    /api/pipeline/start/stream  /api/clarify/initial/stream  /api/clarify/followup/stream
+    /api/documents/extract_combined_drafts  /api/mindmap/generate
+    /api/skills/regenerate  /api/prompts/{key}/suggestions/generate
+
+  调参怎么看：
+    curl http://<host>:8001/health  → gate.waiting 长期 >0 说明卡在全局并发，可上调；
+    provider 开始返 429/超时说明调过头了。
+    GET /api/limits/usage?days=7  → 看 token 花在谁身上，再定 DAILY_TOKEN_QUOTA。
+    参考量级：一次「30000 字 PRD → 澄清 + 生成」约 5~8 万 token。
+
+  ⚠️ OpenAI 兼容网关的流式调用要 stream_options.include_usage 才回 token 数
+     （LLM_STREAM_USAGE=true，默认开）。个别网关不认这个参数会直接报错，遇到就置 false，
+     代价是流式调用统计不到 token、配额会漏算。Anthropic 原生协议不受影响。
 
 ================================================================================
 快速启动

@@ -271,7 +271,7 @@ export interface UploadStreamCallbacks {
   // 用户没指定模块、后端 LLM 自动归类：高置信度直接 applied=true（已落库）；
   // 中等置信度 applied=false，前端弹"建议归类到 XX，是否采用？"
   onModuleAutoClassified?: (payload: ModuleAutoClassifiedPayload) => void
-  onError: (message: string) => void
+  onError: (message: string, meta?: StreamErrorMeta) => void
   onDone: () => void
 }
 
@@ -366,6 +366,54 @@ export interface StagedPayload {
   url?: string
   cached?: boolean
 }
+// SSE 流出错的附带信息。关键是 `rejected`：并发闸门/配额把请求**挡在门外**（任务根本没开始跑）
+// 与「跑到一半流断了」是两种完全不同的失败——前者原地重试即可，UI 不该回退已经走到的流程步骤，
+// 也不该提示"后端重启或网络中断"。上层据此决定 toast 文案与要不要复位状态。
+export interface StreamErrorMeta {
+  status?: number   // HTTP 状态码（仅 SSE 建连阶段失败时有）
+  code?: string     // 后端 X-Limit-Code / error 帧的 code
+  rejected?: boolean
+}
+
+// 与 backend/app/limits.py 的 ServiceBusy code 一一对应。
+const LIMIT_CODES = new Set([
+  'per_user_concurrency',  // 你自己已有任务在跑
+  'queue_full',            // 全局队列满
+  'queue_timeout',         // 排队等太久（也可能以 SSE error 帧的形式到达）
+  'daily_quota',           // 今日 token 配额用尽
+])
+
+export function isRejection(meta?: StreamErrorMeta): boolean {
+  return meta?.rejected === true
+}
+
+// SSE 端点的非 2xx 响应：后端把原因放在 JSON 的 detail 里（并发闸门的 429 尤其需要），
+// 只显示 "HTTP 429" 用户根本不知道发生了什么。读不出来才退回状态码。
+async function sseHttpError(res: Response): Promise<{ message: string; meta: StreamErrorMeta }> {
+  const code = res.headers.get('X-Limit-Code') ?? undefined
+  const meta: StreamErrorMeta = {
+    status: res.status,
+    code,
+    rejected: res.status === 429 || (code != null && LIMIT_CODES.has(code)),
+  }
+  try {
+    const body = await res.json()
+    const detail = (body as { detail?: string })?.detail
+    if (detail) return { message: detail, meta }
+  } catch {
+    // 非 JSON 响应，忽略
+  }
+  if (res.status === 429) return { message: '当前使用人数较多，请稍后再试。', meta }
+  return { message: `HTTP ${res.status}`, meta }
+}
+
+// SSE error 帧（流已经建起来才发生的失败，例如排队等待超时）也可能带 limit code。
+function frameErrorMeta(payload: { code?: string }): StreamErrorMeta | undefined {
+  const code = payload?.code
+  if (!code) return undefined
+  return { code, rejected: LIMIT_CODES.has(code) }
+}
+
 export function streamUpload(
   file: File,
   sessionId: number,
@@ -386,7 +434,8 @@ export function streamUpload(
     signal: controller.signal,
   }).then(async res => {
     if (!res.ok || !res.body) {
-      callbacks.onError(`HTTP ${res.status}`)
+      const e = await sseHttpError(res)
+      callbacks.onError(e.message, e.meta)
       return
     }
 
@@ -409,7 +458,11 @@ export function streamUpload(
         if (!line) continue
         try {
           const payload = JSON.parse(line.slice(6))
-          if (payload.type === 'stage') {
+          if (payload.type === 'queued') {
+            // 并发闸门排队中：复用 stage 通道显示进度，前面还有几个人一并告诉用户
+            const pos = payload.position ? `（前面还有 ${payload.position} 个任务）` : ''
+            callbacks.onStage('queued', `${payload.message}${pos}`)
+          } else if (payload.type === 'stage') {
             callbacks.onStage(payload.stage, payload.message)
           } else if (payload.type === 'token') {
             callbacks.onToken(payload.content)
@@ -433,7 +486,7 @@ export function streamUpload(
             callbacks.onModuleAutoClassified?.(rest as ModuleAutoClassifiedPayload)
           } else if (payload.type === 'error') {
             sawTerminal = true
-            callbacks.onError(payload.message)
+            callbacks.onError(payload.message, frameErrorMeta(payload))
           } else if (payload.type === 'done') {
             sawTerminal = true
             callbacks.onDone()
@@ -476,7 +529,8 @@ export function streamLarkImport(
     signal: controller.signal,
   }).then(async res => {
     if (!res.ok || !res.body) {
-      callbacks.onError(`HTTP ${res.status}`)
+      const e = await sseHttpError(res)
+      callbacks.onError(e.message, e.meta)
       return
     }
 
@@ -498,7 +552,11 @@ export function streamLarkImport(
         if (!line) continue
         try {
           const payload = JSON.parse(line.slice(6))
-          if (payload.type === 'stage') {
+          if (payload.type === 'queued') {
+            // 并发闸门排队中：复用 stage 通道显示进度，前面还有几个人一并告诉用户
+            const pos = payload.position ? `（前面还有 ${payload.position} 个任务）` : ''
+            callbacks.onStage('queued', `${payload.message}${pos}`)
+          } else if (payload.type === 'stage') {
             callbacks.onStage(payload.stage, payload.message)
           } else if (payload.type === 'token') {
             callbacks.onToken(payload.content)
@@ -522,7 +580,7 @@ export function streamLarkImport(
             callbacks.onModuleAutoClassified?.(rest as ModuleAutoClassifiedPayload)
           } else if (payload.type === 'error') {
             sawTerminal = true
-            callbacks.onError(payload.message)
+            callbacks.onError(payload.message, frameErrorMeta(payload))
           } else if (payload.type === 'done') {
             sawTerminal = true
             callbacks.onDone()
@@ -569,7 +627,8 @@ export function streamMindmapUpload(
     signal: controller.signal,
   }).then(async res => {
     if (!res.ok || !res.body) {
-      callbacks.onError(`HTTP ${res.status}`)
+      const e = await sseHttpError(res)
+      callbacks.onError(e.message, e.meta)
       return
     }
 
@@ -591,7 +650,11 @@ export function streamMindmapUpload(
         if (!line) continue
         try {
           const payload = JSON.parse(line.slice(6))
-          if (payload.type === 'stage') {
+          if (payload.type === 'queued') {
+            // 并发闸门排队中：复用 stage 通道显示进度，前面还有几个人一并告诉用户
+            const pos = payload.position ? `（前面还有 ${payload.position} 个任务）` : ''
+            callbacks.onStage('queued', `${payload.message}${pos}`)
+          } else if (payload.type === 'stage') {
             callbacks.onStage(payload.stage, payload.message)
           } else if (payload.type === 'token') {
             callbacks.onToken(payload.content)
@@ -615,7 +678,7 @@ export function streamMindmapUpload(
             callbacks.onModuleAutoClassified?.(rest as ModuleAutoClassifiedPayload)
           } else if (payload.type === 'error') {
             sawTerminal = true
-            callbacks.onError(payload.message)
+            callbacks.onError(payload.message, frameErrorMeta(payload))
           } else if (payload.type === 'done') {
             sawTerminal = true
             callbacks.onDone()
@@ -668,7 +731,8 @@ export function streamPipelineStart(
     signal: controller.signal,
   }).then(async res => {
     if (!res.ok || !res.body) {
-      callbacks.onError(`HTTP ${res.status}`)
+      const e = await sseHttpError(res)
+      callbacks.onError(e.message, e.meta)
       return
     }
 
@@ -690,7 +754,11 @@ export function streamPipelineStart(
         if (!line) continue
         try {
           const payload = JSON.parse(line.slice(6))
-          if (payload.type === 'stage') {
+          if (payload.type === 'queued') {
+            // 并发闸门排队中：复用 stage 通道显示进度，前面还有几个人一并告诉用户
+            const pos = payload.position ? `（前面还有 ${payload.position} 个任务）` : ''
+            callbacks.onStage('queued', `${payload.message}${pos}`)
+          } else if (payload.type === 'stage') {
             callbacks.onStage(payload.stage, payload.message)
           } else if (payload.type === 'token') {
             callbacks.onToken(payload.content)
@@ -706,7 +774,7 @@ export function streamPipelineStart(
             callbacks.onModuleAutoClassified?.(rest as ModuleAutoClassifiedPayload)
           } else if (payload.type === 'error') {
             sawTerminal = true
-            callbacks.onError(payload.message)
+            callbacks.onError(payload.message, frameErrorMeta(payload))
           } else if (payload.type === 'done') {
             sawTerminal = true
             callbacks.onDone()
@@ -752,7 +820,8 @@ export function streamInitialClarification(
     signal: controller.signal,
   }).then(async res => {
     if (!res.ok || !res.body) {
-      callbacks.onError(`HTTP ${res.status}`)
+      const e = await sseHttpError(res)
+      callbacks.onError(e.message, e.meta)
       return
     }
     const reader = res.body.getReader()
@@ -770,7 +839,11 @@ export function streamInitialClarification(
         if (!line) continue
         try {
           const payload = JSON.parse(line.slice(6))
-          if (payload.type === 'stage') {
+          if (payload.type === 'queued') {
+            // 并发闸门排队中：复用 stage 通道显示进度，前面还有几个人一并告诉用户
+            const pos = payload.position ? `（前面还有 ${payload.position} 个任务）` : ''
+            callbacks.onStage('queued', `${payload.message}${pos}`)
+          } else if (payload.type === 'stage') {
             callbacks.onStage(payload.stage, payload.message)
           } else if (payload.type === 'token') {
             callbacks.onToken(payload.content)
@@ -781,7 +854,7 @@ export function streamInitialClarification(
           } else if (payload.type === 'assistant_message') {
             callbacks.onAssistantMessage?.(payload.message as ChatMessage)
           } else if (payload.type === 'error') {
-            callbacks.onError(payload.message)
+            callbacks.onError(payload.message, frameErrorMeta(payload))
           } else if (payload.type === 'done') {
             callbacks.onDone()
           }
@@ -824,7 +897,7 @@ export interface FollowupCallbacks {
   onToken: (text: string) => void
   onResult: (result: FollowupResult) => void
   onAssistantMessage?: (msg: ChatMessage) => void
-  onError: (message: string) => void
+  onError: (message: string, meta?: StreamErrorMeta) => void
   onDone: () => void
 }
 
@@ -855,7 +928,8 @@ export function streamFollowupClarification(
     signal: controller.signal,
   }).then(async res => {
     if (!res.ok || !res.body) {
-      callbacks.onError(`HTTP ${res.status}`)
+      const e = await sseHttpError(res)
+      callbacks.onError(e.message, e.meta)
       return
     }
     const reader = res.body.getReader()
@@ -873,7 +947,11 @@ export function streamFollowupClarification(
         if (!line) continue
         try {
           const payload = JSON.parse(line.slice(6))
-          if (payload.type === 'stage') {
+          if (payload.type === 'queued') {
+            // 并发闸门排队中：复用 stage 通道显示进度
+            const pos = payload.position ? `（前面还有 ${payload.position} 个任务）` : ''
+            callbacks.onStage('queued', `${payload.message}${pos}`)
+          } else if (payload.type === 'stage') {
             callbacks.onStage(payload.stage, payload.message, payload.round, payload.max_rounds)
           } else if (payload.type === 'token') {
             callbacks.onToken(payload.content)
@@ -884,7 +962,7 @@ export function streamFollowupClarification(
           } else if (payload.type === 'assistant_message') {
             callbacks.onAssistantMessage?.(payload.message as ChatMessage)
           } else if (payload.type === 'error') {
-            callbacks.onError(payload.message)
+            callbacks.onError(payload.message, frameErrorMeta(payload))
           } else if (payload.type === 'done') {
             callbacks.onDone()
           }
@@ -1261,7 +1339,7 @@ export function streamChat(
   sessionId: number | null,
   onText: (text: string) => void,
   onDone: (newSessionId: number) => void,
-  onError: (err: string) => void,
+  onError: (err: string, meta?: StreamErrorMeta) => void,
 ): () => void {
   const controller = new AbortController()
 
@@ -1272,7 +1350,8 @@ export function streamChat(
     signal: controller.signal,
   }).then(async res => {
     if (!res.ok || !res.body) {
-      onError(`HTTP ${res.status}`)
+      const e = await sseHttpError(res)
+      onError(e.message, e.meta)
       return
     }
 
@@ -1291,12 +1370,16 @@ export function streamChat(
           const payload = JSON.parse(line.slice(6))
           if (payload.type === 'session') {
             resolvedSessionId = payload.session_id
+          } else if (payload.type === 'queued') {
+            // 并发闸门排队中：chat 没有独立进度通道，直接当正文推一行提示
+            const pos = payload.position ? `（前面还有 ${payload.position} 个任务）` : ''
+            onText(`⏳ ${payload.message}${pos}\n`)
           } else if (payload.type === 'text') {
             onText(payload.content)
           } else if (payload.type === 'done') {
             onDone(resolvedSessionId)
           } else if (payload.type === 'error') {
-            onError(payload.content)
+            onError(payload.content, frameErrorMeta(payload))
           }
         } catch {
           // ignore parse errors on partial lines

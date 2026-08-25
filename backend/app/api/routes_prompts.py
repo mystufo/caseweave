@@ -20,6 +20,7 @@ from sqlalchemy.sql import func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import get_current_user, require_project
+from app.limits import Ticket, llm_slot
 from app.database import get_db
 from app.models.feedback import Feedback, TestCase, FeedbackConsumption
 from app.models.knowledge import PromptSuggestion, PromptVersion
@@ -422,7 +423,7 @@ async def reset_prompt_to_default(
 async def generate_prompt_suggestion(
     key: str,
     project_id: int = Depends(require_project),
-    _user: User = Depends(get_current_user),
+    _slot: Ticket = Depends(llm_slot),  # 并发闸门 + 每日配额（提示词优化要调 LLM）
     db: AsyncSession = Depends(get_db),
 ):
     """分析该项目 generator 的负反馈，产出一条 pending 改进建议（不激活）。

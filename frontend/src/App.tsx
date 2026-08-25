@@ -12,6 +12,8 @@ import {
   type AuthUser, type Project,
 } from './api/client'
 import { Loader2, LogOut, FolderOpen } from 'lucide-react'
+import { ToastHost } from './components/Toast'
+import { AlertDialogHost } from './components/AlertDialog'
 import './index.css'
 
 type Phase = 'booting' | 'login' | 'picker' | 'app'
@@ -105,6 +107,8 @@ export default function App() {
 
   return (
     <div className="h-screen flex flex-col">
+      <ToastHost />
+      <AlertDialogHost />
       <header className="flex items-center justify-between px-4 py-1.5 bg-white border-b border-gray-200 text-xs flex-shrink-0">
         <div className="flex items-center gap-2 text-gray-600 min-w-0">
           <FolderOpen size={12} className="text-amber-500 flex-shrink-0" />

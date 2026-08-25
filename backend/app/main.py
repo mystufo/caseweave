@@ -17,6 +17,7 @@ from app.api.routes_feedback import router as feedback_router
 from app.api.routes_auth import router as auth_router
 from app.api.routes_projects import router as projects_router
 from app.api.routes_prompts import router as prompts_router
+from app.api.routes_limits import router as limits_router
 
 settings = get_settings()
 setup_logging("DEBUG" if settings.debug else "INFO", settings.log_file)
@@ -54,12 +55,16 @@ async def _prompt_suggestion_loop() -> None:
                     .distinct()
                 )).scalars().all()
 
+            from app.limits import background_slot
+
             for pid in project_ids:
                 try:
-                    async with AsyncSessionLocal() as db:
-                        r = await run_generator_suggestion(
-                            db, pid, min_samples=settings.prompt_suggestion_min_samples,
-                        )
+                    # 走闸门的后台通道：巡检自动排在真实用户后面，高峰期取不到名额就跳过本轮
+                    async with background_slot("prompt_suggestion"):
+                        async with AsyncSessionLocal() as db:
+                            r = await run_generator_suggestion(
+                                db, pid, min_samples=settings.prompt_suggestion_min_samples,
+                            )
                     if r.get("created"):
                         logger.info("后台生成 prompt 建议 | project=%s", pid)
                 except Exception as exc:  # noqa: BLE001
@@ -81,6 +86,16 @@ async def lifespan(app: FastAPI):
         )
     await init_db()
     logger.info("Database initialized")
+
+    from app.limits import llm_gate
+    logger.info(
+        "LLM 闸门 | 全局并发=%s 单账号并发=%s 队列=%s 等待上限=%.0fs 每日token配额=%s",
+        llm_gate.limit or "不限",
+        llm_gate.per_user or "不限",
+        llm_gate.queue_size or "不限",
+        llm_gate.wait_timeout,
+        settings.daily_token_quota or "不限",
+    )
 
     suggestion_task: asyncio.Task | None = None
     if settings.prompt_suggestion_interval_hours > 0:
@@ -115,6 +130,9 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    # 跨域下浏览器默认只让 JS 读到 safelisted 响应头。闸门的 429 靠 X-Limit-Code 区分
+    # 「被挡在门外（原地重试即可）」和「跑到一半断了」，不 expose 前端就永远读不到它。
+    expose_headers=["X-Limit-Code", "Retry-After"],
 )
 
 @app.middleware("http")
@@ -141,8 +159,10 @@ app.include_router(mindmap_router, prefix="/api", tags=["mindmap"])
 app.include_router(knowledge_router, prefix="/api", tags=["knowledge"])
 app.include_router(feedback_router, prefix="/api", tags=["feedback"])
 app.include_router(prompts_router, prefix="/api", tags=["prompts"])
+app.include_router(limits_router, prefix="/api", tags=["limits"])
 
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "caseweave"}
+    from app.limits import llm_gate
+    return {"status": "ok", "service": "caseweave", "gate": llm_gate.stats()}

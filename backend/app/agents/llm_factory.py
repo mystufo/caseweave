@@ -7,8 +7,22 @@ Supported providers:
 from typing import Any
 from langchain_core.language_models import BaseChatModel
 from app.config import get_settings
+from app.usage import UsageRecorder
 
 settings = get_settings()
+
+# 全站唯一的 token 记账回调。挂在这里而不是各 agent 里，是为了保证「所有 LLM 调用都被
+# 算进 daily_usage」这条不变量——新增 agent 只要走本工厂就自动记账，不会漏。
+# 归属靠 app/usage.py 的 ContextVar，请求入口（app/limits.py 的依赖）负责设置。
+_usage_recorder = UsageRecorder()
+
+
+def _shared_kwargs() -> dict[str, Any]:
+    return {
+        "timeout": settings.llm_timeout_seconds,
+        "max_retries": settings.llm_max_retries,
+        "callbacks": [_usage_recorder],
+    }
 
 
 def build_chat_model(*, max_tokens: int = 4096, temperature: float = 0.2) -> BaseChatModel:
@@ -22,8 +36,7 @@ def build_chat_model(*, max_tokens: int = 4096, temperature: float = 0.2) -> Bas
             "api_key": settings.llm_api_key,
             "max_tokens": max_tokens,
             "temperature": temperature,
-            "timeout": settings.llm_timeout_seconds,
-            "max_retries": settings.llm_max_retries,
+            **_shared_kwargs(),
         }
         if settings.llm_base_url:
             kwargs["base_url"] = settings.llm_base_url
@@ -36,8 +49,11 @@ def build_chat_model(*, max_tokens: int = 4096, temperature: float = 0.2) -> Bas
             "api_key": settings.llm_api_key,
             "max_tokens": max_tokens,
             "temperature": temperature,
-            "timeout": settings.llm_timeout_seconds,
-            "max_retries": settings.llm_max_retries,
+            # 流式调用默认不回 usage，要显式索要 stream_options.include_usage，否则
+            # /chat、/generate 这些流式接口的 token 会漏记、配额形同虚设。
+            # 个别兼容网关不认这个参数会直接报错，遇到就把 LLM_STREAM_USAGE 置 false。
+            "stream_usage": settings.llm_stream_usage,
+            **_shared_kwargs(),
         }
         if settings.llm_base_url:
             kwargs["base_url"] = settings.llm_base_url
@@ -72,8 +88,7 @@ def build_vision_model(*, max_tokens: int | None = None, temperature: float = 0.
             "api_key": api_key,
             "max_tokens": tokens,
             "temperature": temperature,
-            "timeout": settings.llm_timeout_seconds,
-            "max_retries": settings.llm_max_retries,
+            **_shared_kwargs(),
         }
         if base_url:
             kwargs["base_url"] = base_url
@@ -86,8 +101,8 @@ def build_vision_model(*, max_tokens: int | None = None, temperature: float = 0.
             "api_key": api_key,
             "max_tokens": tokens,
             "temperature": temperature,
-            "timeout": settings.llm_timeout_seconds,
-            "max_retries": settings.llm_max_retries,
+            "stream_usage": settings.llm_stream_usage,
+            **_shared_kwargs(),
         }
         if base_url:
             kwargs["base_url"] = base_url

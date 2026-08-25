@@ -103,7 +103,7 @@ async def init_db():
     migration 文件，不要继续往这里加 ALTER TABLE。
     """
     # Import all models so Base knows about them
-    from app.models import session, knowledge, feedback, user, clarification  # noqa: F401
+    from app.models import session, knowledge, feedback, user, clarification, usage  # noqa: F401
     from sqlalchemy import text
 
     async with engine.begin() as conn:

@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from app.auth import get_current_user, require_project
+from app.limits import Ticket, llm_gate, llm_slot, llm_ticket
 from app.database import AsyncSessionLocal, get_db
 from app.models.knowledge import Document, Module, KnowledgeEntry
 from app.models.session import Session, Message
@@ -718,7 +719,7 @@ async def upload_document(
     file: UploadFile = File(...),
     module_id: int | None = Form(default=None),
     project_id: int = Depends(require_project),
-    _user: User = Depends(get_current_user),
+    _slot: Ticket = Depends(llm_slot),  # 并发闸门 + 每日配额（本路由内联跑 Clarifier）
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -1066,7 +1067,7 @@ class LarkImportRequest(BaseModel):
 async def upload_lark_stream(
     req: LarkImportRequest,
     project_id: int = Depends(require_project),
-    _user: User = Depends(get_current_user),
+    _ticket: Ticket = Depends(llm_ticket),  # 并发闸门 + 每日配额
 ):
     """Import a Feishu/Lark document by URL via local lark-cli.
 
@@ -1376,7 +1377,7 @@ async def upload_lark_stream(
             yield _sse("done", {})
 
     return StreamingResponse(
-        events(),
+        llm_gate.wrap_stream(_ticket, events),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
     )
@@ -1604,7 +1605,7 @@ class ExtractCombinedRequest(BaseModel):
 async def extract_combined_drafts(
     req: ExtractCombinedRequest,
     project_id: int = Depends(require_project),
-    _user: User = Depends(get_current_user),
+    _slot: Ticket = Depends(llm_slot),  # 并发闸门 + 每日配额（知识抽取要调 LLM）
 ):
     """上传完成后触发的「PRD + 脑图」合并知识抽取（脑图优先）。
 
@@ -1627,7 +1628,7 @@ class PipelineStartRequest(BaseModel):
 async def pipeline_start_stream(
     req: PipelineStartRequest,
     project_id: int = Depends(require_project),
-    _user: User = Depends(get_current_user),
+    _ticket: Ticket = Depends(llm_ticket),  # 并发闸门 + 每日配额
 ):
     """「开始生成」闸门：把本会话已暂存（status="staged"）的 PRD / 脑图推进到下游流程第一步。
 
@@ -1771,7 +1772,7 @@ async def pipeline_start_stream(
             yield _sse("done", {})
 
     return StreamingResponse(
-        events(),
+        llm_gate.wrap_stream(_ticket, events),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
     )
@@ -1793,7 +1794,7 @@ class InitialClarifyRequest(BaseModel):
 async def clarify_initial_stream(
     req: InitialClarifyRequest,
     project_id: int = Depends(require_project),
-    _user: User = Depends(get_current_user),
+    _ticket: Ticket = Depends(llm_ticket),  # 并发闸门 + 每日配额
 ):
     """B 方案第二步：用户在 KnowledgePreviewPanel 勾选完知识条目后调它，
     才真正跑 Clarifier。事件序列与原 /upload/stream 末段一致：
@@ -2012,7 +2013,7 @@ async def clarify_initial_stream(
         yield _sse("done", {})
 
     return StreamingResponse(
-        events(),
+        llm_gate.wrap_stream(_ticket, events),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
     )
@@ -2031,7 +2032,7 @@ class FollowupRequest(BaseModel):
 async def clarify_followup_stream(
     req: FollowupRequest,
     project_id: int = Depends(require_project),
-    _user: User = Depends(get_current_user),
+    _ticket: Ticket = Depends(llm_ticket),  # 并发闸门 + 每日配额
 ):
     """
     Run a follow-up clarification round given the document(s) and prior Q/A history.
@@ -2213,7 +2214,7 @@ async def clarify_followup_stream(
         yield _sse("done", {})
 
     return StreamingResponse(
-        events(),
+        llm_gate.wrap_stream(_ticket, events),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
     )

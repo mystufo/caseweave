@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_settings
 from app.database import get_db
 from app.models.user import Project, User
+from app.usage import set_usage_owner
 
 settings = get_settings()
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -61,6 +62,9 @@ async def get_current_user(
     user = result.scalar_one_or_none()
     if not user:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
+    # 把本请求（及其派生的后台任务）的 LLM token 记到这个人头上。放在鉴权这一个入口，
+    # 就不用在每条路由上重复接线；无归属的调用（启动后的定时巡检）自然不计入任何人。
+    set_usage_owner(user.id)
     return user
 
 

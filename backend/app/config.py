@@ -152,6 +152,38 @@ class Settings(BaseSettings):
     # 支持 ~ 与绝对路径；相对路径以后端进程 CWD 为基准（不建议）。
     prompt_dump_dir: Optional[str] = None
 
+    # ── 并发闸门 / 配额（控成本）──────────────────────────────────────────────
+    # 详见 app/limits.py。三层各管一件事，都可以单独关掉（设 0 或负数）。
+    #   llm_max_concurrency          全局同时在跑的 LLM 重任务数。压的是「峰值」——
+    #                                服务器 CPU/内存、provider 侧的 RPM 限流都吃这个。
+    #                                单进程 uvicorn 下就是真·全局；开了 --workers 要除以 worker 数。
+    #   llm_max_concurrency_per_user 单账号同时在跑的重任务数。超了立刻 429 不排队，
+    #                                防一个人开多个标签页把全局名额占满。
+    #   llm_queue_size               排队上限，满了直接 429。别设太大：排太久用户也会走。
+    #   llm_queue_timeout_seconds    排队等待上限。重任务本身就要一两分钟，这个值要够大，
+    #                                但也别超过前端/nginx 的读超时（nginx.conf 现为 300s）。
+    llm_max_concurrency: int = 3
+    llm_max_concurrency_per_user: int = 1
+    llm_queue_size: int = 20
+    llm_queue_timeout_seconds: float = 180.0
+    #   llm_per_user_grace_seconds   「单账号并发」超限时先等这么久再翻脸。吸收正常时序毛刺：
+    #                                前端收到 SSE done 帧就立刻发下一个请求、用户点停止后
+    #                                马上重来、双击重试。真·两个长任务并行照样会被 429。
+    llm_per_user_grace_seconds: float = 3.0
+
+    # 单账号每日 token 上限（input + output 之和）。0 = 不限。
+    # 这才是真正封顶成本的那层：并发只压峰值，不压总量。判定发生在任务开始前，
+    # 所以是软封顶——最后一个任务可能小幅超出上限。用量见 daily_usage 表。
+    daily_token_quota: int = 0
+    # 管理员（admin_emails）是否豁免配额。并发闸门对管理员照样生效（那是机器容量问题）。
+    quota_exempt_admins: bool = True
+    # 配额按哪个时区的自然日翻篇。默认 +8（北京时间 00:00 重置）。
+    quota_reset_utc_offset_hours: int = 8
+    # 流式调用是否向 OpenAI 兼容接口索要 usage（stream_options.include_usage）。
+    # 个别网关不认这个参数会直接报错，遇到就置 false——代价是流式调用统计不到 token，
+    # 配额会漏算。Anthropic 原生协议不受此项影响（流式默认就带 usage）。
+    llm_stream_usage: bool = True
+
     # Auth
     admin_emails: str = ""  # comma-separated list of admin emails (case-insensitive)
     jwt_secret: str = DEV_JWT_SECRET

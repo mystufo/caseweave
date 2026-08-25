@@ -14,11 +14,11 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth import get_current_user, require_project
+from app.auth import require_project
+from app.limits import Ticket, llm_slot
 from app.database import get_db
 from app.models.session import Session, Message
 from app.models.knowledge import Document, Module, KnowledgeEntry
-from app.models.user import User
 from app.agents.mindmap_generator import generate_mindmap
 from app.prompts.registry import get_active_prompt_text
 from app.knowledge.store import search_relevant, summarize_for_prompt
@@ -52,7 +52,7 @@ class MindmapGenerateRequest(BaseModel):
 async def generate_test_mindmap(
     request: MindmapGenerateRequest,
     project_id: int = Depends(require_project),
-    _user: User = Depends(get_current_user),
+    _slot: Ticket = Depends(llm_slot),  # 并发闸门 + 每日配额
     db: AsyncSession = Depends(get_db),
 ):
     """从 PRD 生成测试脑图，写入飞书文档，返回链接。"""

@@ -9,6 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import authorize_project, decode_token, get_current_user, require_project
+from app.limits import Ticket, llm_gate, llm_ticket
 from app.database import get_db
 from app.models.session import Session, Message
 from app.models.knowledge import Document, Module, ModuleRelation, KnowledgeEntry, Skill
@@ -97,7 +98,9 @@ async def generate(
     request: GenerateRequest,
     raw_request: Request,
     project_id: int = Depends(require_project),
-    _user: User = Depends(get_current_user),
+    # 用 llm_ticket（取号不等待）而不是 llm_slot：本路由既有流式分支也有非流式分支，
+    # 流式分支的名额要一直握到流跑完，只能由 wrap_stream 负责归还。
+    _ticket: Ticket = Depends(llm_ticket),
     db: AsyncSession = Depends(get_db),
 ):
     """Generate test cases from an uploaded document."""
@@ -307,10 +310,13 @@ async def generate(
             yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
         return StreamingResponse(
-            event_stream(),
+            llm_gate.wrap_stream(_ticket, event_stream),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
+
+    # 非流式分支：这里才真正去等全局名额（流式分支的等待由 wrap_stream 边排队边推 queued 帧）。
+    await llm_gate.wait(_ticket)
 
     # 用户在 KnowledgePreviewPanel 上的"已确认 N 条"作为一条系统气泡先落库——
     # 即使 LLM 调用挂了，用户至少能在聊天流里看到自己刚才做了什么选择。

@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 
 from app.auth import get_current_user, require_project
+from app.limits import Ticket, llm_gate, llm_ticket
 from app.database import get_db
 from app.models.session import Session, Message
 from app.models.clarification import ClarificationState
@@ -355,6 +356,7 @@ async def chat(
     request: ChatRequest,
     project_id: int = Depends(require_project),
     user: User = Depends(get_current_user),
+    _ticket: Ticket = Depends(llm_ticket),  # 并发闸门 + 每日配额
     db: AsyncSession = Depends(get_db),
 ):
     # Resolve or create session (scoped to project)
@@ -396,7 +398,7 @@ async def chat(
             yield chunk
 
     return StreamingResponse(
-        event_stream(),
+        llm_gate.wrap_stream(_ticket, event_stream),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

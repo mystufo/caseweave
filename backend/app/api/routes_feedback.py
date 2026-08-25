@@ -22,6 +22,7 @@ from app.agents.diff_analyzer import (
 )
 from app.agents.feedback_triage import triage_intent, classify_dislike, targets_to_str
 from app.auth import get_current_user, require_project
+from app.limits import background_slot
 from app.database import AsyncSessionLocal, get_db
 from app.knowledge.store import store_entries
 from app.models.feedback import TestCase, Feedback, FeedbackConsumption
@@ -66,11 +67,15 @@ async def _analyze_diff_bg(
     """异步后台任务：跑 diff 分析，回写 diff_analysis + triage/targets；规则入知识库并记消费台账。
 
     完全 fail-open：任何异常都吞掉 + log warning，不影响主请求已经返回的结果。
+    走并发闸门的后台通道：高峰期自动排在真实用户后面，取不到名额就本次跳过
+    （反馈已落库，损失的只是这条 diff 分析，下次 Skill 归纳时信号还在）。
     """
     try:
-        analysis: DiffAnalysis | None = await analyze_edit(
-            original=original, modified=modified, module_name=module_name,
-        )
+        async with background_slot("feedback_diff"):
+            analysis: DiffAnalysis | None = await analyze_edit(
+                original=original, modified=modified, module_name=module_name,
+            )
+        # 名额出了 with 就还回去，后面的 DB 回写不占闸门。
         if analysis is None:
             logger.info("diff analyzer returned None for feedback=%d (no changes or LLM fail)", feedback_id)
             return
@@ -136,9 +141,11 @@ async def _analyze_dislike_bg(
 
     不直接产知识（dislike 无 before/after diff，抽不出规则）；只打分诊标签，
     供 prompt/skill 出口按 target 取用。fail-open。
+    同样走并发闸门的后台通道（见 _analyze_diff_bg）。
     """
     try:
-        intent = await classify_dislike(reason=reason, case=case, module_name=module_name)
+        async with background_slot("feedback_dislike"):
+            intent = await classify_dislike(reason=reason, case=case, module_name=module_name)
         targets = triage_intent(intent)
         async with AsyncSessionLocal() as db:
             fb = (await db.execute(select(Feedback).where(Feedback.id == feedback_id))).scalar_one_or_none()
