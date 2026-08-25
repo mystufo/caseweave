@@ -49,3 +49,10 @@ def setup_logging(level: str = "INFO", log_file: Optional[str] = None) -> None:
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
     logging.getLogger("watchfiles").setLevel(logging.WARNING)
+
+    # 文档解析库即使在 DEBUG 模式下也必须闭嘴。pdfminer 会为 PDF 里的**每一个 token**
+    # 打一条 DEBUG——解析一份 10 页 PRD 就是几十万条日志、几十 MB 落盘，日志格式化和写盘
+    # 本身发生在 event loop 上，实测把一次解析从数秒放大到 16.7 秒（全程整个后端卡死）。
+    # 这些库的 DEBUG 对排查我们自己的问题毫无价值，直接钉死在 WARNING。
+    for noisy in ("pdfminer", "pdfplumber", "PIL", "docx", "openpyxl", "python_multipart", "multipart"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)

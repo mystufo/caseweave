@@ -396,6 +396,10 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
   const taskMapRef = useRef(taskMap)
   taskMapRef.current = taskMap
   const [input, setInput] = useState('')
+  // 新建会话的 POST 在飞：state 供按钮变灰/转圈，ref 供回调里同步判重（setState 是异步的，
+  // 连点两下时第二下读到的还是旧值）。
+  const [creatingSession, setCreatingSession] = useState(false)
+  const creatingSessionRef = useRef(false)
   const [larkDialogOpen, setLarkDialogOpen] = useState(false)
   const [pasteDialogOpen, setPasteDialogOpen] = useState(false)
   // 项目下所有模块——模块确认卡 / 知识草稿审核面板的下拉数据源。
@@ -806,11 +810,30 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
   // ── Session actions ──────────────────────────────────────────────────────
 
   // 用户在侧边栏选定模式后创建会话并进入。mode 固定该会话用途。
+  //
+  // creatingSession 这个在飞的标记不是防抖的洁癖，是真踩过：后端某个请求把 event loop
+  // 占住时（历史上是文档解析在协程里同步跑），这个 POST 会一直悬着不返回，用户以为按钮
+  // 坏了就猛点，等后端缓过来一口气建出七八个空会话。所以：在飞时忽略后续点击，失败也要
+  // 出声——静默 catch 等于按钮真的没反应。
   const handleCreateSession = useCallback(async (mode: 'cases' | 'mindmap') => {
-    const s = await createSession('新会话', undefined, mode)
-    setSessions(prev => [s, ...prev])
-    setTaskMap(prev => ({ ...prev, [s.id]: { ...emptyState(mode), loaded: true } }))
-    setActiveSessionId(s.id)
+    if (creatingSessionRef.current) return
+    creatingSessionRef.current = true
+    setCreatingSession(true)
+    try {
+      const s = await createSession('新会话', undefined, mode)
+      setSessions(prev => [s, ...prev])
+      setTaskMap(prev => ({ ...prev, [s.id]: { ...emptyState(mode), loaded: true } }))
+      setActiveSessionId(s.id)
+    } catch (err) {
+      console.error('Create session failed:', err)
+      const detail = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail
+      toast.error(`新建会话失败：${detail ?? '服务暂时没有响应，请稍后重试。'}`, {
+        dedupeKey: 'create-session',
+      })
+    } finally {
+      creatingSessionRef.current = false
+      setCreatingSession(false)
+    }
   }, [])
 
   const handleSelectSession = useCallback((id: number) => {
@@ -2216,6 +2239,7 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
           busyIds={busyIds}
           onSelect={handleSelectSession}
           onNew={(mode) => void handleCreateSession(mode)}
+          creating={creatingSession}
           onRename={async (id, title) => {
             const updated = await renameSession(id, title)
             setSessions(prev => prev.map(s => (s.id === id ? { ...s, title: updated.title } : s)))

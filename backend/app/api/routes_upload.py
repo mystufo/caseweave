@@ -1,4 +1,5 @@
 """Upload & document parsing API."""
+import asyncio
 import hashlib
 import json
 import logging
@@ -734,10 +735,10 @@ async def upload_document(
 
     logger.info("Upload received | filename=%s size=%d bytes module_id=%s", filename, len(file_bytes), module_id)
 
-    # Parse document
+    # Parse document —— 见 /upload/stream 里同款注释：解析必须离开 event loop。
     parse_start = time.perf_counter()
     try:
-        parsed = parse_document(filename, file_bytes)
+        parsed = await asyncio.to_thread(parse_document, filename, file_bytes)
     except Exception as exc:
         logger.exception("Document parse failed | filename=%s", filename)
         raise HTTPException(status_code=422, detail=f"Failed to parse document: {exc}")
@@ -876,27 +877,21 @@ async def upload_document_stream(
     project_id: int = Depends(require_project),
     _user: User = Depends(get_current_user),
 ):
-    import sys
-    print(f"[DEBUG] /upload/stream entered file={file.filename} sid={session_id} pid={project_id}", flush=True, file=sys.stderr)
     """
     Stream upload progress as SSE events. New: requires session_id; persists
     a system Message and a ClarificationState row so refresh resumes seamlessly.
     """
     filename, _ = _validate_upload(file)
-    print(f"[DEBUG] step1 validated filename={filename}", flush=True, file=sys.stderr)
     file_bytes = await file.read()
-    print(f"[DEBUG] step2 file read bytes={len(file_bytes)}", flush=True, file=sys.stderr)
     if len(file_bytes) > 20 * 1024 * 1024:
         raise HTTPException(status_code=400, detail="File too large (max 20 MB).")
 
     if not await _verify_session(session_id, project_id):
         raise HTTPException(status_code=404, detail="Session not found")
-    print("[DEBUG] step3 session verified", flush=True, file=sys.stderr)
 
     logger.info("Upload(stream) received | filename=%s size=%d session_id=%s", filename, len(file_bytes), session_id)
 
     sha256 = hashlib.sha256(file_bytes).hexdigest()
-    print(f"[DEBUG] step4 sha256={sha256[:12]}", flush=True, file=sys.stderr)
 
     async def events():
         async def emit_error(message: str):
@@ -958,10 +953,13 @@ async def upload_document_stream(
             return
 
         # Stage 1: parse
+        # ⚠️ parse_document 是纯 CPU 的同步调用（python-docx / pdfplumber），一份 10 页 PDF
+        # 就要跑好几秒。后端是单进程 uvicorn，直接在协程里调等于**冻住整个 event loop**——
+        # 期间别的窗口点任何按钮都没反应（请求根本排不上号）。必须丢进线程池。
         yield _sse("stage", {"stage": "parsing", "message": f"正在解析《{filename}》…"})
         parse_start = time.perf_counter()
         try:
-            parsed = parse_document(filename, file_bytes)
+            parsed = await asyncio.to_thread(parse_document, filename, file_bytes)
         except Exception as exc:
             logger.exception("Document parse failed | filename=%s", filename)
             async for ev in emit_error(f"文档解析失败：{exc}"):
@@ -1235,7 +1233,7 @@ async def upload_lark_stream(
                 # 脑图：把 lark 抓回来的 markdown 文本喂给 mindmap_parser 拆成层级 chunks，
                 # raw_text 复用 parser 的输出（标准化缩进），与本地 .md 上传路径同 shape。
                 try:
-                    parsed_mm = parse_mindmap_md(raw_text.encode("utf-8"))
+                    parsed_mm = await asyncio.to_thread(parse_mindmap_md, raw_text.encode("utf-8"))
                 except Exception as exc:
                     logger.exception("Lark mindmap parse failed | url=%s", url[:200])
                     async for ev in emit_error(f"飞书脑图解析失败：{exc}"):
@@ -1511,7 +1509,7 @@ async def upload_mindmap_stream(
         yield _sse("stage", {"stage": "parsing", "message": f"正在解析脑图《{filename}》…"})
         parse_start = time.perf_counter()
         try:
-            parsed = parse_mindmap_md(file_bytes)
+            parsed = await asyncio.to_thread(parse_mindmap_md, file_bytes)
         except Exception as exc:
             logger.exception("Mindmap parse failed | filename=%s", filename)
             async for ev in emit_error(f"脑图解析失败：{exc}"):

@@ -1429,6 +1429,34 @@ CaseWeave（纬策） — 开发进度记录
      代价是流式调用统计不到 token、配额会漏算。Anthropic 原生协议不受影响。
 
 ================================================================================
+Bugfix — 文档解析冻住 event loop（"其他窗口点按钮没反应"）
+================================================================================
+  现象：一个窗口正在上传本地文档时，其他窗口点「生成测试用例」毫无反应；等上传那边
+  解析完，之前攒的点击会一口气全生效（日志里同一秒冒出 7 条 POST /api/sessions）。
+
+  根因：parse_document / parse_mindmap_md 是纯 CPU 的同步调用（python-docx、pdfplumber），
+  以前直接在协程里跑。后端是单进程单事件循环 uvicorn —— 解析期间整个后端冻死，
+  跟并发闸门、跟前端都没关系，请求根本排不上号。
+  实测一份 10 页 / 24 表的 PRD PDF：Document parsed(stream) ... (16742ms)，即 16.7 秒全站卡死。
+
+  两个放大器叠在一起：
+  1) DEBUG 模式下 root logger 是 DEBUG，pdfminer 会为 PDF 里**每个 token** 打一条日志。
+     一次解析写出几十 MB（app.log 在一次解析里轮转了好几轮），日志格式化 + 落盘同样在
+     event loop 上。基准测试：同一份 39 页 PDF，解析 5973ms → 静音后 2368ms（2.5×）。
+  2) 剩下的 2~3 秒仍然是真解析，照样堵。
+
+  修法：
+  - logging_config.py：pdfminer/pdfplumber/PIL/docx/openpyxl/multipart 一律钉死在 WARNING，
+    不随 DEBUG 放开——这些库的 DEBUG 对排查我们自己的问题没有价值。
+  - routes_upload.py：四处解析全部 `await asyncio.to_thread(...)`，解析再慢也只占线程池。
+  - 顺手清掉 /upload/stream 里遗留的 [DEBUG] print（第一条还挡在 docstring 前面，
+    把函数的 docstring 变成了死表达式）。
+  - 前端 SessionList/ChatPage：新建会话的 POST 在飞时两个按钮变灰转圈，失败弹 toast。
+    以前是静默 catch —— 请求悬着时按钮看着就是"坏了"，用户猛点就建出一串空会话。
+
+  留给以后：真要跑多 worker（uvicorn --workers），并发闸门得换 Redis 实现（见上一节）。
+
+================================================================================
 快速启动
 ================================================================================
   1. cp .env.example .env  （填写 LLM_API_KEY）

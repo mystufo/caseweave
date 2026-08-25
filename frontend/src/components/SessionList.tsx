@@ -8,11 +8,13 @@ interface Props {
   busyIds?: Set<number>
   onSelect: (id: number) => void
   onNew: (mode: 'cases' | 'mindmap') => void
+  /** 新建会话的请求还在飞——两个按钮都变灰，避免用户以为没反应而连点出一串空会话 */
+  creating?: boolean
   onRename: (id: number, title: string) => Promise<void> | void
   onDelete: (id: number) => Promise<void> | void
 }
 
-export default function SessionList({ sessions, activeId, busyIds, onSelect, onNew, onRename, onDelete }: Props) {
+export default function SessionList({ sessions, activeId, busyIds, creating, onSelect, onNew, onRename, onDelete }: Props) {
   const [editingId, setEditingId] = useState<number | null>(null)
   const [draft, setDraft] = useState('')
 
@@ -47,16 +49,18 @@ export default function SessionList({ sessions, activeId, busyIds, onSelect, onN
         <div className="space-y-2">
           <button
             onClick={() => onNew('cases')}
-            className="w-full flex items-center gap-2 px-3 py-2 text-sm bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors"
+            disabled={creating}
+            className="w-full flex items-center gap-2 px-3 py-2 text-sm bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors disabled:opacity-60 disabled:cursor-wait"
           >
-            <Plus size={16} />
+            {creating ? <Loader2 size={16} className="animate-spin" /> : <Plus size={16} />}
             生成测试用例
           </button>
           <button
             onClick={() => onNew('mindmap')}
-            className="w-full flex items-center gap-2 px-3 py-2 text-sm bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 transition-colors"
+            disabled={creating}
+            className="w-full flex items-center gap-2 px-3 py-2 text-sm bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 transition-colors disabled:opacity-60 disabled:cursor-wait"
           >
-            <Plus size={16} />
+            {creating ? <Loader2 size={16} className="animate-spin" /> : <Plus size={16} />}
             生成测试脑图
           </button>
         </div>
