@@ -3,10 +3,13 @@
 [![Release](https://img.shields.io/github/v/release/mystufo/caseweave)](https://github.com/mystufo/caseweave/releases/latest)
 [![CI](https://github.com/mystufo/caseweave/actions/workflows/ci.yml/badge.svg)](https://github.com/mystufo/caseweave/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![在线体验](https://img.shields.io/badge/在线体验-47.93.126.69%3A3001-blue)](http://47.93.126.69:3001/)
 
 **简体中文** | [English](README.en.md)
 
 > 把需求织成用例 —— 智能测试用例生成系统
+
+🔗 **在线体验：<http://47.93.126.69:3001/>** —— 注册即可试用，用法见[使用文档](docs/USAGE.md)。公开体验环境，请勿上传涉密文档。
 
 **CaseWeave（纬策）** 是一个 AI 驱动的测试用例生成系统。上传产品需求文档（Word / PDF / 飞书文档），系统先自动**澄清需求中的歧义**，再据此生成结构化、可执行的**测试用例**并导出 Excel。系统还具备**持续自我进化**能力：从用户反馈、编辑修改、Bug 数据中不断提炼测试设计经验，反哺后续生成。
 
@@ -54,7 +57,7 @@ make dev-frontend  # Vite on :5173
 
 ## 文档
 
-- [使用文档](docs/USAGE.md) —— 面向使用者的完整操作指南（在线体验：<http://47.93.126.69:3001/>）
+- [使用文档](docs/USAGE.md) · [User guide (English)](docs/USAGE.en.md) —— 面向使用者的完整操作指南
 - [部署文档](docs/DEPLOYMENT.md)
 - [反馈进化设计](docs/feedback-evolution-design.md)
 - 开发指引与架构说明见 [CLAUDE.md](CLAUDE.md)

@@ -3,10 +3,13 @@
 [![Release](https://img.shields.io/github/v/release/mystufo/caseweave)](https://github.com/mystufo/caseweave/releases/latest)
 [![CI](https://github.com/mystufo/caseweave/actions/workflows/ci.yml/badge.svg)](https://github.com/mystufo/caseweave/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Live demo](https://img.shields.io/badge/live%20demo-47.93.126.69%3A3001-blue)](http://47.93.126.69:3001/)
 
 [简体中文](README.md) | **English**
 
 > Weave requirements into test cases — an intelligent test-case generation system
+
+🔗 **Live demo: <http://47.93.126.69:3001/>** — register and try it out; see the [user guide](docs/USAGE.en.md). It is a shared demo environment, so please don't upload confidential documents.
 
 **CaseWeave** is an AI-powered test-case generation system. Upload a product requirements document (Word / PDF / Feishu doc), and the system first **clarifies ambiguities** in the requirements, then generates structured, executable **test cases** and exports them to Excel. It also **continuously self-evolves**: distilling test-design experience from user feedback, edits, and bug data to improve later generations.
 
@@ -55,7 +58,7 @@ For production deployment (Docker Compose, or bare metal + systemd/Nginx), see *
 
 ## Documentation
 
-- [User guide](docs/USAGE.md) (in Chinese) — live demo: <http://47.93.126.69:3001/>
+- [User guide](docs/USAGE.en.md) · [使用文档（中文）](docs/USAGE.md) — full end-user walkthrough
 - [Deployment guide](docs/DEPLOYMENT.md)
 - [Feedback evolution design](docs/feedback-evolution-design.md)
 - Development guide & architecture: [CLAUDE.md](CLAUDE.md)
