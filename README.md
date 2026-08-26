@@ -54,6 +54,7 @@ make dev-frontend  # Vite on :5173
 
 ## 文档
 
+- [使用文档](docs/USAGE.md) —— 面向使用者的完整操作指南（在线体验：<http://47.93.126.69:3001/>）
 - [部署文档](docs/DEPLOYMENT.md)
 - [反馈进化设计](docs/feedback-evolution-design.md)
 - 开发指引与架构说明见 [CLAUDE.md](CLAUDE.md)

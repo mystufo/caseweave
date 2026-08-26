@@ -55,6 +55,7 @@ For production deployment (Docker Compose, or bare metal + systemd/Nginx), see *
 
 ## Documentation
 
+- [User guide](docs/USAGE.md) (in Chinese) — live demo: <http://47.93.126.69:3001/>
 - [Deployment guide](docs/DEPLOYMENT.md)
 - [Feedback evolution design](docs/feedback-evolution-design.md)
 - Development guide & architecture: [CLAUDE.md](CLAUDE.md)
