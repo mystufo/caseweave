@@ -33,6 +33,14 @@ export function setProjectId(projectId: number | null) {
   else localStorage.removeItem(PROJECT_KEY)
 }
 
+// 当前登录用户（内存态，App 在 fetchMe/登录成功后写入）。
+// 放这里是为了让深层组件（如 TabBar）不用一路 prop 透传就能判断管理员身份。
+let _user: AuthUser | null = null
+export const getCurrentUser = () => _user
+export function setCurrentUser(user: AuthUser | null) {
+  _user = user
+}
+
 // Helpers to build headers consistently for both axios + fetch.
 function authHeaders(): Record<string, string> {
   const h: Record<string, string> = {}
@@ -1593,3 +1601,72 @@ export const fetchPromptSuggestions = (key: string, status = 'pending') =>
 export const dismissPromptSuggestion = (suggestionId: number) =>
   api.post<{ id: number; status: string }>(`/api/prompts/suggestions/${suggestionId}/dismiss`, {})
     .then(r => r.data)
+
+// ── Token 用量（管理员）────────────────────────────────────────────────────────
+
+/** 统计分组粒度：自然日 / 周（周一为界）/ 月（月初为界）。 */
+export type UsageGranularity = 'day' | 'week' | 'month'
+
+/** 前端一屏最多展示的分组数，与后端 MAX_BUCKETS 对齐。 */
+export const USAGE_MAX_BUCKETS = 31
+
+export interface UsageUserRow {
+  user_id: number
+  email: string
+  name: string | null
+  is_admin: boolean
+  quota_exempt: boolean
+  input_tokens: number
+  output_tokens: number
+  total_tokens: number
+  calls: number
+}
+
+export interface UsagePeriodRow {
+  period: string          // 分组起始日，YYYY-MM-DD
+  input_tokens: number
+  output_tokens: number
+  total_tokens: number
+  calls: number
+}
+
+export interface UsageUserPeriodRow extends UsagePeriodRow {
+  user_id: number
+}
+
+export interface GateStats {
+  running: number
+  waiting: number
+  limit: number
+  per_user_limit: number
+  queue_size: number
+  wait_timeout_seconds: number
+  per_user_grace_seconds: number
+}
+
+export interface UsageReport {
+  granularity: UsageGranularity
+  periods: number
+  since: string
+  until: string
+  buckets: string[]       // 分组起始日，从近到远
+  quota: {
+    daily_token_quota: number
+    exempt_admins: boolean
+    reset_utc_offset_hours: number
+  }
+  totals: {
+    input_tokens: number
+    output_tokens: number
+    total_tokens: number
+    calls: number
+    users: number
+  }
+  by_user: UsageUserRow[]
+  by_period: UsagePeriodRow[]
+  by_user_period: UsageUserPeriodRow[]
+  gate: GateStats
+}
+
+export const fetchUsageReport = (granularity: UsageGranularity = 'day', periods = USAGE_MAX_BUCKETS) =>
+  api.get<UsageReport>('/api/limits/usage', { params: { granularity, periods } }).then(r => r.data)

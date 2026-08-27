@@ -33,7 +33,8 @@ Copy `.env.example` to `.env` and fill in `LLM_API_KEY` before running.
 **Frontend** (`frontend/`) — React + TypeScript + Vite + Tailwind CSS v3
 - `src/pages/ChatPage.tsx` — main page (session list + chat + upload + test case table)
 - `src/components/` — ChatMessage, MessageInput, SessionList, ClarificationPanel, TestCaseTable
-- `src/api/client.ts` — all API calls + `streamChat()` SSE helper
+- `src/pages/UsagePage.tsx` — 管理员 Token 用量页（账号 × 天矩阵、配额/闸门概览、CSV 导出）
+- `src/api/client.ts` — all API calls + `streamChat()` SSE helper + 当前用户内存态（`getCurrentUser`，供 TabBar 判管理员）
 
 **Backend** (`backend/app/`) — FastAPI + SQLAlchemy (async) + asyncpg
 - `main.py` — app entry, CORS, router registration
@@ -72,7 +73,7 @@ Copy `.env.example` to `.env` and fill in `LLM_API_KEY` before running.
 - 给路由加闸门：**非流式**用 `Depends(llm_slot)`（路由体零改动）；**流式**用 `Depends(llm_ticket)` + `llm_gate.wrap_stream(ticket, events)`。不能给流式路由用 yield 依赖 —— FastAPI 的 `AsyncExitStack` 在 `return response` 之前就关闭了，名额会在流跑完前被提前归还。
 - 后台任务（反馈分析、prompt 建议巡检）用 `background_slot(label)`：受全局并发约束、排在真人后面，但不占真人的单账号名额。
 - OpenAI 兼容网关的流式调用需 `LLM_STREAM_USAGE=true`（stream_options.include_usage）才回 token 数；个别网关不认这个参数，遇到报错就置 false。
-- 观测：`GET /health` 带 gate 实时状态；`GET /api/limits/status`（本人配额）；`GET /api/limits/usage?days=N`（管理员，按用户/按天聚合）。
+- 观测：`GET /health` 带 gate 实时状态；`GET /api/limits/status`（本人配额）；`GET /api/limits/usage?granularity=day|week|month&periods=N`（管理员，最多 31 组：按账号/按分组/账号×分组三个口径 + 闸门状态）。前端对应管理员页 `pages/UsagePage.tsx`（TabBar「Token 用量」标签，仅管理员可见）。
 
 ## Development Phases
 

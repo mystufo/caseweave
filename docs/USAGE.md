@@ -267,7 +267,7 @@
 - 澄清最多 **5 轮**（代码常量 `MAX_CLARIFICATION_ROUNDS`，不走 `.env`）；
 - 单次 LLM 调用有超时限制（`LLM_TIMEOUT_SECONDS`，默认 120 秒），超大文档建议**按模块拆分**上传。
 
-> 管理员可用 `GET /api/limits/usage?days=N` 查看近 N 天各账号的 token 消耗；任何用户都能用 `GET /api/limits/status` 查自己的余量。
+> 管理员可用 `GET /api/limits/usage?granularity=day|week|month&periods=N`（最多 31 组）查看各账号按天/周/月的 token 消耗，前端对应「Token 用量」页；任何用户都能用 `GET /api/limits/status` 查自己的余量。
 
 ---
 

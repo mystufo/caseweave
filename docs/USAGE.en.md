@@ -269,7 +269,7 @@ Other boundaries you will actually hit:
 - At most 5 clarification rounds (the `MAX_CLARIFICATION_ROUNDS` constant in code, not an `.env` setting);
 - Each LLM call has a timeout (`LLM_TIMEOUT_SECONDS`, 120s by default) — split very large documents by module.
 
-> Admins can check token spend per account for the last N days via `GET /api/limits/usage?days=N`; any user can check their own remaining quota via `GET /api/limits/status`.
+> Admins can check token spend per account by day/week/month (up to 31 buckets) via `GET /api/limits/usage?granularity=day|week|month&periods=N`, or in the "Token 用量" page in the UI; any user can check their own remaining quota via `GET /api/limits/status`.
 
 ---
 

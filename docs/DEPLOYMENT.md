@@ -470,7 +470,7 @@ Docker 数据卷为 `pg_data`（`docker volume ls` 可见），删除 compose �
   - `LLM_MAX_CONCURRENCY=3` — 全局同时在跑的大模型任务数，压的是**峰值**（服务器资源 + provider 侧限流）。
   - `LLM_MAX_CONCURRENCY_PER_USER=1` — 单账号同时最多一个任务，超了立刻 429。防一个人开多标签页霸占名额。
   - `DAILY_TOKEN_QUOTA=0` — 单账号每日 token 上限，**0 = 不限**。⚠️ 只有这层能真正封顶成本，
-    并发只压峰值不压总量。建议先留 0 跑几天，用 `GET /api/limits/usage?days=7`（管理员）
+    并发只压峰值不压总量。建议先留 0 跑几天，用 `GET /api/limits/usage?granularity=day`（管理员）
     看真实分布再定值。参考量级：一次「30000 字 PRD → 澄清 + 生成」约 5~8 万 token。
   - 调参依据：`curl http://<host>:8001/health` 看 `gate.waiting`，长期 >0 说明卡在全局并发可以上调；
     provider 开始返 429/超时说明调过头了。

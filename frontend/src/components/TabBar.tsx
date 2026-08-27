@@ -1,18 +1,20 @@
-import { MessageSquare, ListChecks, BookOpen, LineChart } from 'lucide-react'
+import { MessageSquare, ListChecks, BookOpen, LineChart, Gauge } from 'lucide-react'
 import type { LucideIcon } from 'lucide-react'
+import { getCurrentUser } from '../api/client'
 
-export type ViewKey = 'chat' | 'cases' | 'knowledge' | 'feedback'
+export type ViewKey = 'chat' | 'cases' | 'knowledge' | 'feedback' | 'usage'
 
 interface Props {
   value: ViewKey
   onChange: (v: ViewKey) => void
 }
 
-const tabs: { key: ViewKey; label: string; icon: LucideIcon }[] = [
+const tabs: { key: ViewKey; label: string; icon: LucideIcon; adminOnly?: boolean }[] = [
   { key: 'chat', label: '对话', icon: MessageSquare },
   { key: 'cases', label: '用例管理', icon: ListChecks },
   { key: 'knowledge', label: '知识库', icon: BookOpen },
   { key: 'feedback', label: '进化报告', icon: LineChart },
+  { key: 'usage', label: 'Token 用量', icon: Gauge, adminOnly: true },
 ]
 
 export default function TabBar({ value, onChange }: Props) {
@@ -21,7 +23,7 @@ export default function TabBar({ value, onChange }: Props) {
       aria-label="主导航"
       className="w-14 flex-shrink-0 bg-gray-900 border-r border-gray-800 flex flex-col items-center py-3 gap-1"
     >
-      {tabs.map(t => {
+      {tabs.filter(t => !t.adminOnly || getCurrentUser()?.is_admin).map(t => {
         const Icon = t.icon
         const active = value === t.key
         return (

@@ -3,12 +3,13 @@ import ChatPage from './pages/ChatPage'
 import CasesPage from './pages/CasesPage'
 import KnowledgePage from './pages/KnowledgePage'
 import NegativeFeedbackPage from './pages/NegativeFeedbackPage'
+import UsagePage from './pages/UsagePage'
 import LoginPage from './pages/LoginPage'
 import ProjectPickerPage from './pages/ProjectPickerPage'
 import type { ViewKey } from './components/TabBar'
 import {
   fetchMe, fetchProjects, getProjectId, getToken,
-  setProjectId, setToken, setUnauthorizedHandler,
+  setCurrentUser, setProjectId, setToken, setUnauthorizedHandler,
   type AuthUser, type Project,
 } from './api/client'
 import { Loader2, LogOut, FolderOpen } from 'lucide-react'
@@ -27,6 +28,7 @@ export default function App() {
   // Boot: if we have a token, hydrate the user. If we also have a saved project, jump into the app.
   useEffect(() => {
     setUnauthorizedHandler(() => {
+      setCurrentUser(null)
       setUser(null)
       setProject(null)
       setPhase('login')
@@ -40,6 +42,7 @@ export default function App() {
     void (async () => {
       try {
         const me = await fetchMe()
+        setCurrentUser(me)
         setUser(me)
         const savedId = getProjectId()
         if (savedId != null) {
@@ -74,6 +77,7 @@ export default function App() {
     return (
       <LoginPage
         onSuccess={u => {
+          setCurrentUser(u)
           setUser(u)
           setPhase('picker')
         }}
@@ -86,7 +90,7 @@ export default function App() {
       <ProjectPickerPage
         user={user!}
         onPick={p => { setProject(p); setPhase('app') }}
-        onLogout={() => { setUser(null); setProject(null); setPhase('login') }}
+        onLogout={() => { setCurrentUser(null); setUser(null); setProject(null); setPhase('login') }}
       />
     )
   }
@@ -100,6 +104,7 @@ export default function App() {
   const logout = () => {
     setToken(null)
     setProjectId(null)
+    setCurrentUser(null)
     setUser(null)
     setProject(null)
     setPhase('login')
@@ -137,6 +142,11 @@ export default function App() {
         <div className={view === 'feedback' ? 'block h-full' : 'hidden'}>
           <NegativeFeedbackPage view={view} onChangeView={setView} />
         </div>
+        {user.is_admin && (
+          <div className={view === 'usage' ? 'block h-full' : 'hidden'}>
+            <UsagePage view={view} onChangeView={setView} />
+          </div>
+        )}
       </div>
     </div>
   )
