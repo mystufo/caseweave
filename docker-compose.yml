@@ -58,6 +58,10 @@ services:
   embedding:
     image: ${EMBEDDING_IMAGE:-ghcr.io/huggingface/text-embeddings-inference:cpu-1.9}
     command: ["--model-id", "BAAI/bge-m3", "--auto-truncate"]
+    environment:
+      # 模型权重默认从 huggingface.co 下载，国内直连不通会卡在首次启动。
+      # 在 .env 设 HF_ENDPOINT=https://hf-mirror.com 即可走国内镜像站。
+      HF_ENDPOINT: ${HF_ENDPOINT:-https://huggingface.co}
     volumes:
       - embedding_data:/data
     restart: unless-stopped
@@ -71,6 +75,8 @@ services:
   reranker:
     image: ${RERANK_IMAGE:-ghcr.io/huggingface/text-embeddings-inference:cpu-1.9}
     command: ["--model-id", "BAAI/bge-reranker-v2-m3", "--auto-truncate"]
+    environment:
+      HF_ENDPOINT: ${HF_ENDPOINT:-https://huggingface.co}
     volumes:
       - reranker_data:/data
     restart: unless-stopped

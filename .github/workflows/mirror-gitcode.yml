@@ -1,0 +1,43 @@
+name: Mirror to GitCode
+
+# 把 main 单向同步到 GitCode（国内镜像仓库），方便大陆用户 clone。
+# GitCode 的「从 GitHub 导入」只能一次性导入，没有定时同步，所以由这里推。
+# 需要在仓库 Settings → Secrets and variables → Actions 配两个 secret：
+#   GITCODE_USER  —— GitCode 用户名
+#   GITCODE_TOKEN —— GitCode 个人访问令牌（需仓库写权限）
+# 仓库名与 GitHub 不同时，另配 variable GITCODE_REPO。
+# 未配置 secret 时本 job 直接跳过，不会让 CI 变红。
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  mirror:
+    name: 同步到 GitCode
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检查是否已配置 secret
+        id: check
+        env:
+          GITCODE_TOKEN: ${{ secrets.GITCODE_TOKEN }}
+        run: |
+          if [ -z "$GITCODE_TOKEN" ]; then
+            echo "未配置 GITCODE_TOKEN，跳过同步"
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 镜像推送
+        if: steps.check.outputs.ready == 'true'
+        env:
+          GITCODE_USER: ${{ secrets.GITCODE_USER }}
+          GITCODE_TOKEN: ${{ secrets.GITCODE_TOKEN }}
+          GITCODE_REPO: ${{ vars.GITCODE_REPO || 'caseweave' }}
+        run: |
+          git clone --mirror "https://github.com/${GITHUB_REPOSITORY}.git" src.git
+          cd src.git
+          git push --mirror \
+            "https://${GITCODE_USER}:${GITCODE_TOKEN}@gitcode.com/${GITCODE_USER}/${GITCODE_REPO}.git"

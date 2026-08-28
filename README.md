@@ -42,6 +42,8 @@ make up
 # 打开 http://localhost:3001，注册管理员账号（邮箱须在 .env 的 ADMIN_EMAILS 中）
 ```
 
+> **中国大陆用户先看这里**：默认镜像源（Docker Hub / ghcr.io）和模型权重源（huggingface.co）直连大多不通，`make up` 会卡在拉镜像或 embedding 服务启动中。请先在 `.env` 里打开「国内网络加速」那一段（`HF_ENDPOINT` + `EMBEDDING_IMAGE` / `RERANK_IMAGE`），并按 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) 的 A.1.1 配好 Docker 镜像加速器。
+
 本地开发（需已装 Python 3.11、Node 20，并启动 PostgreSQL）：
 
 ```bash

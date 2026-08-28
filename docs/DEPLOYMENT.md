@@ -134,6 +134,8 @@ docker info | grep -A3 "Registry Mirrors"       # 能列出镜像地址 = 已生
 
 > **embedding / rerank 镜像走的是 ghcr.io**（`ghcr.io/huggingface/text-embeddings-inference`，各约 1~2 GB），不受 Docker Hub 加速器影响。若 ghcr 也不通，`docker-compose.yml` 已把地址变量化，在 `.env` 里设 `EMBEDDING_IMAGE` / `RERANK_IMAGE` 指向可达的镜像源即可，不用改 compose 文件。
 
+> **镜像拉下来了，还有第二道坎：模型权重**。TEI 容器首次启动会从 `huggingface.co` 下载 `BAAI/bge-m3` 与 `BAAI/bge-reranker-v2-m3`（各约 2 GB），国内直连基本不通，表现为容器起来了但一直没日志、后端语义检索始终降级。在 `.env` 里设 `HF_ENDPOINT=https://hf-mirror.com` 走国内镜像站，然后 `docker compose up -d embedding reranker` 重建容器生效。判断是否卡在这里：`docker compose logs -f embedding`，正常会看到下载进度，卡住则长时间无输出。
+
 ### A.1.2 关于 docker compose 版本
 
 本文命令用 **v2 语法 `docker compose`（带空格）**。若服务器上是老的 **v1 `docker-compose`（带连字符，如 1.29.2）**，用它 `up`/`recreate` 时可能报 `KeyError: 'ContainerConfig'`——这是 v1 与新版 Docker 镜像格式不兼容的已知 bug，触发点是"就地重建旧容器"。绕过办法：**先 `docker-compose down` 删掉旧容器，再 `docker-compose up -d` 全新创建**（`down` 不删 `pg_data` 卷，数据安全）。长期建议装 v2 插件（`sudo apt-get install -y docker-compose-plugin`）改用 `docker compose`。
@@ -492,6 +494,7 @@ Docker 数据卷为 `pg_data`（`docker volume ls` 可见），删除 compose �
 | `docker-compose up` 报 `KeyError: 'ContainerConfig'` | v1 与新版镜像不兼容的已知 bug。先 `docker-compose down` 再 `up -d`；或改用 v2 `docker compose`。见 A.1.2 |
 | 启动报 `bind: address already in use`（5432/8001/3001） | 宿主机端口被占用（常见于同机已跑另一套项目）。db 可用 `.env` 的 `DB_HOST_PORT` 改宿主机端口；其他服务改 `docker-compose.yml` 里 `ports` 左侧的宿主机端口 |
 | 拉基础镜像超时 / `failed to resolve reference "docker.io/..."` | 未配国内镜像加速器。见 A.1.1；ghcr.io 的 embedding/rerank 镜像另用 `.env` 的 `EMBEDDING_IMAGE` / `RERANK_IMAGE` 换源 |
+| embedding 容器起了但一直无日志 / 语义检索始终降级 | 模型权重下载卡在 huggingface.co。`.env` 设 `HF_ENDPOINT=https://hf-mirror.com` 后重建 embedding、reranker 容器 |
 | 装 Docker 时 `curl: (35) Recv failure` / `gpg: no valid OpenPGP data found` | 连不上 `download.docker.com`。两处 URL 换成 `https://mirrors.aliyun.com/docker-ce/linux/ubuntu`。见 A.1 |
 | 改完 `daemon.json` 后 dockerd 起不来 | daemon.json 不是合法 JSON。`python3 -m json.tool` 校验，重写后 `systemctl reset-failed docker` 再 `start`。见 A.1.1 |
 | 飞书导入报 `lark-cli 未安装` / `invalid_client` / `token_missing` | 见「附录：飞书文档导入（lark-cli）配置」 |
