@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![在线体验](https://img.shields.io/badge/在线体验-47.93.126.69%3A3001-blue)](http://47.93.126.69:3001/)
 
-**简体中文** | [English](README.en.md)
+**简体中文** | [English](README.en.md) · 🇨🇳 国内镜像：<https://gitcode.com/mystufo/caseweave>（GitHub clone 慢时用这个，随 main 自动同步）
 
 > 把需求织成用例 —— 智能测试用例生成系统
 

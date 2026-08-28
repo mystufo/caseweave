@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Live demo](https://img.shields.io/badge/live%20demo-47.93.126.69%3A3001-blue)](http://47.93.126.69:3001/)
 
-[简体中文](README.md) | **English**
+[简体中文](README.md) | **English** · China mirror: <https://gitcode.com/mystufo/caseweave> (auto-synced from main)
 
 > Weave requirements into test cases — an intelligent test-case generation system
 
