@@ -269,6 +269,8 @@
 
 > 管理员可用 `GET /api/limits/usage?granularity=day|week|month&periods=N`（最多 31 组）查看各账号按天/周/月的 token 消耗，前端对应「Token 用量」页；任何用户都能用 `GET /api/limits/status` 查自己的余量。
 
+> **管理员「系统设置」页**：左侧导航最下方（仅管理员可见）。主模型（协议 / 模型 / API Key / Base URL / 超时 / 各 max_tokens / 文档字数上限）和视觉识别两组配置可以直接在网页上改，**保存即生效、无需重启**；优先级为页面覆盖 > `.env` > 默认值，每项都能一键「恢复 .env」。保存前可先点「测试连接」，用表单里的值发一次最小请求验证凭证可用。API Key 加密落库（密钥由 `JWT_SECRET` 派生），所以生产环境务必先配置 `JWT_SECRET`，否则重启后页面保存的密钥会失效并回退到 `.env`。数据库、JWT、管理员名单、并发闸门、Embedding 维度等仍只能在 `.env` 改。
+
 ---
 
 ## 11. 常见问题

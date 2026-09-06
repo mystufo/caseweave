@@ -34,20 +34,22 @@ Copy `.env.example` to `.env` and fill in `LLM_API_KEY` before running.
 - `src/pages/ChatPage.tsx` — main page (session list + chat + upload + test case table)
 - `src/components/` — ChatMessage, MessageInput, SessionList, ClarificationPanel, TestCaseTable
 - `src/pages/UsagePage.tsx` — 管理员 Token 用量页（账号 × 天矩阵、配额/闸门概览、CSV 导出）
+- `src/pages/SettingsPage.tsx` — 管理员系统设置页（网页上覆盖 .env 的 LLM / 视觉配置，字段 spec 全由后端下发、按 kind 通用渲染）
 - `src/api/client.ts` — all API calls + `streamChat()` SSE helper + 当前用户内存态（`getCurrentUser`，供 TabBar 判管理员）
 
 **Backend** (`backend/app/`) — FastAPI + SQLAlchemy (async) + asyncpg
 - `main.py` — app entry, CORS, router registration
 - `config.py` — pydantic-settings, reads `.env`
 - `database.py` — async engine, `get_db()` dependency, `init_db()` creates tables on startup
-- `api/` — route modules: `routes_chat`, `routes_upload`, `routes_generate`, `routes_knowledge`, `routes_feedback`
+- `api/` — route modules: `routes_chat`, `routes_upload`, `routes_generate`, `routes_knowledge`, `routes_feedback`, `routes_settings`（管理员系统设置）
+- `settings_store.py` — 网页可改配置的白名单（`EDITABLE`）、校验、Fernet 加密、DB 覆盖加载 / 热更新
 - `agents/clarifier.py` — LLM call to identify ambiguities in a document, returns JSON question list
 - `agents/generator.py` — LLM call to produce structured test case JSON array
 - `tools/doc_parser.py` — `.docx` via python-docx, `.pdf` via pdfplumber
 - `tools/excel_export.py` — openpyxl export, per-module sheets, frozen header
 
 **Database** — PostgreSQL + pgvector; tables auto-created via `init_db()`, schema changes via Alembic migrations (`backend/alembic/versions/`)
-- Key models: `Session`, `Message` (chat history), `TestCase`, `Feedback` (+ `reason`/`triage`/`triage_targets` for evolution triage), `FeedbackConsumption` (consumption ledger), `Module`, `KnowledgeEntry`, `Skill`, `PromptVersion`, `PromptSuggestion`, `Document`, `DailyUsage`（每日 token 用量，支撑配额）
+- Key models: `Session`, `Message` (chat history), `TestCase`, `Feedback` (+ `reason`/`triage`/`triage_targets` for evolution triage), `FeedbackConsumption` (consumption ledger), `Module`, `KnowledgeEntry`, `Skill`, `PromptVersion`, `PromptSuggestion`, `Document`, `DailyUsage`（每日 token 用量，支撑配额）, `SystemSetting`（网页覆盖的运行时配置，key/value）
 
 **Data flow for core use case:**
 1. `POST /api/upload` → parse doc → run Clarifier Agent → return questions
@@ -90,7 +92,8 @@ See `record.txt` (repo root) for the authoritative, detailed progress log. Cross
 
 ## LLM Provider switching
 
-Controlled by `LLM_PROVIDER` / `LLM_MODEL` / `LLM_API_KEY` in `.env`.  
+Controlled by `LLM_PROVIDER` / `LLM_MODEL` / `LLM_API_KEY` in `.env`, **or by the admin「系统设置」page** (`GET/PUT /api/settings`, `POST /api/settings/test`), which overrides `.env` at runtime.  
+Runtime config precedence: `system_settings` table > `.env` > code default. `settings_store.load_overrides()` runs in lifespan after `init_db()` and `setattr`s onto the single cached `Settings` instance; `save_overrides()` does the same on PUT, so changes are hot — this works because every consumer reads `settings.xxx` at call time (`llm_factory` builds a client per call). Only keys in `settings_store.EDITABLE` (LLM + vision groups) are page-editable; bootstrap config (DATABASE_URL / JWT_SECRET / CORS / ADMIN_EMAILS), the concurrency gate (semaphores built at import) and `embedding_dim` (pgvector column) stay `.env`-only. Secrets are Fernet-encrypted with a key derived from `JWT_SECRET`; an ephemeral JWT secret means page-saved keys are unreadable after restart (logged + surfaced in UI). To expose another field on the page, add a `FieldSpec` to `EDITABLE` — the frontend renders from the spec.  
 Agents in `backend/app/agents/` construct the LLM client directly — to add GLM support, replace `ChatAnthropic` with `ChatZhipuAI` and gate on `settings.llm_provider`.
 
 ## Prompts & Skills

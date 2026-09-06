@@ -1457,6 +1457,50 @@ Bugfix — 文档解析冻住 event loop（"其他窗口点按钮没反应"）
   留给以后：真要跑多 worker（uvicorn --workers），并发闸门得换 Redis 实现（见上一节）。
 
 ================================================================================
+管理员「系统设置」页 —— 网页上覆盖 .env 的 LLM / 视觉配置（2026-09-06）
+================================================================================
+  动机：公网部署后换模型 / 换 key / 调 max_tokens 都要登服务器改 .env 再重启，
+  管理员改一次配置就中断一次所有人的会话。Prompt 和 Skill 早就是 DB-backed 了，配置也该是。
+
+  范围（先做两组，其余按需再加）：
+  - 主模型：llm_provider / model / api_key / base_url / timeout / retries / stream_usage /
+    generator|clarifier|knowledge_max_tokens / doc_max_chars
+  - 视觉识别：vision_enabled / provider / model / api_key / base_url / max_tokens / max_images / concurrency
+
+  实现：
+  - system_settings 表（key / value text / is_secret / updated_by），alembic 0009。
+  - app/settings_store.py：EDITABLE 白名单（每项一个 FieldSpec：kind/secret/nullable/options/min/max/
+    label/help），coerce 校验、Fernet 加密（密钥由 JWT_SECRET 派生）、load_overrides（启动时灌进
+    settings）、save_overrides（落库 + setattr 热更新）、snapshot（给前端的完整 spec + 当前值 + 来源）。
+  - 优先级 DB > .env > 默认值。能热更新是因为全站只有一个 Settings 实例（lru_cache）且各处都是
+    调用时才读 settings.xxx —— llm_factory 每次 build 都现读，setattr 一次全局生效。
+  - routes_settings：GET /api/settings、PUT（values + reset）、POST /settings/test。
+    测试连接用表单值现构造模型发一次最小请求（llm 组发「回复 OK」，vision 组发一张 32×32 纯红 PNG
+    问颜色），不记 token、不过闸门；失败把 provider 的原始错误带回给管理员看。
+  - llm_factory 抽出 make_chat_model(显式参数)，build_chat_model / build_vision_model 变薄封装，
+    测试接口复用它而不动全局。
+  - 前端 SettingsPage：字段按后端下发的 kind 通用渲染，来源徽标（页面已覆盖 / 来自 .env / 默认值）、
+    未保存标记、逐项「恢复 .env」、按组保存 / 放弃 / 测试连接。密钥输入框留空 = 不改，已配置只显示末 4 位。
+    TabBar 加「系统设置」，仅管理员可见。
+
+  刻意不开放的：
+  - DATABASE_URL / JWT_SECRET / CORS / LOG_FILE：启动引导，连 DB 之前就要用；
+  - ADMIN_EMAILS：管理员页面能改管理员名单 = 自己给自己发权限；
+  - EMBEDDING_IMAGE / HF_ENDPOINT / DB_HOST_PORT / LARK_NODE_DIR：只有 docker-compose 读；
+  - 并发闸门（信号量在 limits.py 导入时建好）、embedding_dim（pgvector 列维度）：改了要重启，
+    要开放得先给 LLMGate 加 rebuild。
+
+  坑：
+  - JWT_SECRET 未配置时是进程内随机值 → 页面保存的密钥重启后解不开。处理：load 时 InvalidToken
+    直接跳过回退 .env 并 warning，页面顶部也挂横幅提示。
+  - 密钥字段的「不修改」语义靠空串表达，validate_updates 直接剔除；「清空」走 reset。
+  - 保存只回填当前组的表单，其它组没保存的输入不会被吞。
+
+  验证：本地起第二个 uvicorn 连同一库 —— 422 逐键报错、非管理员 401/403、保存后 DB 行密钥为
+  Fernet 密文、真实 LLM 测试连接 OK（错 key 回 401 原文）、vision 探针回「红色」、重启后
+  「已加载 2 项页面覆盖配置」、reset 后回到 env 来源。
+
+================================================================================
 快速启动
 ================================================================================
   1. cp .env.example .env  （填写 LLM_API_KEY）

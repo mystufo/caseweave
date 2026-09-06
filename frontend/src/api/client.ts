@@ -1670,3 +1670,61 @@ export interface UsageReport {
 
 export const fetchUsageReport = (granularity: UsageGranularity = 'day', periods = USAGE_MAX_BUCKETS) =>
   api.get<UsageReport>('/api/limits/usage', { params: { granularity, periods } }).then(r => r.data)
+
+// ── 系统设置（管理员：网页上覆盖 .env 的 LLM / 视觉配置）────────────────────
+// 字段的类型、标签、说明、校验范围都由后端 settings_store.EDITABLE 给出，前端按 kind 通用渲染，
+// 新增可改项只需改后端白名单。
+
+export type SettingKind = 'str' | 'int' | 'float' | 'bool' | 'select'
+export type SettingSource = 'db' | 'env' | 'default'
+
+export interface SettingField {
+  key: string
+  label: string
+  help: string
+  kind: SettingKind
+  secret: boolean
+  nullable: boolean
+  options: { value: string; label: string }[]
+  min: number | null
+  max: number | null
+  placeholder: string
+  /** 当前生效值。密钥只给掩码（••••末4位），空串表示没配 */
+  value: string | number | boolean
+  source: SettingSource
+  /** .env / 默认值给出的基线，「恢复」后会变成它 */
+  baseline: string | number | boolean
+  baseline_source: SettingSource
+}
+
+export interface SettingGroup {
+  key: 'llm' | 'vision'
+  label: string
+  desc: string
+  fields: SettingField[]
+}
+
+export interface SystemSettings {
+  groups: SettingGroup[]
+  /** JWT_SECRET 未配置时为 true：页面保存的 API Key 重启后解不开 */
+  secrets_volatile: boolean
+}
+
+export interface SettingsTestResult {
+  ok: boolean
+  model: string
+  latency_ms?: number
+  reply?: string
+  error?: string
+  usage?: { input_tokens: number; output_tokens: number }
+}
+
+export const fetchSystemSettings = () =>
+  api.get<SystemSettings>('/api/settings').then(r => r.data)
+
+/** values：要改的键值（密钥传空串 = 不改）；reset：删掉页面覆盖、恢复 .env。422 时 detail.errors 是逐键错误。 */
+export const saveSystemSettings = (values: Record<string, unknown>, reset: string[] = []) =>
+  api.put<SystemSettings>('/api/settings', { values, reset }).then(r => r.data)
+
+export const testSystemSettings = (group: 'llm' | 'vision', values: Record<string, unknown>) =>
+  api.post<SettingsTestResult>('/api/settings/test', { group, values }).then(r => r.data)

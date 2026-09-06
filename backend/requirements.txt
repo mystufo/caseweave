@@ -40,6 +40,8 @@ passlib[bcrypt]==1.7.4
 bcrypt==4.2.1  # pin: passlib 1.7.4 不兼容 bcrypt 5.x
 pyjwt==2.10.1
 email-validator==2.2.0
+# 系统设置页里保存的 API Key 加密落库（Fernet）
+cryptography==48.0.0
 
 # Dev tools
 ruff==0.8.4

@@ -18,6 +18,7 @@ from app.api.routes_auth import router as auth_router
 from app.api.routes_projects import router as projects_router
 from app.api.routes_prompts import router as prompts_router
 from app.api.routes_limits import router as limits_router
+from app.api.routes_settings import router as settings_router
 
 settings = get_settings()
 setup_logging("DEBUG" if settings.debug else "INFO", settings.log_file)
@@ -86,6 +87,21 @@ async def lifespan(app: FastAPI):
         )
     await init_db()
     logger.info("Database initialized")
+
+    # 管理员在「系统设置」页改过的 LLM / 视觉配置：DB 覆盖 .env，直接写进 settings 实例。
+    # 放在 init_db 之后是因为表要先建好；放在闸门日志之前是为了让启动日志打的是生效值。
+    from app import settings_store
+    from app.database import AsyncSessionLocal
+    try:
+        async with AsyncSessionLocal() as db:
+            n = await settings_store.load_overrides(db)
+        if n:
+            logger.info(
+                "已加载 %d 项页面覆盖配置 | provider=%s model=%s",
+                n, settings.llm_provider, settings.llm_model,
+            )
+    except Exception as exc:  # noqa: BLE001 — 覆盖加载失败只能回退 .env，不能拦住启动
+        logger.warning("加载页面覆盖配置失败，沿用 .env：%s", exc)
 
     from app.limits import llm_gate
     logger.info(
@@ -160,6 +176,7 @@ app.include_router(knowledge_router, prefix="/api", tags=["knowledge"])
 app.include_router(feedback_router, prefix="/api", tags=["feedback"])
 app.include_router(prompts_router, prefix="/api", tags=["prompts"])
 app.include_router(limits_router, prefix="/api", tags=["limits"])
+app.include_router(settings_router, prefix="/api", tags=["settings"])
 
 
 @app.get("/health")

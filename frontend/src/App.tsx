@@ -4,6 +4,7 @@ import CasesPage from './pages/CasesPage'
 import KnowledgePage from './pages/KnowledgePage'
 import NegativeFeedbackPage from './pages/NegativeFeedbackPage'
 import UsagePage from './pages/UsagePage'
+import SettingsPage from './pages/SettingsPage'
 import LoginPage from './pages/LoginPage'
 import ProjectPickerPage from './pages/ProjectPickerPage'
 import type { ViewKey } from './components/TabBar'
@@ -145,6 +146,11 @@ export default function App() {
         {user.is_admin && (
           <div className={view === 'usage' ? 'block h-full' : 'hidden'}>
             <UsagePage view={view} onChangeView={setView} />
+          </div>
+        )}
+        {user.is_admin && (
+          <div className={view === 'settings' ? 'block h-full' : 'hidden'}>
+            <SettingsPage view={view} onChangeView={setView} />
           </div>
         )}
       </div>

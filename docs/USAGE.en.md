@@ -271,6 +271,8 @@ Other boundaries you will actually hit:
 
 > Admins can check token spend per account by day/week/month (up to 31 buckets) via `GET /api/limits/usage?granularity=day|week|month&periods=N`, or in the "Token 用量" page in the UI; any user can check their own remaining quota via `GET /api/limits/status`.
 
+> **Admin "System Settings" page** (bottom of the left nav, admins only): the main LLM group (provider / model / API key / base URL / timeout / per-agent max_tokens / document char limit) and the vision group can be edited in the browser. Saving **takes effect immediately, no restart**; precedence is page override > `.env` > code default, and every field has a one-click "restore .env". "Test connection" sends a minimal request with the values in the form before you save. API keys are encrypted at rest with a key derived from `JWT_SECRET`, so set `JWT_SECRET` in production first — otherwise keys saved on the page are lost on restart and fall back to `.env`. Database, JWT, admin list, concurrency gate and embedding dimension still live only in `.env`.
+
 ---
 
 ## 11. FAQ

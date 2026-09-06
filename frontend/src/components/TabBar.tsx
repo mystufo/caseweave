@@ -1,8 +1,8 @@
-import { MessageSquare, ListChecks, BookOpen, LineChart, Gauge } from 'lucide-react'
+import { MessageSquare, ListChecks, BookOpen, LineChart, Gauge, SlidersHorizontal } from 'lucide-react'
 import type { LucideIcon } from 'lucide-react'
 import { getCurrentUser } from '../api/client'
 
-export type ViewKey = 'chat' | 'cases' | 'knowledge' | 'feedback' | 'usage'
+export type ViewKey = 'chat' | 'cases' | 'knowledge' | 'feedback' | 'usage' | 'settings'
 
 interface Props {
   value: ViewKey
@@ -15,6 +15,7 @@ const tabs: { key: ViewKey; label: string; icon: LucideIcon; adminOnly?: boolean
   { key: 'knowledge', label: '知识库', icon: BookOpen },
   { key: 'feedback', label: '进化报告', icon: LineChart },
   { key: 'usage', label: 'Token 用量', icon: Gauge, adminOnly: true },
+  { key: 'settings', label: '系统设置', icon: SlidersHorizontal, adminOnly: true },
 ]
 
 export default function TabBar({ value, onChange }: Props) {
