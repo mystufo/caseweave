@@ -32,6 +32,18 @@ class Settings(BaseSettings):
     clarifier_max_tokens: int = 8192
     knowledge_max_tokens: int = 8192
 
+    # ── 两阶段生成（先穷举功能点清单，再按功能点分批写用例）──────────────────────
+    # 背景：单次调用时模型写到自己"舒适长度"就停，用例数与文档规模无关（6 千字和 6 万字
+    # 都只出 16~18 条）。两阶段把数量交给文档结构决定。代价：每批都重发一遍文档，输入
+    # token ≈ (1 + 批数) 倍；调用次数 = 1 + 批数，总耗时相应变长。
+    #   two_stage=false      → 退回旧的单次生成
+    #   batch_size           → 每批写几个功能点的用例（每个功能点约 3~6 条），6 ≈ 每批 20~30 条
+    #   batch_concurrency    → 批次并行度。同一请求内并行，不受 LLM_MAX_CONCURRENCY 闸门约束，
+    #                          只受网关 RPM/TPM 限制；网关报 429 就调到 1
+    generator_two_stage: bool = True
+    generator_batch_size: int = 6
+    generator_batch_concurrency: int = 2
+
     # 文档正文喂给 LLM 前的字符上限（truncate_for_llm 的默认 limit）。超过则保留开头 70% +
     # 结尾，中间换成省略提示。注意这是**输入侧**上限，与上面的 *_max_tokens（输出侧）无关。
     # 30000 字中文 ≈ 20000 token；往上调时记得给 prompt + PRD/脑图两份 + 知识注入 +

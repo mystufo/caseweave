@@ -5,6 +5,7 @@
   - clarifier_followup  续答澄清
   - generator           用例生成
   - mindmap_generator   测试脑图生成
+  - test_point_extractor 用例生成第一阶段：穷举功能点清单
 
 代码里的常量是每个 key 的“原始建议版本”（default）。网页端允许用户基于它
 另存为新版本并选择激活。运行时：
@@ -26,6 +27,7 @@ from app.agents.clarifier import SYSTEM_PROMPT as CLARIFIER_INITIAL_DEFAULT
 from app.agents.clarifier import FOLLOWUP_SYSTEM_PROMPT as CLARIFIER_FOLLOWUP_DEFAULT
 from app.agents.generator import SYSTEM_PROMPT as GENERATOR_DEFAULT
 from app.agents.mindmap_generator import SYSTEM_PROMPT as MINDMAP_DEFAULT
+from app.agents.test_point_extractor import SYSTEM_PROMPT as TEST_POINT_DEFAULT
 from app.models.knowledge import PromptVersion
 
 logger = logging.getLogger("caseweave.prompts")
@@ -61,6 +63,13 @@ PROMPT_SPECS: list[PromptSpec] = [
         label="测试用例生成",
         description="根据文档 + 澄清结果生成结构化测试用例 JSON。",
         default_text=GENERATOR_DEFAULT,
+    ),
+    PromptSpec(
+        key="test_point_extractor",
+        purpose="generation",
+        label="测试用例生成 · 功能点清单",
+        description="两阶段生成的第一步：通读文档 + 澄清结果，穷举需要测试的功能点（sub 编号段 / 覆盖范围 / 优先级），之后按功能点分批写用例。",
+        default_text=TEST_POINT_DEFAULT,
     ),
     PromptSpec(
         key="mindmap_generator",

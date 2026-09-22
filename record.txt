@@ -1501,6 +1501,43 @@ Bugfix — 文档解析冻住 event loop（"其他窗口点按钮没反应"）
   「已加载 2 项页面覆盖配置」、reset 后回到 env 来源。
 
 ================================================================================
+用例生成改两阶段 —— 先穷举功能点清单，再按功能点分批写用例（2026-09-17）
+================================================================================
+  现象：不管 PRD 多大，生成的用例总是 16~18 条，近三次都恰好 18 条。
+
+  排查：翻了 7 月以来全部 14 次 generator 的 prompt dump。
+  - 不是截断：finish_reason 全是 stop，GENERATOR_MAX_TOKENS=65536 远没碰到，无 salvage 日志；
+    路由层也没有对数组切片。
+  - 用例数和文档大小无关：6 千字和 6 万字的 PRD 都出 16~18 条；近期响应体量稳定在
+    11~13 KB。模型写到自己"舒适长度"就停笔，输出长度不受输入驱动。
+  - prompt 自 7/28 没变过。它只说"每个功能点至少 1 正 2 反"，从不要求先列功能点、也没有
+    与文档规模挂钩的总量；"严禁按步骤拆分"又在压数量。temperature 0.2 让这个行为高度稳定。
+  - 8 月中旬前是 22~31 条，之后掉到 15~19：.env 不在 git 里无法确认，怀疑那时换过方舟接入点。
+
+  改法（agents/generator.py + 新增 agents/test_point_extractor.py）：
+  1) 阶段 1 test_point_extractor：同一份上下文（脑图/PRD/澄清/知识/skills），只做测试分析，
+     输出功能点清单 [{sub, feature, scope, priority}]。sub 规整成 [A-Z0-9-]{2,20} 且唯一，
+     作为该功能点用例编号的中段。提示词登记为 prompt key `test_point_extractor`，可版本化。
+  2) 阶段 2 分批：按 generator_batch_size（默认 6）均分（13 个 → 5/4/4 而不是 6/6/1），
+     每批的 user prompt 末尾换成"本批只写这 N 个功能点 + 各自 scope + 编号用对应 sub"，
+     system prompt 仍是项目激活的 generator 版本（老版本零改动可用）。批间
+     asyncio.Semaphore(generator_batch_concurrency，默认 2) 限流——这是同一请求内的并行，
+     不过 LLM_MAX_CONCURRENCY 闸门，只受网关 RPM/TPM 约束。
+  3) 合并：按批次顺序拼接；case_number 撞车（模型没按 sub 编号）时顺延尾号。
+  4) 降级：阶段 1 失败/空清单 → 退回旧的单次生成；单批失败记 warning 跳过；全批失败再回
+     单次生成。不会比以前更差。
+  5) 路由 routes_generate 改调 generate_test_cases_detailed，系统气泡带"识别 N 个功能点，
+     分 M 批生成"；generate_done meta 多了 mode/test_points/batches/failed_batches。
+  6) 三个开关（GENERATOR_TWO_STAGE / BATCH_SIZE / BATCH_CONCURRENCY）进 config + .env.example，
+     也挂到管理员「系统设置」页热改（settings_store.EDITABLE）。
+  7) 流式分支 stream_generate_test_cases 未动（前端不用），仍是单次生成。
+
+  代价：调用次数 = 1 + 批数；每批重发一遍文档，输入 token ≈ (1 + 批数) 倍；总耗时变长。
+  前端 /api/generate 没设 axios 超时，本机没问题；公网若有 Nginx 反代注意 proxy_read_timeout。
+
+  dump 文件名：test_points.txt（阶段 1）、generator_b{i}of{n}.txt（各批）、generator.txt（单次回退）。
+
+================================================================================
 快速启动
 ================================================================================
   1. cp .env.example .env  （填写 LLM_API_KEY）

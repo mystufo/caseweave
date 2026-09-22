@@ -44,7 +44,7 @@ Copy `.env.example` to `.env` and fill in `LLM_API_KEY` before running.
 - `api/` — route modules: `routes_chat`, `routes_upload`, `routes_generate`, `routes_knowledge`, `routes_feedback`, `routes_settings`（管理员系统设置）
 - `settings_store.py` — 网页可改配置的白名单（`EDITABLE`）、校验、Fernet 加密、DB 覆盖加载 / 热更新
 - `agents/clarifier.py` — LLM call to identify ambiguities in a document, returns JSON question list
-- `agents/generator.py` — LLM call to produce structured test case JSON array
+- `agents/generator.py` — two-stage generation (default, `GENERATOR_TWO_STAGE`): `agents/test_point_extractor.py` first enumerates a test-point list (sub-code / scope / priority), then the generator writes cases per batch of `GENERATOR_BATCH_SIZE` points (batches run with `GENERATOR_BATCH_CONCURRENCY`), results merged + case numbers de-duplicated. Falls back to single-shot when stage 1 yields nothing. Rationale: single-shot output plateaus at ~16-18 cases regardless of doc size
 - `tools/doc_parser.py` — `.docx` via python-docx, `.pdf` via pdfplumber
 - `tools/excel_export.py` — openpyxl export, per-module sheets, frozen header
 
@@ -100,5 +100,5 @@ Agents in `backend/app/agents/` construct the LLM client directly — to add GLM
 
 Both are now **DB-backed**, not file-based — the `prompts/` and `skills/` directories are empty.
 
-- **Prompts** — 3 system prompts (`clarifier_initial`, `clarifier_followup`, `generator`) are versioned in the `PromptVersion` table, isolated per project. `backend/app/prompts/registry.py` registers the logical keys; the in-code constants serve as each key's default ("原始建议版本"). Runtime loads the project's active version, falling back to the default constant when none is set. Agent functions take a `system_prompt` parameter injected by the route layer.
+- **Prompts** — system prompts (`clarifier_initial`, `clarifier_followup`, `generator`, `test_point_extractor`, `mindmap_generator`) are versioned in the `PromptVersion` table, isolated per project. `backend/app/prompts/registry.py` registers the logical keys; the in-code constants serve as each key's default ("原始建议版本"). Runtime loads the project's active version, falling back to the default constant when none is set. Agent functions take a `system_prompt` parameter injected by the route layer.
 - **Skills** — reusable test-design knowledge per module, stored in the `Skill` table (CRUD + LLM auto-generation via `agents/skill_generator.py`), injected into the Generator prompt.

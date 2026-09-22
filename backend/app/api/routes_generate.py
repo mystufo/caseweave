@@ -16,7 +16,7 @@ from app.models.knowledge import Document, Module, ModuleRelation, KnowledgeEntr
 from app.models.feedback import TestCase
 from app.models.clarification import ClarificationState
 from app.models.user import User
-from app.agents.generator import generate_test_cases, stream_generate_test_cases
+from app.agents.generator import generate_test_cases_detailed, stream_generate_test_cases
 from app.knowledge.store import search_relevant, summarize_for_prompt, HitEntry
 from app.api._assistant_messages import record_knowledge_selection
 from app.config import get_settings
@@ -329,7 +329,9 @@ async def generate(
     # 前端"停止任务"会 abort axios 请求 → 关闭连接。非流式 handler 默认不会因此被取消
     # （它从不 await receive()），LLM 调用会白跑到底。这里让 LLM 任务与"断连轮询"竞速：
     # 客户端一断开就 cancel 掉 llm_task → 取消底层 httpx 请求 → 真正停止到大模型的调用。
-    llm_task = asyncio.create_task(generate_test_cases(
+    # 两阶段生成：第一阶段的功能点清单提示词也走版本化（key=test_point_extractor）
+    test_point_system_prompt = await get_active_prompt_text(db, project_id, "test_point_extractor")
+    llm_task = asyncio.create_task(generate_test_cases_detailed(
         doc_content=doc_content,
         module_name=module_name,
         case_prefix=case_prefix,
@@ -339,6 +341,7 @@ async def generate(
         relevant_knowledge=relevant_knowledge,
         mindmap_content=mindmap_content,
         system_prompt=generator_system_prompt,
+        test_point_system_prompt=test_point_system_prompt,
     ))
 
     async def _watch_disconnect():
@@ -360,7 +363,8 @@ async def generate(
             await watch_task
         except asyncio.CancelledError:
             pass
-        cases = llm_task.result()
+        gen_result = llm_task.result()
+        cases = gen_result.cases
     else:
         # 客户端已断开：取消 LLM 任务（连带取消到大模型的 httpx 请求），不落库直接返回。
         llm_task.cancel()
@@ -402,11 +406,22 @@ async def generate(
         "total": len(db_cases),
         "module": module_name,
         "case_prefix": case_prefix,
+        "mode": gen_result.mode,
+        "test_points": len(gen_result.test_points),
+        "batches": gen_result.batches,
+        "failed_batches": gen_result.failed_batches,
     }}
+    if gen_result.mode == "two_stage":
+        detail = f"（识别 {len(gen_result.test_points)} 个功能点，分 {gen_result.batches} 批生成"
+        if gen_result.failed_batches:
+            detail += f"，其中 {gen_result.failed_batches} 批失败已跳过"
+        detail += "）"
+    else:
+        detail = ""
     gen_msg = Message(
         session_id=request.session_id,
         role="assistant",
-        content=f"已按模块「{module_name}」（编号前缀 {case_prefix}）生成 **{len(db_cases)}** 条测试用例。",
+        content=f"已按模块「{module_name}」（编号前缀 {case_prefix}）生成 **{len(db_cases)}** 条测试用例{detail}。",
         meta=json.dumps(gen_msg_meta, ensure_ascii=False),
     )
     db.add(gen_msg)

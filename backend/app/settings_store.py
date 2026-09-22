@@ -87,6 +87,12 @@ EDITABLE: tuple[FieldSpec, ...] = (
               kind="int", min=1024, max=200000),
     FieldSpec("doc_max_chars", "llm", "文档输入字符上限", "输入侧上限，超过则保留开头 70% + 结尾。30000 字中文 ≈ 20000 token",
               kind="int", min=1000, max=2000000),
+    FieldSpec("generator_two_stage", "llm", "两阶段生成用例", "先穷举功能点清单、再按功能点分批写用例，用例数由文档规模决定；关闭则退回单次生成（模型通常只出 16~18 条）",
+              kind="bool"),
+    FieldSpec("generator_batch_size", "llm", "每批功能点数", "两阶段生成时每次 LLM 调用负责几个功能点（每个功能点约 3~6 条用例）。越小覆盖越细、调用次数越多",
+              kind="int", min=1, max=50),
+    FieldSpec("generator_batch_concurrency", "llm", "批次并行度", "同一请求内并行发几批。受网关 RPM/TPM 限制，报 429 就调到 1",
+              kind="int", min=1, max=8),
     # ── Vision ──
     FieldSpec("vision_enabled", "vision", "启用图片识别", "关闭时飞书文档里的图片直接丢弃（画板仍走结构化提取）",
               kind="bool"),

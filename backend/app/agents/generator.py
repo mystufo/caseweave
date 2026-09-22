@@ -1,6 +1,13 @@
-"""Generator Agent: produces structured test cases from doc + clarifications."""
+"""Generator Agent: produces structured test cases from doc + clarifications.
+
+默认走两阶段生成（先穷举功能点清单，再按功能点分批写用例），见文件下半部分说明。
+"""
+import asyncio
 import logging
+import math
+import re
 import time
+from dataclasses import dataclass, field
 from typing import Any
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import SystemMessage, HumanMessage
@@ -134,89 +141,161 @@ def _salvage_truncated_json_array(raw: str) -> list | None:
         return None
 
 
-async def generate_test_cases(
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 两阶段生成（默认开启，settings.generator_two_stage）
+#
+#   阶段 1  test_point_extractor.extract_test_points：只做测试分析，穷举功能点清单
+#   阶段 2  按功能点分批（settings.generator_batch_size 个/批）调用 generator，
+#           每批只写自己那几个功能点的用例，批间受 settings.generator_batch_concurrency 限流
+#   合并    按批次顺序拼接、去重 case_number
+#
+# 阶段 1 失败 / 空清单 → 退回旧的单次生成，保证不会比以前更差。
+# 单批失败 → 记 warning 跳过，其余批次照常入库。
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@dataclass
+class GenerationResult:
+    cases: list[dict[str, Any]]
+    test_points: list[dict[str, Any]] = field(default_factory=list)
+    batches: int = 0              # 实际发起的批次数；0 = 走了单次生成
+    failed_batches: int = 0
+    mode: str = "single"          # single | two_stage
+
+
+def _build_user_context(
+    *,
+    skills: str | None,
+    relevant_knowledge: str | None,
+    module_relations: str | None,
+    mindmap_content: str | None,
     doc_content: str,
-    module_name: str,
-    case_prefix: str,
-    clarification_answers: dict[str, str] | None = None,
-    skills: str | None = None,
-    module_relations: str | None = None,
-    relevant_knowledge: str | None = None,
-    mindmap_content: str | None = None,
-    system_prompt: str | None = None,
-) -> list[dict[str, Any]]:
-    """
-    Generate structured test cases.
-    Returns a list of test case dicts matching the JSON schema above.
-    """
-    import json
-
-    llm = _build_llm()
-    active_system = system_prompt or SYSTEM_PROMPT
-
-    user_content = f"功能模块：{module_name}\n用例编号前缀（CASE_PREFIX，所有用例必须以 {case_prefix}- 开头，不要再加 TC- 之类的额外前缀）：{case_prefix}\n\n"
-
+    clarification_answers: dict[str, str] | None,
+) -> str:
+    """generator 与 test_point_extractor 共用的上下文段（不含开头的模块/前缀行与结尾指令）。"""
+    parts: list[str] = []
     # Skills 优先级最高：来自该模块历史用例修改沉淀的"测试设计经验"（人或 LLM 归纳的 Markdown 备忘单）。
     # 比项目知识库更"贴近测试意图"，所以注入位置在知识库之前。
     if skills:
-        user_content += (
+        parts.append(
             "## 测试设计经验（来自该模块历史用例修改沉淀，应优先参考）\n"
             f"{skills}\n\n"
         )
-
     if relevant_knowledge:
-        user_content += (
+        parts.append(
             "## 项目知识库（来自历史文档抽取，作为产品上下文参考；与当前文档冲突时以当前文档为准）\n"
             f"{relevant_knowledge}\n\n"
         )
-
     if module_relations:
-        user_content += f"## 模块关联关系\n{module_relations}\n\n"
-
+        parts.append(f"## 模块关联关系\n{module_relations}\n\n")
     # 脑图放在 PRD 之前，让 LLM 先看到测试人员的最终意图（system prompt 已声明冲突时以脑图为准）
     if mindmap_content:
-        user_content += f"## 测试脑图（与 PRD 冲突时以脑图为准）\n{mindmap_content}\n\n"
-
+        parts.append(f"## 测试脑图（与 PRD 冲突时以脑图为准）\n{mindmap_content}\n\n")
     if doc_content:
-        user_content += f"## 需求文档\n{doc_content}\n\n"
-
+        parts.append(f"## 需求文档\n{doc_content}\n\n")
     if clarification_answers:
         qa_text = "\n".join(f"Q: {q}\nA: {a}" for q, a in clarification_answers.items())
-        user_content += f"## 澄清确认结果\n{qa_text}\n\n"
+        parts.append(f"## 澄清确认结果\n{qa_text}\n\n")
+    return "".join(parts)
 
-    user_content += f"请根据以上信息生成完整的测试用例列表。提醒：所有 case_number 必须以 `{case_prefix}-` 开头，不要带 `TC-` 前缀。"
 
+def _user_header(module_name: str, case_prefix: str) -> str:
+    return (
+        f"功能模块：{module_name}\n"
+        f"用例编号前缀（CASE_PREFIX，所有用例必须以 {case_prefix}- 开头，不要再加 TC- 之类的额外前缀）：{case_prefix}\n\n"
+    )
+
+
+def _single_shot_tail(case_prefix: str) -> str:
+    return (
+        "请根据以上信息生成完整的测试用例列表。"
+        f"提醒：所有 case_number 必须以 `{case_prefix}-` 开头，不要带 `TC-` 前缀。"
+    )
+
+
+def _batch_tail(case_prefix: str, batch_points: list[dict[str, Any]], batch_no: int, total_batches: int) -> str:
+    lines = [
+        "## 本批次任务（重要）",
+        f"功能点清单已在上一步整理完毕并拆成 {total_batches} 批，这是第 {batch_no} 批。"
+        f"本次**只**为下面 {len(batch_points)} 个功能点编写用例；其它功能点由其它批次负责，不要越界，"
+        "也不要遗漏本批的任何一个功能点：",
+    ]
+    for i, p in enumerate(batch_points, start=1):
+        scope = f" —— {p['scope']}" if p.get("scope") else ""
+        lines.append(f"{i}. [{p['sub']}] {p['feature']}（整体优先级 {p['priority']}）{scope}")
+    lines += [
+        "",
+        "- 每个功能点至少 1 条正向 + 2 条反向/边界用例；其「覆盖范围」里提到的每个判定点都要有用例覆盖。",
+        f"- 用例编号使用对应功能点的 sub：`{case_prefix}-{{sub}}-001` 起、按功能点各自递增（例如 "
+        f"`{case_prefix}-{batch_points[0]['sub']}-001`）。不要带 `TC-` 前缀。",
+        "- 只输出本批功能点的用例 JSON 数组，不要输出其它说明文字。",
+    ]
+    return "\n".join(lines)
+
+
+def _parse_cases(raw: str, *, finish_reason: str | None, label: str) -> list[dict[str, Any]]:
+    """JSON 数组解析 + 截断兜底。失败返回 []。"""
+    import json
+
+    raw = (raw or "").strip()
+    # Strip markdown code fences if present
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+        raw = raw.strip()
+    try:
+        cases = json.loads(raw)
+        if isinstance(cases, list):
+            logger.info("Generator[%s] parsed %d cases", label, len(cases))
+            return [c for c in cases if isinstance(c, dict)]
+        logger.warning("Generator[%s] returned non-list JSON: %s", label, str(cases)[:200])
+        return []
+    except json.JSONDecodeError as exc:
+        # 最常见的失败模式：max_tokens 截断导致 JSON 末尾不完整。
+        # 先尝试从尾部回滚到最后一个完整对象，能救回大部分用例
+        salvaged = _salvage_truncated_json_array(raw)
+        if salvaged:
+            logger.warning(
+                "Generator[%s] JSON truncated (%s); salvaged %d cases via tail-rollback "
+                "(finish=%s, raw_len=%d, raw_head=%s)",
+                label, exc, len(salvaged), finish_reason, len(raw), raw[:200],
+            )
+            return [c for c in salvaged if isinstance(c, dict)]
+        logger.warning(
+            "Generator[%s] JSON parse failed (%s); finish=%s raw_len=%d head=%s tail=%s",
+            label, exc, finish_reason, len(raw), raw[:300], raw[-300:],
+        )
+        return []
+
+
+async def _invoke_generator(
+    *,
+    system_prompt: str,
+    user_content: str,
+    label: str,
+    dump_extra: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """一次 generator LLM 调用 → 解析后的用例列表。"""
+    llm = _build_llm()
     messages = [
-        SystemMessage(content=active_system),
+        SystemMessage(content=system_prompt),
         HumanMessage(content=user_content),
     ]
-
-    logger.info(
-        "Generator LLM call | module=%s prefix=%s doc_chars=%d mindmap_chars=%d answers=%d prompt_chars=%d",
-        module_name,
-        case_prefix,
-        len(doc_content or ""),
-        len(mindmap_content or ""),
-        len(clarification_answers or {}),
-        len(user_content),
-    )
+    logger.info("Generator LLM call[%s] | prompt_chars=%d", label, len(user_content))
     dump_path = dump_prompt(
-        agent="generator",
-        system=active_system,
+        agent=f"generator_{label}" if label != "single" else "generator",
+        system=system_prompt,
         user=user_content,
-        extra={
-            "module": module_name,
-            "case_prefix": case_prefix,
-            "doc_chars": len(doc_content or ""),
-            "mindmap_chars": len(mindmap_content or ""),
-            "answers": len(clarification_answers or {}),
-            "has_knowledge": bool(relevant_knowledge),
-        },
+        extra=dump_extra,
     )
     start = time.perf_counter()
     response = await llm.ainvoke(messages)
     elapsed_ms = (time.perf_counter() - start) * 1000
-    raw = response.content.strip()
+    raw = response.content if isinstance(response.content, str) else str(response.content)
+    raw = raw.strip()
     finish_reason = None
     try:
         meta = getattr(response, "response_metadata", {}) or {}
@@ -228,41 +307,194 @@ async def generate_test_cases(
     except Exception:
         pass
     logger.info(
-        "Generator LLM responded | response_chars=%d finish=%s (%.0fms)",
-        len(raw), finish_reason, elapsed_ms,
+        "Generator LLM responded[%s] | response_chars=%d finish=%s (%.0fms)",
+        label, len(raw), finish_reason, elapsed_ms,
     )
     dump_response(dump_path, raw, finish_reason=finish_reason)
+    return _parse_cases(raw, finish_reason=finish_reason, label=label)
 
-    # Strip markdown code fences if present
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-        raw = raw.strip()
 
-    try:
-        cases = json.loads(raw)
-        if isinstance(cases, list):
-            logger.info("Generator parsed %d cases", len(cases))
-            return cases
-        logger.warning("Generator returned non-list JSON: %s", str(cases)[:200])
+def _split_batches(points: list[dict[str, Any]], batch_size: int) -> list[list[dict[str, Any]]]:
+    """按 batch_size 均分（13 个 / 6 → 5/4/4，而不是 6/6/1，避免末批过小）。"""
+    if not points:
         return []
-    except json.JSONDecodeError as exc:
-        # 最常见的失败模式：max_tokens 截断导致 JSON 末尾不完整。
-        # 先尝试从尾部回滚到最后一个完整对象，能救回大部分用例
-        salvaged = _salvage_truncated_json_array(raw)
-        if salvaged:
-            logger.warning(
-                "Generator JSON truncated (%s); salvaged %d cases via tail-rollback "
-                "(finish=%s, raw_len=%d, raw_head=%s)",
-                exc, len(salvaged), finish_reason, len(raw), raw[:200],
-            )
-            return salvaged
-        logger.warning(
-            "Generator JSON parse failed (%s); finish=%s raw_len=%d head=%s tail=%s",
-            exc, finish_reason, len(raw), raw[:300], raw[-300:],
+    batch_size = max(1, batch_size)
+    n_batches = math.ceil(len(points) / batch_size)
+    base, extra = divmod(len(points), n_batches)
+    batches: list[list[dict[str, Any]]] = []
+    idx = 0
+    for b in range(n_batches):
+        size = base + (1 if b < extra else 0)
+        batches.append(points[idx: idx + size])
+        idx += size
+    return batches
+
+
+_TRAILING_NUM_RE = re.compile(r"^(.*?)(\d+)$")
+
+
+def _dedupe_case_numbers(cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """多批合并后 case_number 可能撞车（模型没按 sub 编号）；撞车的顺延尾号直到唯一。"""
+    seen: set[str] = set()
+    for c in cases:
+        num = str(c.get("case_number") or "").strip()
+        if not num:
+            continue
+        if num not in seen:
+            seen.add(num)
+            continue
+        m = _TRAILING_NUM_RE.match(num)
+        if not m:
+            seen.add(num)
+            continue
+        head, digits = m.group(1), m.group(2)
+        width, n = len(digits), int(digits)
+        candidate = num
+        while candidate in seen:
+            n += 1
+            candidate = f"{head}{n:0{width}d}"
+        c["case_number"] = candidate
+        seen.add(candidate)
+    return cases
+
+
+async def generate_test_cases_detailed(
+    doc_content: str,
+    module_name: str,
+    case_prefix: str,
+    clarification_answers: dict[str, str] | None = None,
+    skills: str | None = None,
+    module_relations: str | None = None,
+    relevant_knowledge: str | None = None,
+    mindmap_content: str | None = None,
+    system_prompt: str | None = None,
+    test_point_system_prompt: str | None = None,
+) -> GenerationResult:
+    """两阶段生成主入口。返回用例 + 功能点清单 + 批次统计。"""
+    from app.agents.test_point_extractor import extract_test_points
+
+    s = get_settings()
+    active_system = system_prompt or SYSTEM_PROMPT
+    context = _build_user_context(
+        skills=skills,
+        relevant_knowledge=relevant_knowledge,
+        module_relations=module_relations,
+        mindmap_content=mindmap_content,
+        doc_content=doc_content,
+        clarification_answers=clarification_answers,
+    )
+    header = _user_header(module_name, case_prefix)
+    base_extra = {
+        "module": module_name,
+        "case_prefix": case_prefix,
+        "doc_chars": len(doc_content or ""),
+        "mindmap_chars": len(mindmap_content or ""),
+        "answers": len(clarification_answers or {}),
+        "has_knowledge": bool(relevant_knowledge),
+    }
+    logger.info(
+        "Generator start | module=%s prefix=%s doc_chars=%d mindmap_chars=%d answers=%d two_stage=%s",
+        module_name, case_prefix, len(doc_content or ""), len(mindmap_content or ""),
+        len(clarification_answers or {}), s.generator_two_stage,
+    )
+
+    async def _single() -> GenerationResult:
+        cases = await _invoke_generator(
+            system_prompt=active_system,
+            user_content=header + context + _single_shot_tail(case_prefix),
+            label="single",
+            dump_extra=base_extra,
         )
-        return []
+        return GenerationResult(cases=cases, mode="single")
+
+    if not s.generator_two_stage:
+        return await _single()
+
+    # ── 阶段 1：功能点清单 ────────────────────────────────────────────────────
+    points = await extract_test_points(
+        context, module_name=module_name, case_prefix=case_prefix,
+        system_prompt=test_point_system_prompt,
+    )
+    if not points:
+        logger.warning("Two-stage: no test points extracted, falling back to single-shot generation")
+        return await _single()
+
+    # ── 阶段 2：分批生成 ──────────────────────────────────────────────────────
+    batches = _split_batches(points, s.generator_batch_size)
+    total = len(batches)
+    sem = asyncio.Semaphore(max(1, s.generator_batch_concurrency))
+    logger.info(
+        "Two-stage: %d test points → %d batches (size≈%d, concurrency=%d)",
+        len(points), total, s.generator_batch_size, s.generator_batch_concurrency,
+    )
+
+    async def _run_batch(i: int, batch: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        label = f"b{i}of{total}"
+        async with sem:
+            return await _invoke_generator(
+                system_prompt=active_system,
+                user_content=header + context + _batch_tail(case_prefix, batch, i, total),
+                label=label,
+                dump_extra={**base_extra, "batch": f"{i}/{total}",
+                            "batch_subs": ",".join(p["sub"] for p in batch)},
+            )
+
+    results = await asyncio.gather(
+        *(_run_batch(i, b) for i, b in enumerate(batches, start=1)),
+        return_exceptions=True,
+    )
+    merged: list[dict[str, Any]] = []
+    failed = 0
+    for i, r in enumerate(results, start=1):
+        if isinstance(r, BaseException):
+            failed += 1
+            logger.warning("Two-stage: batch %d/%d failed: %s", i, total, r)
+            continue
+        merged.extend(r)
+    merged = _dedupe_case_numbers(merged)
+    logger.info(
+        "Two-stage done | points=%d batches=%d failed=%d cases=%d",
+        len(points), total, failed, len(merged),
+    )
+    if not merged and failed == total:
+        # 所有批次全挂（通常是网关/网络问题）——再给单次生成一次机会
+        logger.warning("Two-stage: all batches failed, falling back to single-shot generation")
+        return await _single()
+    return GenerationResult(
+        cases=merged, test_points=points, batches=total, failed_batches=failed, mode="two_stage",
+    )
+
+
+async def generate_test_cases(
+    doc_content: str,
+    module_name: str,
+    case_prefix: str,
+    clarification_answers: dict[str, str] | None = None,
+    skills: str | None = None,
+    module_relations: str | None = None,
+    relevant_knowledge: str | None = None,
+    mindmap_content: str | None = None,
+    system_prompt: str | None = None,
+    test_point_system_prompt: str | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Generate structured test cases.
+    Returns a list of test case dicts matching the JSON schema above.
+    （兼容旧签名的薄封装；要拿功能点/批次统计用 generate_test_cases_detailed）
+    """
+    result = await generate_test_cases_detailed(
+        doc_content=doc_content,
+        module_name=module_name,
+        case_prefix=case_prefix,
+        clarification_answers=clarification_answers,
+        skills=skills,
+        module_relations=module_relations,
+        relevant_knowledge=relevant_knowledge,
+        mindmap_content=mindmap_content,
+        system_prompt=system_prompt,
+        test_point_system_prompt=test_point_system_prompt,
+    )
+    return result.cases
 
 
 async def stream_generate_test_cases(
@@ -276,31 +508,21 @@ async def stream_generate_test_cases(
     mindmap_content: str | None = None,
     system_prompt: str | None = None,
 ):
-    """Stream-generate test cases token by token."""
+    """Stream-generate test cases token by token（单次生成；流式分支不走两阶段）。"""
     llm = _build_llm()
     active_system = system_prompt or SYSTEM_PROMPT
-
-    user_content = f"功能模块：{module_name}\n用例编号前缀（CASE_PREFIX，所有用例必须以 {case_prefix}- 开头，不要再加 TC- 之类的额外前缀）：{case_prefix}\n\n"
-    if skills:
-        user_content += (
-            "## 测试设计经验（来自该模块历史用例修改沉淀，应优先参考）\n"
-            f"{skills}\n\n"
+    user_content = (
+        _user_header(module_name, case_prefix)
+        + _build_user_context(
+            skills=skills,
+            relevant_knowledge=relevant_knowledge,
+            module_relations=module_relations,
+            mindmap_content=mindmap_content,
+            doc_content=doc_content,
+            clarification_answers=clarification_answers,
         )
-    if relevant_knowledge:
-        user_content += (
-            "## 项目知识库（来自历史文档抽取，作为产品上下文参考；与当前文档冲突时以当前文档为准）\n"
-            f"{relevant_knowledge}\n\n"
-        )
-    if module_relations:
-        user_content += f"## 模块关联关系\n{module_relations}\n\n"
-    if mindmap_content:
-        user_content += f"## 测试脑图（与 PRD 冲突时以脑图为准）\n{mindmap_content}\n\n"
-    if doc_content:
-        user_content += f"## 需求文档\n{doc_content}\n\n"
-    if clarification_answers:
-        qa_text = "\n".join(f"Q: {q}\nA: {a}" for q, a in clarification_answers.items())
-        user_content += f"## 澄清确认结果\n{qa_text}\n\n"
-    user_content += f"请根据以上信息生成完整的测试用例列表。提醒：所有 case_number 必须以 `{case_prefix}-` 开头，不要带 `TC-` 前缀。"
+        + _single_shot_tail(case_prefix)
+    )
 
     messages = [
         SystemMessage(content=active_system),
