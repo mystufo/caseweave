@@ -7,7 +7,7 @@ interface Props {
   currentStep: number
 }
 
-const CASES_STEPS = ['上传资料', '确认模块', '审核知识', '澄清', '生成用例']
+const CASES_STEPS = ['上传资料', '确认模块', '审核知识', '澄清', '确认功能点', '生成用例']
 const MINDMAP_STEPS = ['上传需求文档', '澄清', '生成脑图', '存入飞书']
 
 export default function FlowSteps({ mode, currentStep }: Props) {

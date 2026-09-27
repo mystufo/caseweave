@@ -2,6 +2,7 @@
 import asyncio
 import json
 import re
+from dataclasses import dataclass
 from fastapi import APIRouter, Depends, HTTPException, Query, Header, Request
 from fastapi.responses import StreamingResponse, Response
 from pydantic import BaseModel
@@ -9,14 +10,17 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import authorize_project, decode_token, get_current_user, require_project
-from app.limits import Ticket, llm_gate, llm_ticket
+from app.limits import Ticket, llm_gate, llm_slot, llm_ticket
 from app.database import get_db
 from app.models.session import Session, Message
 from app.models.knowledge import Document, Module, ModuleRelation, KnowledgeEntry, Skill
 from app.models.feedback import TestCase
 from app.models.clarification import ClarificationState
 from app.models.user import User
-from app.agents.generator import generate_test_cases_detailed, stream_generate_test_cases
+from app.agents.generator import (
+    build_user_context, generate_test_cases_detailed, stream_generate_test_cases,
+)
+from app.agents.test_point_extractor import extract_test_points
 from app.knowledge.store import search_relevant, summarize_for_prompt, HitEntry
 from app.api._assistant_messages import record_knowledge_selection
 from app.config import get_settings
@@ -62,6 +66,16 @@ class GenerateRequest(BaseModel):
     #   非空  → 仅按这些 id 加载并注入，跳过自动 search
     knowledge_ids: list[int] | None = None
     stream: bool = False
+    # 两阶段生成：用户在「功能点确认」面板上确认/修改过的清单。非空 → 跳过阶段 1 直接分批；
+    # None/[] → 后端自己跑阶段 1（老前端 / 命令行仍可用）。
+    test_points: list["TestPointIn"] | None = None
+
+
+class TestPointIn(BaseModel):
+    sub: str = ""
+    feature: str
+    scope: str = ""
+    priority: str = "P2"
 
 
 def _normalize_case_number(raw: str, prefix: str, fallback_index: int) -> str:
@@ -93,17 +107,26 @@ def _normalize_case_number(raw: str, prefix: str, fallback_index: int) -> str:
     return f"{prefix}-{suffix}"
 
 
-@router.post("/generate")
-async def generate(
-    request: GenerateRequest,
-    raw_request: Request,
-    project_id: int = Depends(require_project),
-    # 用 llm_ticket（取号不等待）而不是 llm_slot：本路由既有流式分支也有非流式分支，
-    # 流式分支的名额要一直握到流跑完，只能由 wrap_stream 负责归还。
-    _ticket: Ticket = Depends(llm_ticket),
-    db: AsyncSession = Depends(get_db),
-):
-    """Generate test cases from an uploaded document."""
+@dataclass
+class _GenContext:
+    """/generate 与 /generate/test-points 共用的、已经校验 + 组装好的生成上下文。"""
+    case_prefix: str
+    module_name: str
+    doc_content: str
+    mindmap_content: str | None
+    relevant_knowledge: str | None
+    module_relations_str: str | None
+    skills_str: str | None
+
+
+async def _build_generation_context(
+    request: GenerateRequest, project_id: int, db: AsyncSession,
+) -> _GenContext:
+    """校验请求、加载文档/模块，拼出知识库 / 模块关系 / Skills 三段注入文本。
+
+    两阶段生成的"识别功能点"接口和"生成用例"接口拿到的上下文必须一模一样，
+    所以抽成一个函数；任何校验失败直接抛 HTTPException。
+    """
     # Validate case prefix (required for consistent numbering)
     case_prefix = (request.case_prefix or "").strip().upper()
     if not case_prefix:
@@ -287,6 +310,111 @@ async def generate(
         except Exception:
             skills_str = None
 
+    return _GenContext(
+        case_prefix=case_prefix,
+        module_name=module_name,
+        doc_content=doc_content,
+        mindmap_content=mindmap_content,
+        relevant_knowledge=relevant_knowledge,
+        module_relations_str=module_relations_str,
+        skills_str=skills_str,
+    )
+
+
+@router.post("/generate/test-points")
+async def extract_generation_test_points(
+    request: GenerateRequest,
+    project_id: int = Depends(require_project),
+    _slot: Ticket = Depends(llm_slot),  # 并发闸门 + 每日配额（要调一次 LLM）
+    db: AsyncSession = Depends(get_db),
+):
+    """两阶段生成的第一步：识别功能点清单，写入 clarification_states.test_points 并返回，
+    等用户在前端确认/修改后再带着清单调 /generate。
+
+    两阶段开关关闭时返回空清单 + two_stage=false，前端应直接调 /generate。
+    """
+    settings = get_settings()
+    if not settings.generator_two_stage:
+        return {"session_id": request.session_id, "two_stage": False, "test_points": [],
+                "batch_size": settings.generator_batch_size, "assistant_message": None}
+
+    ctx = await _build_generation_context(request, project_id, db)
+    context = build_user_context(
+        skills=ctx.skills_str,
+        relevant_knowledge=ctx.relevant_knowledge,
+        module_relations=ctx.module_relations_str,
+        mindmap_content=ctx.mindmap_content,
+        doc_content=ctx.doc_content,
+        clarification_answers=request.clarification_answers,
+    )
+    system_prompt = await get_active_prompt_text(db, project_id, "test_point_extractor")
+    points = await extract_test_points(
+        context, module_name=ctx.module_name, case_prefix=ctx.case_prefix,
+        system_prompt=system_prompt,
+    )
+
+    state_q = await db.execute(
+        select(ClarificationState).where(ClarificationState.session_id == request.session_id)
+    )
+    state = state_q.scalar_one_or_none()
+    msg_payload = None
+    if points:
+        n_batches = -(-len(points) // max(1, settings.generator_batch_size))
+        meta = {"kind": "test_points_ready", "ref": {
+            "total": len(points), "batches": n_batches,
+            "module": ctx.module_name, "case_prefix": ctx.case_prefix,
+        }}
+        msg = Message(
+            session_id=request.session_id,
+            role="assistant",
+            content=(
+                f"已从需求中识别出 **{len(points)}** 个功能点（模块「{ctx.module_name}」，编号前缀 {ctx.case_prefix}），"
+                f"预计分 {n_batches} 批生成。请在下方确认或修改功能点清单后开始生成。"
+            ),
+            meta=json.dumps(meta, ensure_ascii=False),
+        )
+        db.add(msg)
+        if state is not None:
+            state.test_points = points
+            state.status = "awaiting_test_points"
+            state.confirmed_module_name = ctx.module_name
+            state.confirmed_case_prefix = ctx.case_prefix
+        await db.commit()
+        await db.refresh(msg)
+        msg_payload = {
+            "id": msg.id, "role": msg.role, "content": msg.content, "meta": meta,
+            "created_at": msg.created_at.isoformat() if msg.created_at else None,
+        }
+    # 识别失败/空清单：不改状态，前端直接调 /generate（后端会再试一次阶段 1，仍失败则单次生成）
+
+    return {
+        "session_id": request.session_id,
+        "two_stage": True,
+        "module_name": ctx.module_name,
+        "case_prefix": ctx.case_prefix,
+        "test_points": points,
+        "batch_size": settings.generator_batch_size,
+        "assistant_message": msg_payload,
+    }
+
+
+@router.post("/generate")
+async def generate(
+    request: GenerateRequest,
+    raw_request: Request,
+    project_id: int = Depends(require_project),
+    # 用 llm_ticket（取号不等待）而不是 llm_slot：本路由既有流式分支也有非流式分支，
+    # 流式分支的名额要一直握到流跑完，只能由 wrap_stream 负责归还。
+    _ticket: Ticket = Depends(llm_ticket),
+    db: AsyncSession = Depends(get_db),
+):
+    """Generate test cases from an uploaded document."""
+    ctx = await _build_generation_context(request, project_id, db)
+    case_prefix, module_name = ctx.case_prefix, ctx.module_name
+    doc_content, mindmap_content = ctx.doc_content, ctx.mindmap_content
+    relevant_knowledge = ctx.relevant_knowledge
+    module_relations_str, skills_str = ctx.module_relations_str, ctx.skills_str
+
     # 在请求 session 仍有效时解析激活的生成提示词；流式分支的 event_stream()
     # 运行时外层 db 可能已随响应关闭，故提前取好再传入。
     generator_system_prompt = await get_active_prompt_text(db, project_id, "generator")
@@ -342,6 +470,7 @@ async def generate(
         mindmap_content=mindmap_content,
         system_prompt=generator_system_prompt,
         test_point_system_prompt=test_point_system_prompt,
+        test_points=[tp.model_dump() for tp in request.test_points] if request.test_points else None,
     ))
 
     async def _watch_disconnect():
@@ -436,6 +565,8 @@ async def generate(
         state.confirmed_case_prefix = case_prefix
         state.ready_to_generate = True
         state.current_questions = []
+        # 最终用于生成的功能点清单（用户改过的版本）留档；单次生成路径为空表
+        state.test_points = gen_result.test_points or None
 
     await db.commit()
     await db.refresh(gen_msg)

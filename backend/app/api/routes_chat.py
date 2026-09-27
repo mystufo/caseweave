@@ -339,6 +339,8 @@ async def get_clarification_state(
         "current_questions": st.current_questions or [],
         "ready_to_generate": st.ready_to_generate,
         "status": st.status,
+        # 两阶段生成：待确认的功能点清单（status=awaiting_test_points 时前端据此恢复面板）
+        "test_points": st.test_points or None,
         "updated_at": st.updated_at.isoformat() if st.updated_at else None,
     }
 

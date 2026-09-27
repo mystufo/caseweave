@@ -1538,6 +1538,32 @@ Bugfix — 文档解析冻住 event loop（"其他窗口点按钮没反应"）
   dump 文件名：test_points.txt（阶段 1）、generator_b{i}of{n}.txt（各批）、generator.txt（单次回退）。
 
 ================================================================================
+生成前先让用户确认/修改功能点清单（2026-09-27）
+================================================================================
+  两阶段生成上线后系统气泡会说"识别 27 个功能点，分 5 批生成"，但用户看不到、也改不了
+  这份清单。现在把阶段 1 拆成流程里一个可停留的步骤，和「审核知识」同一套模式。
+
+  流程：澄清答完 → 只跑功能点识别（约 1 分钟）→ 面板列出清单，可改名称/覆盖范围/优先级/
+  编号段、删除、新增、上下移 → 点「按这 N 个功能点生成用例」→ 后端跳过识别直接分批。
+  顶部步骤条 5 步变 6 步（上传/确认模块/审核知识/澄清/确认功能点/生成用例）。
+
+  后端：
+  - clarification_states 新列 test_points JSONB（alembic 0010），新状态 awaiting_test_points。
+  - routes_generate：上下文组装抽成 _build_generation_context（两个接口拿到的上下文必须一样）；
+    新增 POST /api/generate/test-points（llm_slot 闸门）→ 识别、落库、写系统气泡
+    "已识别 N 个功能点…请确认"；两阶段开关关闭时回 two_stage=false，前端直接生成。
+  - GenerateRequest 加 test_points；带了就传给 generate_test_cases_detailed 跳过阶段 1
+    （仍过 normalize_test_points 规整 sub）；生成完把最终清单回写 state.test_points 留档。
+  - clarification_state DTO 带 test_points，刷新后按 status 恢复面板。
+
+  前端：
+  - 新组件 TestPointReviewPanel（编辑副本模式，同 KnowledgeDraftReviewPanel）。
+  - runGenerate 改成两段：没带 points → 调 extractTestPoints、挂 testPointReview 面板、返回；
+    带 points → 才真正 generateCases。所有现有调用方（首轮即就绪 / 追问上限 / probe 自动恢复）
+    自动获得这一步，不用逐个改。pendingGenerate 记住已确认的 points，自动恢复时不重识别。
+  - 识别失败 / 429 / 用户停止 → 回到"待生成"中间态，probe 会按 pendingGenerate 续跑。
+
+================================================================================
 快速启动
 ================================================================================
   1. cp .env.example .env  （填写 LLM_API_KEY）

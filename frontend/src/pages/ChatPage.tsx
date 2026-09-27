@@ -2,11 +2,11 @@ import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import type {
   ChatSession, ChatMessage as IChatMessage, TestCase, UploadResult, DocStats,
   ClarificationQuestion, ClarificationRoundHistory, ClarificationStateDTO,
-  KnowledgeHit, KnowledgeNearMiss, KnowledgeDraft, ModuleSummary,
+  KnowledgeHit, KnowledgeNearMiss, KnowledgeDraft, ModuleSummary, TestPoint,
 } from '../api/client'
 import {
   fetchSessions, fetchMessages, createSession, renameSession, deleteSession,
-  generateCases, generateMindmap, fetchSessionCases, fetchClarificationState, fetchKnowledgePreview,
+  generateCases, extractTestPoints, generateMindmap, fetchSessionCases, fetchClarificationState, fetchKnowledgePreview,
   streamChat, streamUpload, streamLarkImport, streamLarkMindmapImport, streamFollowupClarification,
   streamInitialClarification, streamMindmapUpload, streamPipelineStart, isRejection,
   confirmPendingKnowledge, extractCombinedDrafts,
@@ -19,6 +19,7 @@ import MessageInput from '../components/MessageInput'
 import ClarificationPanel from '../components/ClarificationPanel'
 import KnowledgePreviewPanel from '../components/KnowledgePreviewPanel'
 import KnowledgeDraftReviewPanel from '../components/KnowledgeDraftReviewPanel'
+import TestPointReviewPanel from '../components/TestPointReviewPanel'
 import ModuleConfirmPanel from '../components/ModuleConfirmPanel'
 import FlowSteps from '../components/FlowSteps'
 import TestCaseTable from '../components/TestCaseTable'
@@ -124,6 +125,21 @@ interface SessionState {
     moduleName: string
     casePrefix: string
     rounds: ClarificationRoundHistory[]
+    // 用户已确认过的功能点清单（如有）：自动恢复时直接带上，不再重新识别
+    testPoints?: TestPoint[] | null
+  } | null
+  // 两阶段生成的「确认功能点」面板：阶段 1 识别中 loading=true；识别完 points 非空等用户确认/修改；
+  // 确认后走 runGenerate(…, points) 真正生成。生成入参原样保存，便于「重新识别」/确认时复用。
+  testPointReview: {
+    documentId: number | null
+    mindmapDocumentId: number | null
+    moduleName: string
+    casePrefix: string
+    rounds: ClarificationRoundHistory[]
+    knowledgeIds: number[] | null
+    loading: boolean
+    points: TestPoint[]
+    batchSize: number
   } | null
 
   // 澄清面板被「请求根本没发出去」的失败（并发闸门 429）打断时，用户填过的答案暂存在这里，
@@ -209,6 +225,7 @@ const emptyState = (mode: 'cases' | 'mindmap' = 'cases'): SessionState => ({
   knowledgePreview: null,
   clarifyKnowledgeIds: null,
   pendingGenerate: null,
+  testPointReview: null,
   prdDraftReview: null,
   mindmapDraftReview: null,
   extractingDrafts: false,
@@ -234,9 +251,10 @@ const deriveFlowStep = (s: SessionState): number => {
     if (s.uploadResult?.document_id != null) return 1
     return 0
   }
-  // 用例：0 上传资料 / 1 确认模块 / 2 审核知识 / 3 澄清 / 4 生成用例
-  if (s.testCases.length > 0) return 5
-  if (s.generating || s.pendingGenerate) return 4
+  // 用例：0 上传资料 / 1 确认模块 / 2 审核知识 / 3 澄清 / 4 确认功能点 / 5 生成用例
+  if (s.testCases.length > 0) return 6
+  if (s.generating || s.pendingGenerate) return 5
+  if (s.testPointReview) return 4
   if (s.knowledgePreview?.phase === 'generate'
       || (s.currentQuestions && s.currentQuestions.length > 0)
       || s.followupActive) return 3
@@ -300,6 +318,28 @@ function stateFromDTO(dto: ClarificationStateDTO, hasCases: boolean): Partial<Se
       moduleName: dto.confirmed_module_name,
       casePrefix: dto.confirmed_case_prefix,
       rounds: dto.rounds,
+    }
+  }
+
+  // status === 'awaiting_test_points' → 阶段 1 已跑完、清单已落库，用户还没确认：直接恢复面板。
+  // knowledgeIds 传 null（后端 top-K 兜底）——澄清阶段的选择没随状态落库，刷新后拿不回来。
+  let testPointReview: SessionState['testPointReview'] = null
+  if (
+    dto.status === 'awaiting_test_points'
+    && Array.isArray(dto.test_points) && dto.test_points.length > 0
+    && dto.confirmed_module_name && dto.confirmed_case_prefix
+    && (dto.document_id != null || dto.mindmap_document_id != null)
+  ) {
+    testPointReview = {
+      documentId: dto.document_id,
+      mindmapDocumentId: dto.mindmap_document_id,
+      moduleName: dto.confirmed_module_name,
+      casePrefix: dto.confirmed_case_prefix,
+      rounds: dto.rounds,
+      knowledgeIds: null,
+      loading: false,
+      points: dto.test_points,
+      batchSize: 6,
     }
   }
 
@@ -377,6 +417,7 @@ function stateFromDTO(dto: ClarificationStateDTO, hasCases: boolean): Partial<Se
       && dto.status !== 'awaiting_answers'
       && dto.status !== 'awaiting_clarification',
     pendingGenerate: pending,
+    testPointReview,
     knowledgePreview,
     prdDraftReview,
     mindmapDraftReview,
@@ -434,6 +475,7 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
     sid: number, documentId: number | null, mindmapDocumentId: number | null,
     rounds: ClarificationRoundHistory[],
     moduleName: string, casePrefix: string, knowledgeIds: number[] | null,
+    testPoints?: TestPoint[] | null,
   ) => void) | null>(null)
 
   // 同理：脑图模式上传处理器在前定义，而 startMindmapClarification 在后；用 ref 桥接，
@@ -784,6 +826,7 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
             runGenerateRef.current?.(
               sid, pending.documentId, pending.mindmapDocumentId,
               pending.rounds, pending.moduleName, pending.casePrefix, null,
+              pending.testPoints ?? null,
             )
           }
         }
@@ -1524,11 +1567,10 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
     moduleName: string,
     casePrefix: string,
     knowledgeIds: number[] | null,
+    // 用户在「确认功能点」面板上确认过的清单。没传 → 先跑阶段 1 识别、弹面板、本函数即返回；
+    // 用户点确认后再带着清单调一次本函数才真正生成。
+    testPoints?: TestPoint[] | null,
   ) => {
-    patchSession(sid, { generating: true, knowledgePreview: null })
-    // 把 generate 的 AbortController 也注册进 cancelMap，让"停止"按钮可中止 axios 请求
-    const controller = new AbortController()
-    setCancel(sid, () => controller.abort())
     const flatAnswers: Record<string, string> = {}
     rounds.forEach(rnd => {
       rnd.questions.forEach(q => {
@@ -1536,10 +1578,69 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
         if (a) flatAnswers[q.question] = a
       })
     })
+    const genArgs = { documentId, mindmapDocumentId, moduleName, casePrefix, rounds }
+
+    // ── 阶段 1：识别功能点，停下来等用户确认 ─────────────────────────────────
+    if (!testPoints || testPoints.length === 0) {
+      patchSession(sid, {
+        knowledgePreview: null,
+        pendingGenerate: null,
+        testPointReview: {
+          ...genArgs, knowledgeIds, loading: true, points: [], batchSize: 6,
+        },
+      })
+      const extractCtl = new AbortController()
+      setCancel(sid, () => extractCtl.abort())
+      try {
+        const res = await extractTestPoints(
+          sid, documentId, flatAnswers, moduleName, casePrefix, knowledgeIds, mindmapDocumentId,
+          extractCtl.signal,
+        )
+        if (res.two_stage && res.test_points.length > 0) {
+          patchSession(sid, prev => ({
+            testPointReview: {
+              ...genArgs, knowledgeIds, loading: false,
+              points: res.test_points, batchSize: res.batch_size || 6,
+            },
+            messages: res.assistant_message ? [...prev.messages, res.assistant_message] : prev.messages,
+          }))
+          setCancel(sid, null)
+          return
+        }
+        // 两阶段关闭 / 识别为空：不停留，直接生成（后端会自行兜底）
+        patchSession(sid, { testPointReview: null })
+      } catch (err) {
+        const aborted =
+          extractCtl.signal.aborted
+          || (err as { name?: string })?.name === 'CanceledError'
+          || (err as { code?: string })?.code === 'ERR_CANCELED'
+        const status = (err as { response?: { status?: number } })?.response?.status
+        if (status === 429) {
+          const detail = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail
+          showGateBlocked(detail ?? '当前使用人数较多，请稍后再试。')
+        } else if (!aborted) {
+          console.error('Extract test points error:', err)
+          toast.error(`识别功能点失败：${(err as Error)?.message ?? '未知错误'}`)
+        }
+        // 回到"澄清已完成、待生成"的中间态；probe 会按 pendingGenerate 自动续跑（重新识别）
+        patchSession(sid, { testPointReview: null, pendingGenerate: genArgs })
+        setCancel(sid, null)
+        return
+      } finally {
+        setCancel(sid, null)
+      }
+    }
+
+    // ── 阶段 2：真正生成 ─────────────────────────────────────────────────────
+    patchSession(sid, { generating: true, knowledgePreview: null, testPointReview: null })
+    // 把 generate 的 AbortController 也注册进 cancelMap，让"停止"按钮可中止 axios 请求
+    const controller = new AbortController()
+    setCancel(sid, () => controller.abort())
+    const pendingArgs = { ...genArgs, testPoints: testPoints ?? null }
     try {
       const result = await generateCases(
         sid, documentId, flatAnswers, moduleName, casePrefix, knowledgeIds, mindmapDocumentId,
-        controller.signal,
+        controller.signal, testPoints ?? null,
       )
       patchSession(sid, prev => {
         // 把"已确认 N 条 / 未注入"的系统气泡 + "已生成 N 条用例"的系统气泡顺序 append；
@@ -1562,6 +1663,7 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
           followupBuffer: '',
           knowledgePreview: null,
           pendingGenerate: null,
+          testPointReview: null,
           clarifyKnowledgeIds: null,
         }
       })
@@ -1575,7 +1677,7 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
         || (err as { code?: string })?.code === 'ERR_CANCELED'
       if (aborted) {
         patchSession(sid, {
-          pendingGenerate: { documentId, mindmapDocumentId, moduleName, casePrefix, rounds },
+          pendingGenerate: pendingArgs,
         })
         return
       }
@@ -1587,7 +1689,7 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
         const detail = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail
         showGateBlocked(detail ?? '当前使用人数较多，请稍后再试。')
         patchSession(sid, prev => ({
-          pendingGenerate: { documentId, mindmapDocumentId, moduleName, casePrefix, rounds },
+          pendingGenerate: pendingArgs,
           messages: [...prev.messages, {
             id: -Date.now(),
             role: 'assistant',
@@ -1633,14 +1735,14 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
         } else {
           // 真没跑完：保留澄清入参，让用户点「继续生成」再跑一次
           patchSession(sid, {
-            pendingGenerate: { documentId, mindmapDocumentId, moduleName, casePrefix, rounds },
+            pendingGenerate: pendingArgs,
           })
         }
       } catch (e2) {
         console.error('Generate recovery probe failed:', e2)
         // 回查也挂了——最低限度给个按钮兜底
         patchSession(sid, {
-          pendingGenerate: { documentId, mindmapDocumentId, moduleName, casePrefix, rounds },
+          pendingGenerate: pendingArgs,
         })
       }
     } finally {
@@ -2168,6 +2270,7 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
   const runningTaskLabel = useMemo(() => {
     if (!active) return null
     if (active.generating) return '生成测试用例'
+    if (active.testPointReview?.loading) return '识别功能点'
     if (active.followupActive) {
       return active.clarificationRounds.length === 0
         ? '识别澄清问题'
@@ -2454,7 +2557,29 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
             </div>
           )}
 
-          {active.mode !== 'mindmap' && (active.uploadResult || active.uploadMindmap) && active.currentQuestions && active.currentQuestions.length > 0 && !active.generating && !active.followupActive && !active.extractingDrafts && !active.prdDraftReview && !active.mindmapDraftReview && !active.moduleDecision && (
+          {/* 两阶段生成：阶段 1 识别出的功能点清单，用户确认/修改后才分批写用例。
+              「重新识别」= 丢掉清单再调一次 runGenerate（不带 points）；确认 = 带 points 调 runGenerate。 */}
+          {active.mode !== 'mindmap' && active.testPointReview && !active.generating && (
+            <TestPointReviewPanel
+              points={active.testPointReview.points}
+              loading={active.testPointReview.loading}
+              submitting={false}
+              moduleName={active.testPointReview.moduleName}
+              casePrefix={active.testPointReview.casePrefix}
+              batchSize={active.testPointReview.batchSize}
+              onConfirm={(points) => {
+                const r = active.testPointReview!
+                void runGenerate(activeSessionId!, r.documentId, r.mindmapDocumentId, r.rounds, r.moduleName, r.casePrefix, r.knowledgeIds, points)
+              }}
+              onReextract={() => {
+                const r = active.testPointReview!
+                void runGenerate(activeSessionId!, r.documentId, r.mindmapDocumentId, r.rounds, r.moduleName, r.casePrefix, r.knowledgeIds, null)
+              }}
+              onCancel={() => { if (activeSessionId != null) cancelMapRef.current.get(activeSessionId)?.() }}
+            />
+          )}
+
+          {active.mode !== 'mindmap' && (active.uploadResult || active.uploadMindmap) && active.currentQuestions && active.currentQuestions.length > 0 && !active.generating && !active.followupActive && !active.extractingDrafts && !active.prdDraftReview && !active.mindmapDraftReview && !active.moduleDecision && !active.testPointReview && (
             <ClarificationPanel
               questions={active.currentQuestions}
               summary={active.currentSummary || active.uploadResult?.clarification?.summary || ''}

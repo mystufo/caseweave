@@ -165,7 +165,7 @@ class GenerationResult:
     mode: str = "single"          # single | two_stage
 
 
-def _build_user_context(
+def build_user_context(
     *,
     skills: str | None,
     relevant_knowledge: str | None,
@@ -369,13 +369,18 @@ async def generate_test_cases_detailed(
     mindmap_content: str | None = None,
     system_prompt: str | None = None,
     test_point_system_prompt: str | None = None,
+    test_points: list[dict[str, Any]] | None = None,
 ) -> GenerationResult:
-    """两阶段生成主入口。返回用例 + 功能点清单 + 批次统计。"""
-    from app.agents.test_point_extractor import extract_test_points
+    """两阶段生成主入口。返回用例 + 功能点清单 + 批次统计。
+
+    test_points：调用方已经拿到（通常是用户在面板上确认/修改过）的功能点清单，非空时跳过
+    阶段 1 直接分批；仍会过一遍 normalize_test_points 规整 sub / 优先级。
+    """
+    from app.agents.test_point_extractor import extract_test_points, normalize_test_points
 
     s = get_settings()
     active_system = system_prompt or SYSTEM_PROMPT
-    context = _build_user_context(
+    context = build_user_context(
         skills=skills,
         relevant_knowledge=relevant_knowledge,
         module_relations=module_relations,
@@ -410,11 +415,15 @@ async def generate_test_cases_detailed(
     if not s.generator_two_stage:
         return await _single()
 
-    # ── 阶段 1：功能点清单 ────────────────────────────────────────────────────
-    points = await extract_test_points(
-        context, module_name=module_name, case_prefix=case_prefix,
-        system_prompt=test_point_system_prompt,
-    )
+    # ── 阶段 1：功能点清单（外部传入则跳过 LLM 调用）─────────────────────────
+    points = normalize_test_points(test_points, case_prefix) if test_points else []
+    if points:
+        logger.info("Two-stage: using %d caller-provided test points, skipping extraction", len(points))
+    else:
+        points = await extract_test_points(
+            context, module_name=module_name, case_prefix=case_prefix,
+            system_prompt=test_point_system_prompt,
+        )
     if not points:
         logger.warning("Two-stage: no test points extracted, falling back to single-shot generation")
         return await _single()
@@ -513,7 +522,7 @@ async def stream_generate_test_cases(
     active_system = system_prompt or SYSTEM_PROMPT
     user_content = (
         _user_header(module_name, case_prefix)
-        + _build_user_context(
+        + build_user_context(
             skills=skills,
             relevant_knowledge=relevant_knowledge,
             module_relations=module_relations,

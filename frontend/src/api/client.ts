@@ -235,8 +235,20 @@ export interface ClarificationStateDTO {
   rounds: ClarificationRoundHistory[]
   current_questions: ClarificationQuestion[]
   ready_to_generate: boolean
-  status: 'clarifying' | 'staged' | 'awaiting_clarification' | 'awaiting_answers' | 'generating' | 'done' | 'error'
+  status: 'clarifying' | 'staged' | 'awaiting_clarification' | 'awaiting_answers' | 'generating' | 'awaiting_test_points' | 'done' | 'error'
+  // 两阶段生成：待确认的功能点清单（status === 'awaiting_test_points' 时非空，刷新后据此恢复面板）
+  test_points: TestPoint[] | null
   updated_at: string | null
+}
+
+// ── 两阶段生成：功能点 ────────────────────────────────────────────────────────
+// 阶段 1 由 /api/generate/test-points 识别出来、用户在 TestPointReviewPanel 上确认/修改，
+// 再随 /api/generate 的 test_points 传回；后端会再规整一遍 sub（大写、唯一、剥掉与前缀重复的段）。
+export interface TestPoint {
+  sub: string        // 用例编号中段：{CASE_PREFIX}-{sub}-NNN
+  feature: string    // 功能点名称
+  scope: string      // 覆盖范围 / 关键判定点（写用例时逐条对照）
+  priority: 'P1' | 'P2' | 'P3'
 }
 
 export const fetchClarificationState = async (sessionId: number): Promise<ClarificationStateDTO | null> => {
@@ -1169,6 +1181,8 @@ export const generateCases = (
   knowledgeIds?: number[] | null,
   mindmapDocumentId?: number | null,
   signal?: AbortSignal,
+  // 用户确认过的功能点清单；非空则后端跳过识别直接分批生成
+  testPoints?: TestPoint[] | null,
 ) =>
   api.post<{
     total: number
@@ -1185,6 +1199,37 @@ export const generateCases = (
     module_name: moduleName,
     case_prefix: casePrefix,
     // null → 后端自动 top-K；[] → 不注入；非空 → 仅这些
+    knowledge_ids: knowledgeIds === undefined ? null : knowledgeIds,
+    test_points: testPoints && testPoints.length > 0 ? testPoints : null,
+  }, { signal }).then(r => r.data)
+
+// 两阶段生成第一步：识别功能点清单（只跑一次 LLM，约 1 分钟），不生成用例。
+// two_stage=false 表示后端关了两阶段开关，调用方应直接走 generateCases。
+export const extractTestPoints = (
+  sessionId: number,
+  documentId: number | null | undefined,
+  answers?: Record<string, string>,
+  moduleName?: string,
+  casePrefix?: string,
+  knowledgeIds?: number[] | null,
+  mindmapDocumentId?: number | null,
+  signal?: AbortSignal,
+) =>
+  api.post<{
+    session_id: number
+    two_stage: boolean
+    module_name?: string
+    case_prefix?: string
+    test_points: TestPoint[]
+    batch_size: number
+    assistant_message: ChatMessage | null
+  }>('/api/generate/test-points', {
+    session_id: sessionId,
+    document_id: documentId ?? null,
+    mindmap_document_id: mindmapDocumentId ?? null,
+    clarification_answers: answers,
+    module_name: moduleName,
+    case_prefix: casePrefix,
     knowledge_ids: knowledgeIds === undefined ? null : knowledgeIds,
   }, { signal }).then(r => r.data)
 

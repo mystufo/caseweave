@@ -27,7 +27,12 @@ class ClarificationState(Base):
 
     ready_to_generate = Column(Boolean, nullable=False, default=False)
     status = Column(String(40), nullable=False, default="clarifying")
-    # clarifying / awaiting_clarification / awaiting_answers / generating / done / error
+    # clarifying / awaiting_clarification / awaiting_answers / generating / awaiting_test_points / done / error
     # awaiting_clarification: 文档已 persist，等用户确认要注入到 Clarifier 的知识库条目
+    # awaiting_test_points: 两阶段生成的第一步已跑完，功能点清单在 test_points 里等用户确认/修改
+
+    # 两阶段生成的功能点清单草稿 [{sub, feature, scope, priority}]；用户在面板上改完后
+    # 随 /api/generate 的 test_points 传回，生成时再覆盖成最终版（便于回看用户改了什么）。
+    test_points = Column(JSONB, nullable=True)
 
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
