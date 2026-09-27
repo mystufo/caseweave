@@ -82,7 +82,11 @@ SYSTEM_PROMPT = """你是一位资深的测试工程师，负责根据产品需�
 - 例如前缀 USER-LOGIN：USER-LOGIN-VALID-001 / USER-LOGIN-INVALID-001 / USER-LOGIN-LOCKOUT-001
 
 ## 要求
-- 每个功能点至少生成1条正向用例 + 2条反向用例
+- 用例数量由功能点里**独立判定点**的个数决定，不设固定条数：每个独立判定点一条用例，正向/反向/边界各按实际存在的判定点写，不要为了凑数量拆分或重复。
+- **拆分与合并只看预期结果是否相同**：
+  - 多种用户身份 / 档位 / 入口 **预期结果相同** → 合成一条，把这些身份写进前置条件或步骤（如"分别以 A、B 两类账号登录，均应看到 X"）。不要把同一个判定点按身份复制成多条。
+  - 多种用户身份 / 档位 / 状态 **预期结果不同**（A 看到 4 折、B 只看到赠分、C 什么都不展示）→ 这是多个独立判定点，**必须各写一条**。严禁把"登录 A 账号看… / 登录 B 账号看… / 登录 C 账号看…"这种预期各不相同的场景堆进同一条用例的步骤里。
+  - 自检：一条用例的 steps 里如果出现"登录/切换另一类账号"且该步的预期结果与前面不同，就应该拆开。
 - 再次强调粒度：同一操作流程的连续步骤必须合并进一条用例的 `steps`，不要按步骤拆分用例（见上文"用例粒度"约束）
 - 步骤要具体可执行，不能有"等操作"这类模糊描述
 - 预期结果要明确，包含具体的提示语、页面跳转、数据变化等；多条预期结果需按步骤序号与 steps 一一对应（见"执行步骤与预期结果的对应规则"）
@@ -215,7 +219,19 @@ def _single_shot_tail(case_prefix: str) -> str:
     )
 
 
-def _batch_tail(case_prefix: str, batch_points: list[dict[str, Any]], batch_no: int, total_batches: int) -> str:
+def _batch_tail(
+    case_prefix: str,
+    batch_points: list[dict[str, Any]],
+    batch_no: int,
+    total_batches: int,
+    all_points: list[dict[str, Any]] | None = None,
+) -> str:
+    """批次尾巴：本批功能点 + 完整清单（其它批次负责的部分）+ 数量/编号约束。
+
+    附完整清单是为了防跨批重复：不告诉模型"活动时间范围""风控黑名单"这类横切维度已经
+    单独成点，它就会在每个页面元素下面各补一条"活动结束后不展示"。
+    """
+    batch_subs = {p["sub"] for p in batch_points}
     lines = [
         "## 本批次任务（重要）",
         f"功能点清单已在上一步整理完毕并拆成 {total_batches} 批，这是第 {batch_no} 批。"
@@ -225,9 +241,22 @@ def _batch_tail(case_prefix: str, batch_points: list[dict[str, Any]], batch_no: 
     for i, p in enumerate(batch_points, start=1):
         scope = f" —— {p['scope']}" if p.get("scope") else ""
         lines.append(f"{i}. [{p['sub']}] {p['feature']}（整体优先级 {p['priority']}）{scope}")
+    others = [p for p in (all_points or []) if p["sub"] not in batch_subs]
+    if others:
+        lines += [
+            "",
+            f"### 其它批次负责的功能点（共 {len(others)} 个，仅供参考，本批不要写）",
+            "下面这些维度已经有专门的功能点覆盖。本批用例里**不要**再为它们补场景——"
+            "例如「活动开始前/结束后不展示」「风控黑名单用户」「教育优惠用户」「不同身份判定」这类横切场景，"
+            "只在负责它的功能点里写一次，其它功能点默认在活动期内、普通用户身份下测：",
+        ]
+        for p in others:
+            lines.append(f"- [{p['sub']}] {p['feature']}")
     lines += [
         "",
-        "- 每个功能点至少 1 条正向 + 2 条反向/边界用例；其「覆盖范围」里提到的每个判定点都要有用例覆盖。",
+        "- 用例数量由每个功能点「覆盖范围」里的独立判定点决定，不设固定条数：每个判定点一条，都要覆盖到，但不要为了凑数拆分或重复。",
+        "- 拆分与合并只看预期结果：多种身份/档位预期结果**相同**就合进一条的前置条件或步骤里；"
+        "预期结果**不同**（例如 A 身份看到折扣、B 身份看不到）就是不同判定点，必须各写一条，不要堆进同一条的步骤里。",
         f"- 用例编号使用对应功能点的 sub：`{case_prefix}-{{sub}}-001` 起、按功能点各自递增（例如 "
         f"`{case_prefix}-{batch_points[0]['sub']}-001`）。不要带 `TC-` 前缀。",
         "- 只输出本批功能点的用例 JSON 数组，不要输出其它说明文字。",
@@ -442,7 +471,7 @@ async def generate_test_cases_detailed(
         async with sem:
             return await _invoke_generator(
                 system_prompt=active_system,
-                user_content=header + context + _batch_tail(case_prefix, batch, i, total),
+                user_content=header + context + _batch_tail(case_prefix, batch, i, total, all_points=points),
                 label=label,
                 dump_extra={**base_extra, "batch": f"{i}/{total}",
                             "batch_subs": ",".join(p["sub"] for p in batch)},
