@@ -811,6 +811,8 @@ export default function ChatPage({ view, onChangeView }: PageProps) {
             moduleName: clarState.confirmed_module_name,
             casePrefix: clarState.confirmed_case_prefix,
             rounds: clarState.rounds,
+            // 用户已确认过功能点清单时带上，自动恢复直接进阶段 2，不再重新识别
+            testPoints: clarState.test_points ?? null,
           }
           // 确保 pendingGenerate 一直填着，让 UI 显示常驻 loader
           patchSession(sid, prev => ({
